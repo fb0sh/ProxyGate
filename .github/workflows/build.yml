@@ -83,8 +83,27 @@ jobs:
       # builds turn off, and the suite (fake upstreams, no network) takes ~1s.
       # Windows is not a second-class target here: the only tests skipped there
       # are the ones that need a POSIX shell.
+      #
+      # `--no-fail-fast` reports every failing binary in one run, and the failing
+      # test names are emitted as annotations: downloading a job log needs admin
+      # rights, annotations are public, so this is what makes a red cross
+      # diagnosable from outside the repository.
       - name: Test
-        run: cargo test --locked
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --no-fail-fast 2>&1 | tee test-output.log
+          status="${PIPESTATUS[0]}"
+          if [ "$status" -ne 0 ]; then
+            grep -E '^---- .* stdout ----$' test-output.log \
+              | sed -E 's/^---- (.*) stdout ----$/\1/' \
+              | sort -u \
+              | while read -r name; do echo "::error::failing test: $name"; done
+            grep -E 'panicked at|^assertion|^  left:|^  right:' test-output.log \
+              | head -20 \
+              | while read -r line; do echo "::error::$line"; done
+          fi
+          exit "$status"
 
       # The API reference is published to docs.rs and is written in Chinese, so
       # a broken intra-doc link or an undocumented public item fails the build
