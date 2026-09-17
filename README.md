@@ -366,7 +366,7 @@ $ curl http://127.0.0.1:8081/api/v1/get
 http://user:pass@1.2.3.4:8080
 
 $ curl -s http://127.0.0.1:8081/api/v1/health
-{"status":"ok","version":"0.2.0","uptime_seconds":42,"generation":3,
+{"status":"ok","version":"0.2.1","uptime_seconds":42,"generation":3,
  "strategy":"random","health_targets":["https://www.google.com/generate_204",
  "https://cn.bing.com/"],"health_require":"any",
  "ready":true,"initializing":false,"initialization_attempts":1,
