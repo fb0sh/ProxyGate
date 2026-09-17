@@ -70,6 +70,9 @@ curl -x "$(proxygate get)" -A "$(proxygate getua)" https://example.com
 
 Global flags: `-c/--config <path>`, `-v`/`-vv`/`-vvv` (info/debug/trace), `-q`.
 
+`--help` output is in **Chinese** (the project's primary language): clap uses
+the source's doc comments as help text. This table is the English reference.
+
 `--no-refresh` and `--no-check` mean "use the cache even if it is stale" — the
 right choice when calling `get` in a tight loop or when offline.
 
