@@ -1,0 +1,7 @@
+# Build context exclusions for docker build.
+target/
+.cargo-home/
+.git/
+.gitignore
+config.yaml
+proxies.txt

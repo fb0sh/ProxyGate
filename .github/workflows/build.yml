@@ -1,0 +1,115 @@
+name: build
+
+# Builds the two platforms ProxyGate ships for:
+#   * Linux amd64   (x86_64-unknown-linux-gnu)
+#   * macOS arm64   (aarch64-apple-darwin)
+#
+# Nothing else: no Windows, no Linux arm64, no releases. Binaries are attached
+# to the run as artifacts.
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch makes the previous run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Full backtraces when a test fails on a runner nobody is watching.
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Report both platforms even if one of them breaks.
+      fail-fast: false
+      matrix:
+        include:
+          # GitHub's ubuntu runners are x86_64, macos-14 runners are Apple
+          # silicon: both builds are native, no cross-compilation.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # The builds are meant to be native. If the runner label ever changes
+      # architecture this fails loudly instead of silently cross-compiling.
+      # `macos-14` is Apple silicon; the confusing part of GitHub's naming is
+      # that `*-large` is the Intel variant for macOS 14 and newer.
+      - name: Assert the runner matches the target
+        shell: bash
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "runner host: $host"
+          echo "target:      ${{ matrix.target }}"
+          if [ "$host" != "${{ matrix.target }}" ]; then
+            echo "::error::This runner is $host, but the job must build ${{ matrix.target }} natively. Pick a runner label with that architecture."
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Debug build on purpose: it also enables the overflow checks that release
+      # builds turn off, and the suite (fake upstreams, no network) takes ~1s.
+      - name: Test
+        run: cargo test --locked
+
+      - name: Smoke test
+        run: ./target/${{ matrix.target }}/release/proxygate --version
+
+      - name: Verify the binary architecture
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/proxygate"
+          case "${{ matrix.target }}" in
+            *apple-darwin)
+              lipo -archs "$bin"
+              lipo -archs "$bin" | grep -qw arm64
+              ;;
+            *linux-gnu)
+              file "$bin"
+              file "$bin" | grep -q 'x86-64'
+              ;;
+          esac
+
+      - name: Package
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          name="proxygate-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/proxygate" "dist/${name}/"
+          cp README.md LICENSE config.example.yaml "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          echo "packaged dist/${name}.tar.gz"
+          tar -tzf "dist/${name}.tar.gz"
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxygate-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error

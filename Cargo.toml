@@ -1,0 +1,53 @@
+[package]
+name = "proxygate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Turn any proxy source into a uniform, always-ready proxy pool with a CLI, REST API and HTTP gateway."
+license = "MIT"
+readme = "README.md"
+keywords = ["proxy", "socks5", "http-proxy", "gateway"]
+categories = ["command-line-utilities", "network-programming"]
+
+[lib]
+name = "proxygate"
+path = "src/lib.rs"
+
+[[bin]]
+name = "proxygate"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+url = "2"
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "socks",
+    "json",
+    "stream",
+    "charset",
+    "http2",
+] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+axum = "0.8"
+tokio-socks = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+rand = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
