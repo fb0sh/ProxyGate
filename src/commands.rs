@@ -47,6 +47,9 @@ pub fn providers(args: ProvidersArgs) -> Result<ExitCode> {
                     "format": provider.format.as_str(),
                     "homepage": provider.homepage,
                     "notes": provider.notes,
+                    "pages": provider.pages_label(),
+                    "page_count": provider.page_count(),
+                    "limit": provider.limit,
                 })
             })
             .collect();
@@ -63,29 +66,33 @@ pub fn providers(args: ProvidersArgs) -> Result<ExitCode> {
 
     let mut output = String::new();
     output.push_str(&format!(
-        "{:<width$}  {:<10}  {}\n",
+        "{:<width$}  {:<8}  {:<7}  {}\n",
         "NAME",
         "FORMAT",
+        "PAGES",
         "ENDPOINT",
         width = width
     ));
     for provider in providers {
         output.push_str(&format!(
-            "{:<width$}  {:<10}  {}\n",
+            "{:<width$}  {:<8}  {:<7}  {}\n",
             provider.name,
             provider.format.as_str(),
+            provider.pages_label(),
             provider.url,
             width = width
         ));
         output.push_str(&format!(
-            "{:<width$}  {:<10}  notes: {}\n",
+            "{:<width$}  {:<8}  {:<7}  notes: {}\n",
+            "",
             "",
             "",
             provider.notes,
             width = width
         ));
         output.push_str(&format!(
-            "{:<width$}  {:<10}  docs:  {}\n",
+            "{:<width$}  {:<8}  {:<7}  docs:  {}\n",
+            "",
             "",
             "",
             provider.homepage,
@@ -473,21 +480,17 @@ pub async fn serve(config_path: Option<PathBuf>, args: ServeArgs) -> Result<Exit
     let proxy_address = config.server.proxy.clone();
     let api_address = config.server.api.clone();
 
-    let app = Arc::new(
-        App::bootstrap(
-            config,
-            path,
-            Bootstrap {
-                refresh: if args.no_refresh {
-                    Freshness::Never
-                } else {
-                    Freshness::IfStale
-                },
-                check: Freshness::IfStale,
-            },
-        )
-        .await?,
-    );
+    // 只读本地状态：抓取订阅源与探测代理放到后台，端口立刻开始接受请求。
+    // 未就绪期间 REST API 返回 503，并推动后台立刻重试。
+    let bootstrap = Bootstrap {
+        refresh: if args.no_refresh {
+            Freshness::Never
+        } else {
+            Freshness::IfStale
+        },
+        check: Freshness::IfStale,
+    };
+    let app = Arc::new(App::new(config, path)?);
 
     let proxy_listener = TcpListener::bind(&proxy_address).await.map_err(|error| {
         Error::Other(format!(
@@ -521,14 +524,7 @@ pub async fn serve(config_path: Option<PathBuf>, args: ServeArgs) -> Result<Exit
         },
     ));
 
-    let api_state = Arc::new(ApiState::new(
-        app.pool.clone(),
-        app.store.clone(),
-        app.config.selection.strategy,
-        app.config.selection.reuse_after,
-        app.config.health.targets(),
-        app.config.health.require,
-    ));
+    let api_state = Arc::new(ApiState::new(app.clone()));
 
     // On a shared port the API rides along on the gateway listener.
     let gateway = if shared_port {
@@ -550,8 +546,12 @@ pub async fn serve(config_path: Option<PathBuf>, args: ServeArgs) -> Result<Exit
         proxies = app.pool.len(),
         alive = app.pool.stats().alive,
         auth = credentials.is_some(),
-        "proxygate is ready"
+        ready = app.readiness().is_ready(),
+        "proxygate is listening"
     );
+    if !app.readiness().is_ready() {
+        info!("the pool is still being initialized; the REST API answers 503 until it is ready");
+    }
     if shared_port {
         info!(
             "the REST API shares the proxy port; `gateway.auth` covers proxy requests only, \
@@ -595,7 +595,7 @@ pub async fn serve(config_path: Option<PathBuf>, args: ServeArgs) -> Result<Exit
         let app = app.clone();
         let shutdown = shutdown_rx.clone();
         async move {
-            refresh_loop(app, shutdown).await;
+            refresh_loop(app, shutdown, bootstrap).await;
             "refresh"
         }
     });

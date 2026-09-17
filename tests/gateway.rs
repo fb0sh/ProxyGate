@@ -10,7 +10,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use proxygate::app::App;
 use proxygate::checker::ProxyClients;
+use proxygate::config::Config;
 use proxygate::gateway::{Gateway, GatewayOptions};
 use proxygate::model::{self, normalize};
 use proxygate::pool::{HealthUpdate, ProxyPool};
@@ -24,9 +26,8 @@ use common::{
 
 const WAIT: Duration = Duration::from_secs(5);
 
-/// Builds a pool whose proxies are already marked alive.
-fn pool_from(upstreams: &[(String, Duration)]) -> Arc<ProxyPool> {
-    let pool = ProxyPool::new();
+/// Inserts the upstreams into `pool` and marks every one of them alive.
+fn populate(pool: &ProxyPool, upstreams: &[(String, Duration)]) {
     let mut updates = Vec::new();
     for (raw, latency) in upstreams {
         let (id, _) = pool.insert(normalize(raw).expect("valid upstream url"));
@@ -41,7 +42,37 @@ fn pool_from(upstreams: &[(String, Duration)]) -> Arc<ProxyPool> {
         ));
     }
     pool.apply_health_pass(&updates, 3);
+}
+
+/// Builds a pool whose proxies are already marked alive.
+fn pool_from(upstreams: &[(String, Duration)]) -> Arc<ProxyPool> {
+    let pool = ProxyPool::new();
+    populate(&pool, upstreams);
     Arc::new(pool)
+}
+
+/// Builds an app for API tests.
+///
+/// Each call gets its own cache directory: a shared one would let a previous
+/// test's `cache.json` restore proxies that the assertion did not ask for.
+fn test_app(upstreams: &[(String, Duration)], ready: bool) -> Arc<App> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    let mut config = Config::default();
+    config.state.dir = Some(std::env::temp_dir().join(format!(
+        "proxygate-gateway-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    )));
+    config.health.targets = Some(vec!["https://example.test/".to_string()]);
+
+    let app = Arc::new(App::new(config, None).expect("test app"));
+    populate(&app.pool, upstreams);
+    if ready {
+        app.readiness.mark_ready();
+    }
+    app
 }
 
 fn http_proxy(upstreams: &[SocketAddr]) -> Vec<(String, Duration)> {
@@ -156,21 +187,10 @@ async fn forwards_plain_http_in_absolute_form() {
 #[tokio::test]
 async fn serves_the_rest_api_on_the_proxy_port() {
     use proxygate::api::{self, ApiState};
-    use proxygate::config::HealthRequirement;
 
     let upstream = fake_http_proxy(ProxyBehaviour::Serve).await;
-    let pool = pool_from(&http_proxy(&[upstream.address]));
-    let store = Arc::new(proxygate::state::StateStore::new(
-        std::env::temp_dir().join(format!("proxygate-shared-{}", std::process::id())),
-    ));
-    let api_state = Arc::new(ApiState::new(
-        pool.clone(),
-        store,
-        Strategy::Random,
-        Duration::from_secs(1800),
-        vec!["https://example.test/".to_string()],
-        HealthRequirement::Any,
-    ));
+    let app = test_app(&http_proxy(&[upstream.address]), true);
+    let api_state = Arc::new(ApiState::new(app.clone()));
 
     let clients = Arc::new(ProxyClients::new(
         Duration::from_secs(5),
@@ -178,7 +198,7 @@ async fn serves_the_rest_api_on_the_proxy_port() {
     ));
     let gateway = Arc::new(
         Gateway::new(
-            pool,
+            app.pool.clone(),
             clients,
             GatewayOptions {
                 retries: 0,
@@ -229,6 +249,72 @@ async fn serves_the_rest_api_on_the_proxy_port() {
         .expect("send GET");
     let response = read_until_contains(&mut client, "hello from the upstream proxy", WAIT).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+}
+
+/// A process that has not finished its first refresh + health pass must say so
+/// instead of pretending the pool is empty, and it must start serving as soon
+/// as the background pass completes.
+#[tokio::test]
+async fn a_cold_start_answers_503_until_the_first_pass_finishes() {
+    use proxygate::api::{self, ApiState};
+
+    let upstream = fake_http_proxy(ProxyBehaviour::Serve).await;
+    let app = test_app(&http_proxy(&[upstream.address]), false);
+    assert!(!app.readiness().is_ready());
+
+    let clients = Arc::new(ProxyClients::new(
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    ));
+    let gateway = Arc::new(
+        Gateway::new(
+            app.pool.clone(),
+            clients,
+            GatewayOptions {
+                retries: 0,
+                ..GatewayOptions::default()
+            },
+        )
+        .with_api(api::router(Arc::new(ApiState::new(app.clone())))),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener, std::future::pending::<()>()).await;
+    });
+
+    // Cold: 503 + Retry-After, in the wording a client can act on.
+    let mut client = TcpStream::connect(address).await.expect("connect");
+    client
+        .write_all(b"GET /api/v1/get HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("send");
+    let response = read_until_contains(&mut client, "initializing", WAIT).await;
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    assert!(response.contains("retry-after: 5"), "{response}");
+
+    // Health reports the cold state instead of claiming an empty pool.
+    let mut client = TcpStream::connect(address).await.expect("connect");
+    client
+        .write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("send");
+    let response = read_until_contains(&mut client, "\"ready\"", WAIT).await;
+    assert!(response.contains("\"ready\":false"), "{response}");
+
+    // The background pass finishes: the same port now hands out the proxy.
+    app.readiness().mark_ready();
+    let mut client = TcpStream::connect(address).await.expect("connect");
+    client
+        .write_all(b"GET /api/v1/get HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("send");
+    let response = read_until_contains(&mut client, "http://", WAIT).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        response.contains(&upstream.address.to_string()),
+        "{response}"
+    );
 }
 
 #[tokio::test]

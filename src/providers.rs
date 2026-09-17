@@ -17,12 +17,19 @@
 //! 新增一个内置来源＝一条 [`Provider`] 字面量，再加 `config.example.yaml`
 //! 里的一行；有测试保证两者同步。
 
+use std::ops::RangeInclusive;
 use std::time::Duration;
 
 use crate::config::Format;
 
+/// 分页端点的 URL 里用来表示页码的占位符。
+///
+/// 目录里带这个占位符的条目会被 [`crate::config::Config::normalize`] 按
+/// [`Provider::pages`] 展开成每页一条订阅源。
+pub const PAGE_PLACEHOLDER: &str = "{page}";
+
 /// 一个内置来源。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Provider {
     /// 在配置中作为 `provider:` 使用、并由 `proxygate providers`
     /// 打印出来的 id。
@@ -38,6 +45,12 @@ pub struct Provider {
     /// 拉取该端点时的超时；当默认的 `refresh.timeout` 不够长时使用。
     /// 可在每个配置条目上覆盖。
     pub timeout: Option<Duration>,
+    /// 端点分页时的页码范围（含两端）；`None` 表示一次请求就能取回全部。
+    ///
+    /// 非 `None` 时 [`Provider::url`] 必须包含 [`PAGE_PLACEHOLDER`]，否则
+    /// 目录里的测试会失败。展开后每一页都是一条独立的订阅源：各自拉取、
+    /// 各自计数、各自失败，所以某一页出问题不会拖走其余页。
+    pub pages: Option<RangeInclusive<u32>>,
     /// 最多保留这么多个来自该来源的可用代理，按端点返回的顺序取（大型列表
     /// 以最快优先排序，因此取到的是有用的一端）。`None` 表示不限。
     ///
@@ -55,6 +68,7 @@ pub const ALL: &[Provider] = &[
         homepage: "https://proxy.scdn.io/api_docs.php",
         notes: "small and fast; rate limits, so keep refresh.interval at 10m or slower",
         timeout: None,
+        pages: None,
         limit: None,
     },
     Provider {
@@ -64,18 +78,23 @@ pub const ALL: &[Provider] = &[
         homepage: "https://www.freeproxy.com.cn/",
         notes: "~120 entries, all HTTP; carries country/region/anonymity per entry",
         timeout: None,
+        pages: None,
         limit: None,
     },
     Provider {
         name: "rola-ip",
-        url: "https://rola-ip.co/proxy-api/api/v1/proxies?page=1&pageSize=500",
+        // Ten pages: page 1 alone is 500 of the ~4,700 entries the API reports
+        // in `pagination.totalPages`. Each page becomes its own subscriber, so
+        // a page that fails is visible instead of silently shrinking the pool.
+        url: "https://rola-ip.co/proxy-api/api/v1/proxies?page={page}&pageSize=500",
         format: Format::Json,
         homepage: "https://rola-ip.co/",
-        // pageSize tops out at 500 and page 1 is the largest slice; the whole
-        // list is 4,685 over 10 pages. socks4-only entries are skipped, and
-        // socks5 ones become socks5h, so the proxy resolves names itself.
-        notes: "500 per request, 60 req/min; mixes http, socks5 and socks4, plus transparent entries",
+        // Page size tops out at 500 (`pagination.totalPages` was 10 when this
+        // was written), socks4-only entries are skipped, and socks5 ones become
+        // socks5h so the proxy resolves names itself.
+        notes: "all 10 pages (pageSize maxes out at 500), 60 req/min; mixes http, socks5 and socks4",
         timeout: None,
+        pages: Some(1..=10),
         limit: None,
     },
     Provider {
@@ -90,9 +109,33 @@ pub const ALL: &[Provider] = &[
         // minutes. Raise `timeout` per config entry if it still times out.
         notes: "~16k entries (mostly socks5), 2.5 MB download taking minutes; capped at 1000",
         timeout: Some(Duration::from_secs(300)),
+        pages: None,
         limit: Some(1000),
     },
 ];
+
+impl Provider {
+    /// 该端点分几页；不分页时返回 1。
+    pub fn page_count(&self) -> u32 {
+        match &self.pages {
+            Some(pages) => pages.clone().count() as u32,
+            None => 1,
+        }
+    }
+
+    /// 把 [`PAGE_PLACEHOLDER`] 换成具体页码后的端点。
+    pub fn url_for_page(&self, page: u32) -> String {
+        self.url.replace(PAGE_PLACEHOLDER, &page.to_string())
+    }
+
+    /// 供 `proxygate providers` 展示的分页说明，如 `1-10`；不分页时为 `-`。
+    pub fn pages_label(&self) -> String {
+        match &self.pages {
+            Some(pages) => format!("{}-{}", pages.start(), pages.end()),
+            None => "-".to_string(),
+        }
+    }
+}
 
 /// 当配置要求 `limit: 0`（不限）时使用的默认上限——测试会用到。
 pub const NO_LIMIT: Option<usize> = None;
@@ -148,6 +191,37 @@ mod tests {
             if let Some(limit) = provider.limit {
                 assert!(limit > 0, "{} has a zero limit", provider.name);
             }
+            // A paginated endpoint must say so in the URL and vice versa: the
+            // expansion in `Config::normalize` keys off the placeholder, so a
+            // mismatch means the pages are never fetched.
+            match &provider.pages {
+                Some(pages) => {
+                    assert!(
+                        pages.start() <= pages.end() && *pages.start() >= 1,
+                        "{} has an empty page range {}..={}",
+                        provider.name,
+                        pages.start(),
+                        pages.end()
+                    );
+                    assert!(
+                        provider.url.contains(PAGE_PLACEHOLDER),
+                        "{} declares pages but its url has no {PAGE_PLACEHOLDER}",
+                        provider.name
+                    );
+                    for page in pages.clone() {
+                        assert!(
+                            !provider.url_for_page(page).contains(PAGE_PLACEHOLDER),
+                            "{} leaves the placeholder in place for page {page}",
+                            provider.name
+                        );
+                    }
+                }
+                None => assert!(
+                    !provider.url.contains(PAGE_PLACEHOLDER),
+                    "{} has {PAGE_PLACEHOLDER} but declares no pages",
+                    provider.name
+                ),
+            }
             assert!(
                 !provider.url.contains(char::is_whitespace),
                 "{} has whitespace in its URL",
@@ -176,10 +250,36 @@ mod tests {
     #[test]
     fn the_catalog_entries_parse_as_urls() {
         for provider in ALL {
-            let url =
-                url::Url::parse(provider.url).unwrap_or_else(|e| panic!("{}: {e}", provider.name));
-            assert!(matches!(url.scheme(), "http" | "https"));
-            assert!(url.host_str().is_some());
+            // A paginated entry is only a URL once the page is substituted, so
+            // check every page it will actually request.
+            let urls: Vec<String> = match &provider.pages {
+                Some(pages) => pages
+                    .clone()
+                    .map(|page| provider.url_for_page(page))
+                    .collect(),
+                None => vec![provider.url.to_string()],
+            };
+            for raw in urls {
+                let url = url::Url::parse(&raw)
+                    .unwrap_or_else(|e| panic!("{}: {raw}: {e}", provider.name));
+                assert!(matches!(url.scheme(), "http" | "https"));
+                assert!(url.host_str().is_some());
+            }
         }
+    }
+
+    #[test]
+    fn the_paginated_catalog_entry_covers_every_page() {
+        let rola = find("rola-ip").expect("rola-ip is in the catalog");
+        // The API reports `pagination.totalPages`; the catalog has to ask for
+        // all of them or the pool silently loses most of the list.
+        assert_eq!(rola.page_count(), 10);
+        assert_eq!(rola.pages_label(), "1-10");
+        assert!(rola.url_for_page(7).contains("page=7"));
+        assert!(rola.url_for_page(1).contains("pageSize=500"));
+
+        let plain = find("scdn").expect("scdn is in the catalog");
+        assert_eq!(plain.page_count(), 1);
+        assert_eq!(plain.pages_label(), "-");
     }
 }

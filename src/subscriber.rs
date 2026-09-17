@@ -12,6 +12,11 @@
 //!
 //! 注意：`exec` 会以 ProxyGate 进程的权限运行配置文件里的命令。这是一条
 //! 有意留出的逃生通道——请把 `config.yaml` 当作可信输入。
+//!
+//! 分页来源（目录里声明了页数的内置来源）在这里表现为**多条订阅源**：
+//! [`crate::config::Config::normalize`] 已经把 `{page}` 展开成具体页码，
+//! 所以本模块不需要知道分页的存在，每一页都是一次普通的 HTTP 拉取，各自
+//! 计数、各自失败。
 
 use std::collections::BTreeMap;
 use std::process::Stdio;

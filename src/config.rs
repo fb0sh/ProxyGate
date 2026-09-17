@@ -311,6 +311,9 @@ pub enum SubscriberConfig {
         timeout: Option<Duration>,
         /// 最多保留多少个可用代理（0 表示全部保留）。默认沿用内置
         /// 目录自身的上限（如果有）。
+        ///
+        /// 分页来源会展开成每页一条订阅源，这个上限因此是**按页**生效的：
+        /// `rola-ip` 加 `limit: 200` 表示每页最多 200 条。
         #[serde(default)]
         limit: Option<usize>,
         /// 是否启用该订阅源，默认 `true`。
@@ -401,6 +404,14 @@ impl SubscriberConfig {
             | SubscriberConfig::Exec { name: n, .. } => *n = name,
         }
     }
+}
+
+/// 分页来源展开后，每一页对应的订阅源名称。
+///
+/// 例如 `rola-ip` 的第 3 页叫 `rola-ip#3`。名字里带页码，`proxygate refresh`
+/// 的输出就能直接指出是哪一页失败或变空。
+pub fn paged_name(base: &str, page: u32) -> String {
+    format!("{base}#{page}")
 }
 
 /// 订阅源响应内容如何转换为代理 URL。
@@ -615,6 +626,12 @@ impl Config {
             }
         }
 
+        // 分页端点（如 rola-ip 的 10 页）在这里展开成每页一条订阅源：每页
+        // 独立拉取、独立计数、独立失败，`proxygate refresh` 因此能指出是哪
+        // 一页出了问题。展开时把页码写进 `url`，展开后的条目不再含占位符，
+        // 所以再调用一次 `normalize` 也不会重复展开。
+        self.expand_paged_builtins();
+
         let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
         for subscriber in &self.subscribers {
             *seen.entry(subscriber.name()).or_default() += 1;
@@ -627,6 +644,69 @@ impl Config {
 
         self.validate()?;
         Ok(())
+    }
+
+    /// 把带分页占位符的内置来源展开成每页一条订阅源。
+    ///
+    /// 手写的 `url` 覆盖优先于目录里的端点；只要生效的 URL 里有
+    /// [`crate::providers::PAGE_PLACEHOLDER`]，就按目录声明的页码范围展开。
+    /// 不属于内置来源、或没有声明分页的条目原样保留。
+    fn expand_paged_builtins(&mut self) {
+        use crate::providers::{self, PAGE_PLACEHOLDER};
+
+        let subscribers = std::mem::take(&mut self.subscribers);
+        let mut expanded: Vec<SubscriberConfig> = Vec::with_capacity(subscribers.len());
+
+        for subscriber in subscribers {
+            let SubscriberConfig::Builtin {
+                name,
+                provider,
+                url,
+                format,
+                timeout,
+                limit,
+                enabled,
+            } = subscriber
+            else {
+                expanded.push(subscriber);
+                continue;
+            };
+
+            // 生效的端点：手写覆盖优先，否则用目录里的。
+            let template = url.clone().unwrap_or_else(|| {
+                providers::find(&provider)
+                    .map(|entry| entry.url.to_string())
+                    .unwrap_or_default()
+            });
+            let pages = providers::find(&provider).and_then(|entry| entry.pages.clone());
+
+            let (Some(pages), true) = (pages, template.contains(PAGE_PLACEHOLDER)) else {
+                expanded.push(SubscriberConfig::Builtin {
+                    name,
+                    provider,
+                    url,
+                    format,
+                    timeout,
+                    limit,
+                    enabled,
+                });
+                continue;
+            };
+
+            for page in pages {
+                expanded.push(SubscriberConfig::Builtin {
+                    name: paged_name(&name, page),
+                    provider: provider.clone(),
+                    url: Some(template.replace(PAGE_PLACEHOLDER, &page.to_string())),
+                    format,
+                    timeout,
+                    limit,
+                    enabled,
+                });
+            }
+        }
+
+        self.subscribers = expanded;
     }
 
     /// 校验各字段的取值范围与地址格式。
@@ -1160,7 +1240,7 @@ health:
         let mut config: Config = serde_yaml::from_str(EXAMPLE_CONFIG).unwrap();
         config.normalize().unwrap();
 
-        let enabled: Vec<&str> = config
+        let mut enabled: Vec<&str> = config
             .subscribers
             .iter()
             .filter(|subscriber| subscriber.enabled())
@@ -1174,11 +1254,23 @@ health:
             })
             .collect();
 
-        let expected: Vec<&str> = crate::providers::names();
+        // 分页来源会被展开成多页，所以按 provider 去重后再比。
+        enabled.sort_unstable();
+        enabled.dedup();
+        let mut expected: Vec<&str> = crate::providers::names();
+        expected.sort_unstable();
         assert_eq!(
             enabled, expected,
             "config.example.yaml and the provider catalog must list the same sources"
         );
+
+        // 展开出的订阅源集合要和 `builtin-subscribers: enabled` 完全一致。
+        let names: Vec<String> = config
+            .subscribers
+            .iter()
+            .map(|subscriber| subscriber.name().to_string())
+            .collect();
+        assert_eq!(names, expanded_catalog_names());
     }
 
     #[test]
@@ -1235,10 +1327,22 @@ subscribers:
         );
     }
 
+    /// 内置目录（含分页展开）应当得到的订阅源名称。
+    fn expanded_catalog_names() -> Vec<String> {
+        crate::providers::ALL
+            .iter()
+            .flat_map(|provider| match &provider.pages {
+                Some(pages) => pages
+                    .clone()
+                    .map(|page| paged_name(provider.name, page))
+                    .collect::<Vec<String>>(),
+                None => vec![provider.name.to_string()],
+            })
+            .collect()
+    }
+
     #[test]
     fn the_builtin_switch_expands_the_catalog() {
-        let catalog = crate::providers::names();
-
         // 默认关闭：什么都不写的配置不会隐式引入任何来源。
         let mut config = Config::default();
         config.normalize().unwrap();
@@ -1248,12 +1352,12 @@ subscribers:
         // `enabled` 会加入内置目录的每一项，并以内置来源命名。
         let mut config: Config = serde_yaml::from_str("builtin-subscribers: enabled\n").unwrap();
         config.normalize().unwrap();
-        let names: Vec<&str> = config
+        let names: Vec<String> = config
             .subscribers
             .iter()
-            .map(|subscriber| subscriber.name())
+            .map(|subscriber| subscriber.name().to_string())
             .collect();
-        assert_eq!(names, catalog);
+        assert_eq!(names, expanded_catalog_names());
         assert!(
             config
                 .subscribers
@@ -1264,7 +1368,13 @@ subscribers:
         // 幂等：归一化两次不会让列表翻倍。
         let mut twice = config.clone();
         twice.normalize().unwrap();
-        assert_eq!(twice.subscribers.len(), catalog.len());
+        assert_eq!(twice.subscribers.len(), names.len());
+        let again: Vec<String> = twice
+            .subscribers
+            .iter()
+            .map(|subscriber| subscriber.name().to_string())
+            .collect();
+        assert_eq!(again, names, "second normalize changed the subscriber list");
     }
 
     #[test]
@@ -1283,15 +1393,17 @@ subscribers:
         .unwrap();
         config.normalize().unwrap();
 
-        let builds: Vec<&str> = config
+        let builds: Vec<String> = config
             .subscribers
             .iter()
             .filter(|subscriber| subscriber.kind() == "builtin")
-            .map(|subscriber| subscriber.name())
+            .map(|subscriber| subscriber.name().to_string())
             .collect();
-        let expected: Vec<&str> = crate::providers::names()
+        // 手写的 `scdn` 占住了这个名字，所以内置目录里的 scdn 不会再加进来；
+        // rola-ip 仍然按页展开。
+        let expected: Vec<String> = expanded_catalog_names()
             .into_iter()
-            .filter(|name| *name != "scdn")
+            .filter(|name| !name.starts_with("scdn"))
             .collect();
         assert_eq!(builds, expected, "`scdn` was taken by a hand-written entry");
 

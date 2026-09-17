@@ -133,6 +133,13 @@ proxy really has international connectivity, and `cn.bing.com` proves the tunnel
 is not broken for everything else. By default `require: any` accepts a proxy
 that reaches either one; the `TARGETS` column tells you which.
 
+> **Enabling every built-in grows the pool a lot.** A cold start of all 13
+> subscribers (rola-ip's 10 pages plus three others) fetches ~5,200 proxies, and
+> one health pass over them takes minutes (5,157 checked in ~3.5 minutes with 66
+> alive, measured). With the default `health.interval` of 30s the checker is then
+> busy almost continuously — raise it to `10m`, or cap a source with `limit`, if
+> you want it to rest.
+
 ### Sharing one port with the API
 
 `server.api` also accepts `same` (or `proxy`, or a literal copy of the
@@ -350,15 +357,33 @@ http://user:pass@1.2.3.4:8080
 
 $ curl -s http://127.0.0.1:8081/api/v1/health
 {"status":"ok","version":"0.1.0","uptime_seconds":42,"generation":3,
- "strategy":"random","health_target":"https://example.com/",
+ "strategy":"random","health_targets":["https://cn.bing.com/"],
+ "health_require":"any","ready":true,"initializing":false,
+ "initialization_attempts":1,"initialization_error":null,
  "proxies":{"total":2,"alive":2,"dead":0}}
+# While the first pass runs, `status` is "initializing" and `ready` is false.
 ```
 
 With `server.api: same`, use port `8080` in the examples above; the paths
 are unchanged.
 
-`/get` answers `503` when no healthy proxy is available. Credentials are never
-exposed by `/proxies` (they are replaced with `***:***`).
+`/get` has two distinct `503`s, told apart by the body:
+
+| Situation | Body | Meaning |
+| --- | --- | --- |
+| The first pass is still running | `proxygate: still initializing the proxy pool; retry in 5 seconds` | not ready yet; carries `Retry-After: 5` |
+| The pool has nothing healthy | `proxygate: no healthy proxy available` | initialization finished, there is just nothing usable (same as exit code `3`) |
+
+Just retry the first one: every request also nudges the background task to try
+again, so there is no need to poll. `/health` carries `ready`, `initializing`,
+`initialization_attempts` and `initialization_error` for monitoring.
+
+`serve` does **not** wait for the first fetch: it restores the local cache, binds
+the port in milliseconds, and does the fetching and probing in the background, so
+a `systemd`/k8s probe gets a `503` instead of a refused connection. With a fresh
+cache initialization is instant and the very first request is served.
+
+Credentials are never exposed by `/proxies` (they are replaced with `***:***`).
 
 ## Gateway
 
@@ -577,6 +602,13 @@ Deviations from the v0.1 design notes, each for a reason found while building it
   name matches the commands in this document.
 * `server.api` accepts `same` so the REST API and the proxy gateway can share a
   single port, dispatched by request shape.
+* Built-in sources can be paginated: the URL carries `{page}` and the catalog
+  declares the range, which `normalize` expands into one subscriber per page so
+  each page is counted and can fail on its own. rola-ip went from 500 entries to
+  all 10 pages (4,724).
+* `serve` binds its ports first and initializes in the background; until that
+  finishes the REST API answers `503` with `Retry-After` instead of pretending
+  the pool is empty.
 * `state.json` holds exactly what the notes describe, *plus* a separate
   `cache.json` for subscriber and health results. Without it, one `get` against a
   10,000-proxy pool re-probes all 10,000 every time.

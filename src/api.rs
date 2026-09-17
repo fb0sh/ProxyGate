@@ -25,11 +25,15 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::app::{App, Readiness};
 use crate::config::HealthRequirement;
 use crate::error::{Error, Result};
 use crate::pool::ProxyPool;
 use crate::selector::Strategy;
 use crate::state::{self, StateStore};
+
+/// 未就绪时 `/api/v1/get` 在 `Retry-After` 里给出的建议重试秒数。
+pub const INITIALIZE_RETRY_SECONDS: u64 = 5;
 
 /// 相邻两次重写 `state.json` 之间的最小间隔。
 const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
@@ -51,26 +55,28 @@ pub struct ApiState {
     pub health_targets: Vec<String>,
     /// 是否要求所有探测目标都通过，代理才算存活。
     pub health_require: HealthRequirement,
+    /// 冷启动状态：未就绪时 `/api/v1/get` 返回 `503` 而不是空代理。
+    ///
+    /// 未就绪时它的 [`Readiness::request_init`] 会推动后台立刻重试一次
+    /// 初始化，所以客户端不需要自己反复轰炸。
+    pub readiness: Arc<Readiness>,
 }
 
 impl ApiState {
-    /// 用给定的代理池、状态存储和选择参数构造共享状态。
-    pub fn new(
-        pool: Arc<ProxyPool>,
-        store: Arc<StateStore>,
-        strategy: Strategy,
-        reuse_after: Duration,
-        health_targets: Vec<String>,
-        health_require: HealthRequirement,
-    ) -> Self {
+    /// 用运行时上下文构造共享状态。
+    ///
+    /// 代理池、状态存储与选择参数都取自 [`App`]；额外记住 `started`，用于
+    /// `/api/v1/health` 里的 `uptime_seconds`。
+    pub fn new(app: Arc<App>) -> Self {
         Self {
-            pool,
-            strategy,
-            reuse_after,
-            store,
+            pool: app.pool.clone(),
+            strategy: app.config.selection.strategy,
+            reuse_after: app.config.selection.reuse_after,
+            store: app.store.clone(),
             started: Instant::now(),
-            health_targets,
-            health_require,
+            health_targets: app.config.health.targets(),
+            health_require: app.config.health.require,
+            readiness: app.readiness().clone(),
         }
     }
 }
@@ -158,7 +164,8 @@ struct ProbeEntry {
 /// `/api/v1/health` 的响应体。
 #[derive(Debug, Serialize)]
 struct HealthResponse {
-    /// 整体状态：`ok`、`degraded`（没有存活代理）或 `empty`（池为空）。
+    /// 整体状态：`initializing`（冷启动还没做完）、`ok`、`degraded`
+    /// （没有存活代理）或 `empty`（池为空）。
     status: &'static str,
     /// crate 版本号。
     version: &'static str,
@@ -172,6 +179,14 @@ struct HealthResponse {
     health_targets: Vec<String>,
     /// 健康检查的通过要求。
     health_require: &'static str,
+    /// 冷启动是否已经完成；未完成时 `/api/v1/get` 返回 `503`。
+    ready: bool,
+    /// 此刻是否正在初始化（抓取订阅源或探测代理）。
+    initializing: bool,
+    /// 已经开始的初始化尝试次数。
+    initialization_attempts: u64,
+    /// 最近一次初始化的失败原因；从未失败或已成功时为 `null`。
+    initialization_error: Option<String>,
     /// 代理池计数。
     proxies: HealthCounts,
 }
@@ -189,6 +204,48 @@ struct HealthCounts {
 
 /// `GET /api/v1/get` —— 发放一个健康代理。
 async fn get_proxy(State(state): State<Arc<ApiState>>, Query(query): Query<GetQuery>) -> Response {
+    // 冷启动（第一次抓取 + 探测）还没做完时，池子里的内容不代表最终结果，
+    // 与其回答"没有可用代理"，不如明确说"还没准备好"。同时请后台立刻再试
+    // 一次，所以下一次请求通常就能拿到代理。
+    if !state.readiness.is_ready() {
+        state.readiness.request_init();
+        let retry_after = INITIALIZE_RETRY_SECONDS.to_string();
+        let error = state.readiness.error();
+        let retry_hint = format!(
+            "proxygate: still initializing the proxy pool; retry in {INITIALIZE_RETRY_SECONDS} seconds\n"
+        );
+
+        if query.format.as_deref() == Some("json") {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    (header::CONTENT_TYPE, "application/json"),
+                    (header::RETRY_AFTER, retry_after.as_str()),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                Json(serde_json::json!({
+                    "error": "initializing",
+                    "message": "the proxy pool is still being initialized",
+                    "retry_after_seconds": INITIALIZE_RETRY_SECONDS,
+                    "attempts": state.readiness.attempts(),
+                    "detail": error,
+                })),
+            )
+                .into_response();
+        }
+
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (header::RETRY_AFTER, retry_after.as_str()),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            retry_hint,
+        )
+            .into_response();
+    }
+
     let now = SystemTime::now();
     let Some(selection) = state.pool.select(state.strategy, state.reuse_after, now) else {
         return (
@@ -299,7 +356,10 @@ async fn list_proxies(State(state): State<Arc<ApiState>>) -> Json<Vec<ProxyEntry
 /// `GET /api/v1/health` —— 存活状态与代理池计数。
 async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
     let stats = state.pool.stats();
-    let status = if stats.total == 0 {
+    // 未就绪优先：`empty` 会被误读成"配置里没有来源"，而这时其实是在初始化。
+    let status = if !state.readiness.is_ready() {
+        "initializing"
+    } else if stats.total == 0 {
         "empty"
     } else if stats.alive == 0 {
         "degraded"
@@ -315,6 +375,10 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
         strategy: state.strategy.as_str(),
         health_targets: state.health_targets.clone(),
         health_require: state.health_require.as_str(),
+        ready: state.readiness.is_ready(),
+        initializing: state.readiness.is_initializing(),
+        initialization_attempts: state.readiness.attempts(),
+        initialization_error: state.readiness.error(),
         proxies: HealthCounts {
             total: stats.total,
             alive: stats.alive,
@@ -347,12 +411,27 @@ mod tests {
     use crate::pool::HealthUpdate;
     use axum::body::Body;
     use axum::http::Request;
+
+    use crate::config::Config;
     use tower::ServiceExt;
 
+    /// 测试用的运行时上下文：缓存目录指向临时目录，避免碰到真实的
+    /// `~/.cache`（沙箱里通常不可写）。
+    fn test_app() -> Arc<App> {
+        let mut config = Config::default();
+        config.state.dir = Some(std::env::temp_dir().join("proxygate-api-test"));
+        config.health.targets = Some(vec!["https://example.com/generate_204".to_string()]);
+        config.health.require = HealthRequirement::All;
+        Arc::new(App::new(config, None).expect("test app"))
+    }
+
+    /// 已就绪、池里有一个已判活代理的共享状态。
     fn test_state() -> Arc<ApiState> {
-        let pool = Arc::new(ProxyPool::new());
-        let (id, _) = pool.insert(normalize("http://user:pass@1.2.3.4:3128").unwrap());
-        pool.update_health(&[(
+        let app = test_app();
+        let (id, _) = app
+            .pool
+            .insert(normalize("http://user:pass@1.2.3.4:3128").unwrap());
+        app.pool.update_health(&[(
             id,
             HealthUpdate {
                 alive: true,
@@ -361,17 +440,13 @@ mod tests {
                 probes: Vec::new(),
             },
         )]);
-        let store = Arc::new(StateStore::new(
-            std::env::temp_dir().join("proxygate-api-test"),
-        ));
-        Arc::new(ApiState::new(
-            pool,
-            store,
-            Strategy::Random,
-            Duration::from_secs(1800),
-            vec!["https://example.com/generate_204".to_string()],
-            HealthRequirement::All,
-        ))
+        app.readiness.mark_ready();
+        Arc::new(ApiState::new(app))
+    }
+
+    /// 冷启动还没做完的共享状态。
+    fn initializing_state() -> Arc<ApiState> {
+        Arc::new(ApiState::new(test_app()))
     }
 
     async fn body_string(response: Response) -> String {
@@ -492,17 +567,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_pool_answers_503() {
-        let pool = Arc::new(ProxyPool::new());
-        let state = Arc::new(ApiState::new(
-            pool,
-            Arc::new(StateStore::new(
-                std::env::temp_dir().join("proxygate-api-empty"),
-            )),
-            Strategy::Random,
-            Duration::from_secs(1800),
-            vec!["https://example.com/generate_204".to_string()],
-            HealthRequirement::All,
-        ));
+        let state = test_state_ready_with_empty_pool();
         let response = router(state)
             .oneshot(
                 Request::builder()
@@ -513,5 +578,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_string(response).await;
+        assert!(
+            !body.contains("initializing"),
+            "an empty pool is not the same as a cold start: {body}"
+        );
+    }
+
+    /// 已就绪但池子是空的：`/get` 应当说"没有可用代理"，而不是"还在初始化"。
+    fn test_state_ready_with_empty_pool() -> Arc<ApiState> {
+        let app = test_app();
+        app.readiness.mark_ready();
+        Arc::new(ApiState::new(app))
+    }
+
+    #[tokio::test]
+    async fn a_cold_process_answers_503_with_retry_after() {
+        let state = initializing_state();
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/get")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .expect("Retry-After"),
+            INITIALIZE_RETRY_SECONDS.to_string().as_str()
+        );
+        let body = body_string(response).await;
+        assert!(body.contains("initializing"), "{body}");
+
+        // 同一个进程里，健康检查也会如实说明自己还没就绪。
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(value["ready"], false);
+        assert_eq!(value["initializing"], false);
+        assert_eq!(value["initialization_attempts"], 0);
+        assert_eq!(
+            value["status"], "initializing",
+            "an empty pool during a cold start is not the same as an empty config"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cold_process_explains_itself_in_json() {
+        let response = router(initializing_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/get?format=json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(value["error"], "initializing");
+        assert_eq!(value["retry_after_seconds"], INITIALIZE_RETRY_SECONDS);
+    }
+
+    #[tokio::test]
+    async fn a_ready_pool_reports_ready_in_health() {
+        let response = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(value["ready"], true);
+        assert!(value["initialization_error"].is_null());
     }
 }

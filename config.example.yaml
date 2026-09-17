@@ -29,6 +29,11 @@ server:
 # check (dead endpoints, and proxies that intercept TLS with their own
 # certificate — ProxyGate refuses those), and expect rate limits, so leave
 # `refresh.interval` at 10m or slower.
+#
+# A paginated source expands into one subscriber per page (`rola-ip#1` …
+# `rola-ip#10`), so `proxygate refresh` reports every page separately and a page
+# that fails does not hide the rest. Nothing to configure here: the page range
+# lives in the catalog, and `proxygate providers` prints it.
 builtin-subscribers: enabled
 
 subscribers:

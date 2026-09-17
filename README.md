@@ -123,6 +123,11 @@ proxygate genconfig > config.yaml     # 带注释的完整示例，直接重定�
 
 时⻓支持 `30s`、`10m`、`2h`、`1d`、`250ms`、`1h30m` 或纯秒数。
 
+> **开满内置来源后池子会变大**：全部 13 条订阅源（rola-ip 的 10 页 + 另外 3 个）一次
+> 冷启动抓到约 5,200 条代理，一遍健康探测要几分钟（实测 5,157 条约 3.5 分钟，66 条存活）。
+> `health.interval` 默认 30s，池子这么大时探测基本是连轴转的——想让它喘口气就把
+> `health.interval` 加到 `10m`，或者给来源加 `limit` 少抓一点。
+
 > **注意 `health.targets` 的语义**：探测请求是**通过代理**发出的，所以「你本机连不上
 > Google」不是问题——要连上的是代理。默认两个目标里，Google 只有代理真的能出国才会
 > 应答，`cn.bing.com` 则证明这条隧道不是对所有站点都坏。默认 `require: any`，通一个
@@ -165,8 +170,8 @@ builtin-subscribers: enabled      # 订阅目录里的每一个源（genconfig �
 # disabled                        # 只用手写的 subscribers
 ```
 
-`proxygate providers` 列出目录里的全部条目（端点、格式、注意事项、文档地址），也可以
-`--json`。总开关默认 `disabled`（不写就不隐式联网），而 `genconfig` 生成的配置里带的是
+`proxygate providers` 列出目录里的全部条目（端点、格式、分页范围、注意事项、文档地址），
+也可以 `--json`。总开关默认 `disabled`（不写就不隐式联网），而 `genconfig` 生成的配置里带的是
 `enabled`。
 
 也可以只挑一个源，或者单独调参——`builtin` 本质上就是一次 HTTP 拉取，所以支持与 `http`
@@ -314,7 +319,7 @@ $ proxygate get --format json
 | `GET /api/v1/getua` | 一个 User-Agent，`text/plain` |
 | `GET /api/v1/getua?format=json` | `{"user_agent": "Mozilla/5.0 ..."}` |
 | `GET /api/v1/proxies` | 整个池的 JSON，凭据已脱敏 |
-| `GET /api/v1/health` | `{"status": "ok", "proxies": {"total": 2, "alive": 2, ...}}` |
+| `GET /api/v1/health` | `{"status": "initializing"\|"ok"\|"degraded"\|"empty", "ready": true, "proxies": {...}}` |
 | `GET /` | 以上端点的索引 |
 
 ```console
@@ -325,13 +330,30 @@ $ curl -s http://127.0.0.1:8081/api/v1/health
 {"status":"ok","version":"0.1.0","uptime_seconds":42,"generation":3,
  "strategy":"random","health_targets":["https://www.google.com/generate_204",
  "https://cn.bing.com/"],"health_require":"any",
+ "ready":true,"initializing":false,"initialization_attempts":1,
+ "initialization_error":null,
  "proxies":{"total":2,"alive":2,"dead":0}}
+# 冷启动还没做完时 status 是 "initializing"，ready 是 false。
 ```
 
 `server.api: same` 时把上面的 `8081` 换成 `8080` 即可，路径不变。
 
-池内没有可用代理时 `/get` 返回 `503`（含义同退出码 `3`）。`/proxies` 永远不会暴露凭据
-（替换成 `***:***`），但会带上每个代理的逐目标探测结果。
+`/get` 有两种 `503`，靠响应体区分：
+
+| 情况 | 响应体 | 含义 |
+| --- | --- | --- |
+| 冷启动还没做完 | `proxygate: still initializing the proxy pool; retry in 5 seconds` | 还没准备好，`Retry-After: 5`；挂载端口后第一次抓取与探测还在跑 |
+| 池里没有可用代理 | `proxygate: no healthy proxy available` | 已经初始化过了，只是当下确实没有能用（含义同退出码 `3`） |
+
+收到第一种时重试即可：每次请求都会顺手推动后台立刻再试一次初始化，不用自己轮询。
+`/health` 里有 `ready`、`initializing`、`initialization_attempts`、
+`initialization_error` 四个字段，运维看这四个就够。
+
+`serve` **不会**在启动时等抓取完成：它读完本地缓存就把端口挂上（几毫秒），抓取和探测
+在后台跑，所以 `systemd`/`k8s` 的探针能立刻拿到 `503` 而不是连接被拒。缓存新鲜时初始
+化是瞬间完成的，第一次请求就直接拿到代理。
+
+`/proxies` 永远不会暴露凭据（替换成 `***:***`），但会带上每个代理的逐目标探测结果。
 
 ## 网关
 
@@ -543,6 +565,10 @@ SKILL.md         面向 AI agent 的说明（`proxygate skill` 输出它）
   污染时，本地解析会把假地址交给代理。
 - 每个源可以有默认 `limit`，因为一次拉上万条代理会让健康探测循环跑不完。
 - `server.api` 支持 `same`，让 REST API 和代理网关共用一个端口（按请求形状分流）。
+- 内置来源支持**分页**：URL 里写 `{page}`、目录里声明页数，`normalize` 会把它展开成
+  每页一条订阅源，各自计数、各自失败。rola-ip 因此从 500 条变成全部 10 页 4,724 条。
+- `serve` 先挂端口、再在后台初始化；未就绪时 REST API 返回 `503` + `Retry-After`，
+  而不是假装池子是空的。
 - 文档注释一律写成中文，docs.rs 展示的就是它（也正因如此 `proxygate --help`
   的内容是中文）。`SKILL.md` 保持英文，因为它面向 agent。
 

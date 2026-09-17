@@ -88,11 +88,21 @@ shelling out. Default port is `127.0.0.1:8081`.
 | `GET /api/v1/getua` | a user agent as `text/plain` |
 | `GET /api/v1/getua?format=json` | `{"user_agent":"Mozilla/5.0 ..."}` |
 | `GET /api/v1/proxies` | the pool as JSON, credentials masked as `***:***` |
-| `GET /api/v1/health` | `{"status":"ok","proxies":{"total":2,"alive":2,"dead":0}, ...}` |
+| `GET /api/v1/health` | `{"status":"ok"\|"initializing"\|"degraded"\|"empty","ready":true,"proxies":{"total":2,"alive":2,"dead":0}, ...}` |
 | `GET /` | an index of the endpoints |
 
-`/api/v1/get` answers `503` when the pool has nothing healthy — same meaning as
-exit code `3`.
+`/api/v1/get` answers `503` in two situations, told apart by the body:
+
+* **still cold** — `proxygate: still initializing the proxy pool; retry in 5
+  seconds`, with `Retry-After: 5`. Retry; each request also nudges the
+  background initialization. Use `GET /api/v1/health` and look at `ready`.
+* **nothing healthy** — `proxygate: no healthy proxy available`, same meaning as
+  exit code `3`.
+
+`serve` binds its ports immediately and initializes in the background, so a
+service that has never fetched before answers `503` (not a refused connection)
+for the first few seconds. With `?format=json` the cold answer is
+`{"error":"initializing","retry_after_seconds":5, ...}`.
 
 The API can share the gateway port (`serve --api same`, or `server.api: same`):
 `CONNECT` and absolute-form requests go to the proxy, origin-form paths such as
@@ -103,7 +113,8 @@ interface.
 ## Built-in sources
 
 `proxygate providers` lists the curated catalog of public endpoints shipped in
-the binary. One switch subscribes to all of them:
+the binary (the `PAGES` column shows which ones are paginated). One switch
+subscribes to all of them:
 
 ```yaml
 builtin-subscribers: enabled
@@ -121,10 +132,19 @@ subscribers:
 `proxygate genconfig` writes `builtin-subscribers: enabled`, so
 `genconfig > config.yaml` followed by a `get` works with no editing. Each entry
 is an HTTP fetch with the catalog's payload format; `url`/`format`/`timeout`/
-`limit` can be overridden. Treat these sources as best-effort: they are free
-lists, they rate limit, and most of what they return fails the health check —
-roughly 25 of 1500 freshly fetched ones passed in testing, and they rot within
-minutes, so ask for a new proxy per task instead of caching one.
+`limit` can be overridden. A paginated source (rola-ip: `{page}` in the URL plus
+a page range in the catalog) expands into one subscriber per page, named
+`rola-ip#1` … `rola-ip#10`, so `refresh` shows the count for every page and one
+failing page does not hide the rest.
+
+Treat these sources as best-effort: they are free lists, they rate limit, and
+most of what they return fails the health check — in a full live run all four
+sources parsed cleanly (0 rejected) but most entries were dead or unsupported,
+and they rot within minutes, so ask for a new proxy per task instead of caching
+one. A cold `refresh` of everything takes about four minutes, almost all of it
+the 2.5 MB GitHub list; with all built-ins enabled the pool holds ~5,200 proxies
+and one health pass over it takes minutes, so the default 30s `health.interval`
+means near-continuous probing at that size.
 
 ## Configuration
 
