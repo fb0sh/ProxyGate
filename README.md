@@ -129,29 +129,34 @@ proxygate genconfig > config.yaml     # 带注释的完整示例，直接重定�
 
 四种：`builtin`（内置源）、`http`、`file`、`exec`。
 
-`builtin` 指向代码里维护的**内置源目录**，配置里只写名字，不用抄 URL：
+`builtin` 指向代码里维护的**内置源目录**。不想逐个挑的话，一个总开关就够：
 
 ```yaml
-subscribers:
-  - name: scdn
-    type: builtin
-    provider: scdn
+builtin-subscribers: enabled      # 订阅目录里的每一个源（genconfig 写的就是这行）
+# disabled                        # 只用手写的 subscribers
 ```
 
 `proxygate providers` 列出目录里的全部条目（端点、格式、注意事项、文档地址），也可以
-`--json`。`proxygate genconfig` 生成的配置**默认启用目录里的每一个源**——新装一台机器，
-`genconfig` 之后直接 `refresh` 就有池子。
+`--json`。总开关默认 `disabled`（不写就不隐式联网），而 `genconfig` 生成的配置里带的是
+`enabled`。
 
-每个条目本质上就是一次 HTTP 拉取，所以 `builtin` 支持与 `http` 相同的覆盖项：
+也可以只挑一个源，或者单独调参——`builtin` 本质上就是一次 HTTP 拉取，所以支持与 `http`
+相同的覆盖项，外加一个 `limit`：
 
 ```yaml
+subscribers:
   - name: scdn-cn
     type: builtin
     provider: scdn
     url: https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20&country_code=CN
     format: json      # 默认取目录里的格式
-    timeout: 20s
+    timeout: 20s      # 目录可以给某个源更长的超时
+    limit: 200        # 最多保留多少个可用代理（0 = 不限）
 ```
+
+`limit` 是给「一个源返回上万条」准备的：健康探测要把池子里每个代理都探一遍，16,000 条在
+默认并发下就是十二分钟一轮。目录里对那个大源设了 1000 的默认上限，按返回顺序取（大列表
+基本是按速度从快到慢排的），配置里可以自己改。
 
 另外三种是通用的，其余情况用最后一个逃生口：
 
@@ -183,6 +188,17 @@ subscriber 的唯一职责是产出代理 URL：`exec` 在 stdout 上一行一�
 Clash / Clash.Meta 的 `proxies:` 列表。其他格式都交给脚本，见
 [`subscribers/README.md`](subscribers/README.md) 和
 [`subscribers/example.py`](subscribers/example.py)。
+
+subscriber 返回体里的协议字段也认：`protocol`（字符串）、`protocols`（数组）、
+`"socks4+socks5"` 这种拼接串都能识别。命名规则是：
+
+| 返回体里写的 | 归一化为 | 原因 |
+| --- | --- | --- |
+| `http` / `https` / `ssl` | `http://` | 列表里的 https 指「这个代理能 CONNECT 到 HTTPS」，不是「对代理做 TLS」 |
+| `socks5` / `socks5h` / `socks` | `socks5h://` | 让代理去解析域名：本机 DNS 被污染时，`socks5://`（本地解析）会把假 IP 交给代理，探测和实际使用都会失败 |
+| `socks4` / 其它 | 丢弃 | v0.1 不能用 |
+
+同一行既写 `http` 又写 `socks5` 时优先 `http`。
 
 接受的 URL 写法：
 
@@ -478,8 +494,12 @@ SKILL.md         面向 AI agent 的说明（`proxygate skill` 输出它）
   说明里只有一个 `target`。默认目标是 Google 加 `cn.bing.com`。
 - **从未成功过的代理一次失败即判死**，`health.max_failures` 只对原本可用的代理生效。
 - `https://` 上游在加载列表时就被拒绝，而不是接受之后在 CONNECT 阶段失败。
-- 多了第四种 subscriber `builtin`：设计说明只写了 http/file/exec，但「内置源目录」让
-  URL 和格式集中维护，配置里只写名字。它做的仍然只是一次 HTTP 拉取。
+- 多了第四种 subscriber `builtin` 和一个 `builtin-subscribers` 总开关：设计说明只写了
+  http/file/exec，但「内置源目录」让 URL、格式和限流说明集中维护，配置里只写名字。它做的
+  仍然只是一次 HTTP 拉取。
+- 返回体里的协议字段会被归一化（上表），其中 `socks5` → `socks5h` 是刻意的：本机 DNS 被
+  污染时，本地解析会把假地址交给代理。
+- 每个源可以有默认 `limit`，因为一次拉上万条代理会让健康探测循环跑不完。
 
 ## 许可
 

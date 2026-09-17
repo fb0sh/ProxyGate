@@ -134,30 +134,36 @@ that reaches either one; the `TARGETS` column tells you which.
 Four kinds: `builtin` (a curated source), `http`, `file`, and the `exec` escape
 hatch.
 
-`builtin` refers to the catalog maintained in the code, so a config only names a
-source instead of repeating its URL:
+`builtin` refers to the catalog maintained in the code. One switch subscribes to
+all of it:
 
 ```yaml
-subscribers:
-  - name: scdn
-    type: builtin
-    provider: scdn
+builtin-subscribers: enabled      # subscribe to every catalog entry
+# disabled                        # use only the subscribers you write
 ```
 
 `proxygate providers` lists the whole catalog (endpoint, format, caveats, docs)
-and takes `--json`. `proxygate genconfig` **enables every entry by default**, so
-a fresh machine gets a working pool from `genconfig` + `refresh`.
+and takes `--json`. The switch defaults to `disabled` — nothing reaches the
+network unless a config says so — and `genconfig` writes `enabled`.
 
-A builtin is an HTTP fetch underneath, so it accepts the same overrides:
+A single source can also be picked by name and tuned. A builtin is an HTTP fetch
+underneath, so it takes the same overrides plus `limit`:
 
 ```yaml
+subscribers:
   - name: scdn-cn
     type: builtin
     provider: scdn
     url: https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20&country_code=CN
     format: json      # defaults to the catalog format
-    timeout: 20s
+    timeout: 20s      # the catalog can give a source a longer one
+    limit: 200        # keep at most this many usable proxies (0 = no cap)
 ```
+
+`limit` exists because the health checker probes every proxy it is given: 16,000
+of them is a twelve minute pass at the default concurrency. The catalog caps the
+one huge source at 1000, taking entries in the order returned (big lists are
+ordered fastest-first).
 
 The other three kinds, for everything else:
 
@@ -191,6 +197,18 @@ and arbitrarily nested envelopes such as
 `proxies:` lists. Anything else belongs in a script; see
 [`subscribers/README.md`](subscribers/README.md) and
 [`subscribers/example.py`](subscribers/example.py).
+
+Protocol fields in payloads are understood in the shapes lists actually use:
+`protocol` as a string, `protocols` as an array, and joined strings like
+`"socks4+socks5"`. The mapping:
+
+| The payload says | Becomes | Why |
+| ---------------- | ------- | --- |
+| `http` / `https` / `ssl` | `http://` | in a list, "https" means the proxy can CONNECT to HTTPS, not TLS-to-proxy |
+| `socks5` / `socks5h` / `socks` | `socks5h://` | the proxy resolves names: with poisoned local DNS, `socks5://` hands the proxy a bogus address and both the probe and real use fail |
+| `socks4`, anything else | dropped | v0.1 cannot tunnel it |
+
+An entry offering both picks `http`.
 
 Accepted URL shapes:
 
@@ -520,8 +538,14 @@ Deviations from the v0.1 design notes, each for a reason found while building it
   broken for everything else.
 * `https://` upstream proxies are rejected when a list is loaded rather than
   accepted and then failing at CONNECT time.
-* A fourth subscriber kind, `builtin`, points at the curated catalog so endpoints
-  and formats live in one place; it is still just an HTTP fetch underneath.
+* A fourth subscriber kind, `builtin`, plus a `builtin-subscribers` switch, point
+  at the curated catalog so endpoints, formats and rate-limit notes live in one
+  place; it is still just an HTTP fetch underneath.
+* Payload protocol fields are normalized per the table above. `socks5` becoming
+  `socks5h` is deliberate: with poisoned local DNS, resolving on the client side
+  hands the proxy a bogus address.
+* A source can carry a default `limit`, because pulling tens of thousands of
+  proxies makes the health loop unable to keep up with its own interval.
 
 ## License
 

@@ -40,6 +40,8 @@ pub struct FetchOutcome {
     pub rejected: Vec<String>,
     /// Entries the parser deliberately ignored (e.g. unsupported clash types).
     pub skipped: usize,
+    /// Usable proxies dropped because the source has a `limit`.
+    pub truncated: usize,
     pub duration: Duration,
     pub error: Option<String>,
 }
@@ -114,6 +116,7 @@ impl SubscriberSet {
             proxies: Vec::new(),
             rejected: Vec::new(),
             skipped: 0,
+            truncated: 0,
             duration: Duration::ZERO,
             error: None,
         };
@@ -145,8 +148,28 @@ impl SubscriberSet {
             Err(error) => outcome.error = Some(error.to_string()),
         }
 
+        // Keep the cap last, so it applies to usable proxies rather than to
+        // whatever the source happened to list first.
+        outcome.truncated = apply_limit(&mut outcome.proxies, self.limit_for(subscriber));
+
         outcome.duration = started.elapsed();
         outcome
+    }
+
+    /// Effective per-source cap: the config wins, `0` means unlimited, and
+    /// otherwise the catalog's own cap applies.
+    fn limit_for(&self, subscriber: &SubscriberConfig) -> Option<usize> {
+        let SubscriberConfig::Builtin {
+            provider, limit, ..
+        } = subscriber
+        else {
+            return None;
+        };
+        match limit {
+            Some(0) => None,
+            Some(explicit) => Some(*explicit),
+            None => crate::providers::find(provider).and_then(|entry| entry.limit),
+        }
     }
 
     async fn read_payload(&self, subscriber: &SubscriberConfig) -> Result<String> {
@@ -173,7 +196,9 @@ impl SubscriberSet {
                     ),
                 })?;
                 let url = url.as_deref().unwrap_or(entry.url);
-                self.fetch_http(subscriber, url, &BTreeMap::new(), *timeout)
+                // The catalog may know this endpoint needs longer than the
+                // global `refresh.timeout`; an explicit config value wins.
+                self.fetch_http(subscriber, url, &BTreeMap::new(), timeout.or(entry.timeout))
                     .await
             }
             SubscriberConfig::File { path, .. } => tokio::fs::read_to_string(path)
@@ -284,6 +309,34 @@ async fn run_command(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Effective per-source cap: the config wins, `0` means unlimited, and
+/// otherwise the catalog's own cap applies. Only `builtin` entries have one.
+pub fn effective_limit(subscriber: &SubscriberConfig) -> Option<usize> {
+    let SubscriberConfig::Builtin {
+        provider, limit, ..
+    } = subscriber
+    else {
+        return None;
+    };
+    match limit {
+        Some(0) => None,
+        Some(explicit) => Some(*explicit),
+        None => crate::providers::find(provider).and_then(|entry| entry.limit),
+    }
+}
+
+/// Truncates a proxy list to `limit`, returning how many were dropped.
+pub fn apply_limit(proxies: &mut Vec<Url>, limit: Option<usize>) -> usize {
+    match limit {
+        Some(limit) if proxies.len() > limit => {
+            let dropped = proxies.len() - limit;
+            proxies.truncate(limit);
+            dropped
+        }
+        _ => 0,
+    }
+}
+
 /// Result of running a payload through one of the built-in format parsers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedPayload {
@@ -338,6 +391,13 @@ fn parse_json_value(value: &JsonValue) -> ParsedPayload {
 
 const MAX_DEPTH: usize = 6;
 
+/// Keys whose array value holds the proxies.
+const CONTAINER_KEYS: [&str; 5] = ["proxies", "data", "items", "list", "result"];
+
+/// Keys that hold a proxy endpoint, as a host name or a full URL.
+const HOST_KEYS: [&str; 6] = ["server", "host", "hostname", "ip", "address", "addr"];
+const URL_KEYS: [&str; 4] = ["url", "proxy", "uri", "address_url"];
+
 fn walk(value: &JsonValue, parsed: &mut ParsedPayload, depth: usize) {
     if depth > MAX_DEPTH {
         parsed.skipped += 1;
@@ -356,28 +416,42 @@ fn walk(value: &JsonValue, parsed: &mut ParsedPayload, depth: usize) {
             }
         }
         JsonValue::Object(map) => {
-            // Recognised containers first: `{"proxies":[...]}`, `{"data":[...]}`.
-            let mut nested = false;
-            for key in ["proxies", "data", "items", "list", "result"] {
-                if let Some(inner) = map.get(key) {
-                    if inner.is_array() {
-                        walk(inner, parsed, depth + 1);
-                        nested = true;
+            let host = lookup(map, &HOST_KEYS);
+            let url = lookup(map, &URL_KEYS);
+
+            // Recognised containers first, but only on something that is not
+            // itself a proxy entry: `{"proxies":[...]}`, `{"data":[...]}`.
+            if host.is_none() && url.is_none() {
+                let mut nested = false;
+                for key in CONTAINER_KEYS {
+                    if let Some(inner) = map.get(key) {
+                        if inner.is_array() {
+                            walk(inner, parsed, depth + 1);
+                            nested = true;
+                        }
                     }
                 }
-            }
-            if nested {
-                return;
+                if nested {
+                    return;
+                }
             }
 
             // A full URL under a known key, or a proxy described by fields.
-            let explicit = lookup(map, &["url", "proxy", "uri", "address_url"]);
-            if let Some(url) = explicit {
+            if let Some(url) = url {
                 parsed.candidates.push(url);
                 return;
             }
             if let Some(candidate) = proxy_from_fields(map) {
                 parsed.candidates.push(candidate);
+                return;
+            }
+
+            // It has a host but named a protocol ProxyGate cannot tunnel
+            // (socks4, vmess, ...). Count it and stop here: descending into its
+            // fields would mine metadata — `"protocols": ["socks4"]` is a list of
+            // protocol names, not a list of proxies.
+            if host.is_some() {
+                parsed.skipped += 1;
                 return;
             }
 
@@ -413,13 +487,12 @@ fn lookup(map: &serde_json::Map<String, JsonValue>, keys: &[&str]) -> Option<Str
 /// Returns `None` for entries whose protocol ProxyGate cannot use (Shadowsocks,
 /// VMess, Trojan, ...) so that they are reported as skipped rather than rejected.
 fn proxy_from_fields(map: &serde_json::Map<String, JsonValue>) -> Option<String> {
-    let host = lookup(
-        map,
-        &["server", "host", "hostname", "ip", "address", "addr"],
-    )?;
-    let scheme =
-        lookup(map, &["type", "scheme", "protocol", "proxy_type"]).unwrap_or_else(|| "http".into());
-    let scheme = ProxyScheme::parse(&scheme)?;
+    let host = lookup(map, &HOST_KEYS)?;
+
+    // Which protocol the entry claims. A list source may express it as a string
+    // (`"protocol": "HTTP"`), as a list (`"protocols": ["https"]`), or as a
+    // joined string (`"socks4+socks5"`); all three are common in the wild.
+    let scheme = scheme_from_fields(map)?;
 
     let port = map
         .get("port")
@@ -445,6 +518,61 @@ fn proxy_from_fields(map: &serde_json::Map<String, JsonValue>) -> Option<String>
     };
 
     Some(format!("{}://{auth}{host}:{port}", scheme.as_str()))
+}
+
+/// The scheme an entry advertises, or `None` when ProxyGate cannot use it.
+///
+/// Naming is loose in these lists: `https` means "an HTTP proxy that can also
+/// CONNECT to HTTPS", not "TLS to the proxy", and `socks5` becomes
+/// [`ProxyScheme::Socks5h`] so the *proxy* resolves names. That matters: a
+/// client on a network with poisoned DNS resolving `www.google.com` itself
+/// would hand the proxy a bogus address, while remote resolution works.
+fn scheme_from_fields(map: &serde_json::Map<String, JsonValue>) -> Option<ProxyScheme> {
+    let mut named: Vec<String> = Vec::new();
+    for key in ["type", "scheme", "protocol", "protocols", "proxy_type"] {
+        if let Some(value) = map.get(key) {
+            collect_scheme_names(value, &mut named);
+        }
+    }
+
+    // Nothing said: a bare `host:port` is an HTTP proxy by convention.
+    if named.is_empty() {
+        return Some(ProxyScheme::Http);
+    }
+    if named
+        .iter()
+        .any(|name| matches!(name.as_str(), "http" | "https" | "ssl"))
+    {
+        return Some(ProxyScheme::Http);
+    }
+    if named
+        .iter()
+        .any(|name| matches!(name.as_str(), "socks5" | "socks5h" | "socks"))
+    {
+        return Some(ProxyScheme::Socks5h);
+    }
+    None
+}
+
+/// Flattens a protocol field (string, list or joined string) into lowercased
+/// names, so `["http", "socks5"]` and `"socks4+socks5"` both work.
+fn collect_scheme_names(value: &JsonValue, out: &mut Vec<String>) {
+    match value {
+        JsonValue::String(text) => {
+            for name in text
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|name| !name.is_empty())
+            {
+                out.push(name.to_ascii_lowercase());
+            }
+        }
+        JsonValue::Array(items) => {
+            for item in items {
+                collect_scheme_names(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Percent-encodes the characters that would break a URL's userinfo section.
@@ -508,7 +636,7 @@ mod tests {
             parsed.candidates,
             vec![
                 "http://u:p@1.2.3.4:8080".to_string(),
-                "socks5://5.6.7.8:3128".to_string(),
+                "socks5h://5.6.7.8:3128".to_string(),
                 "http://7.7.7.7:8000".to_string(),
             ]
         );
@@ -544,6 +672,113 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_protocol_field_in_every_shape_lists_use() {
+        // Real payloads name the protocol as a string, as a list, as a joined
+        // string, and in mixed case.
+        let payload = r#"[
+            {"ip": "1.1.1.1", "port": 80, "protocol": "HTTP"},
+            {"ip": "2.2.2.2", "port": 80, "protocol": "HTTPS"},
+            {"ip": "3.3.3.3", "port": 1080, "protocol": "Socks5"},
+            {"ip": "4.4.4.4", "port": 1080, "protocols": ["socks5"]},
+            {"ip": "5.5.5.5", "port": 8080, "protocols": ["https"]},
+            {"ip": "6.6.6.6", "port": 8080, "protocols": ["http", "socks5"]},
+            {"ip": "7.7.7.7", "port": 1080, "protocol": "socks4+socks5"},
+            {"ip": "8.8.8.8", "port": 1080, "protocol": "SOCKS4"},
+            {"ip": "9.9.9.9", "port": 1080, "protocols": ["socks4"]},
+            {"ip": "10.10.10.10", "port": 3128}
+        ]"#;
+        let parsed = parse_payload(payload, Format::Json).unwrap();
+        let rendered: Vec<String> = parsed
+            .candidates
+            .iter()
+            .map(|candidate| model::render_url(&model::normalize(candidate).unwrap(), true))
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "http://1.1.1.1:80".to_string(),
+                // `https` in a list means "can CONNECT to HTTPS", not TLS-to-proxy.
+                "http://2.2.2.2:80".to_string(),
+                // socks5 becomes socks5h: the proxy resolves names, which is what
+                // makes blocked destinations work from a poisoned-DNS network.
+                "socks5h://3.3.3.3:1080".to_string(),
+                "socks5h://4.4.4.4:1080".to_string(),
+                "http://5.5.5.5:8080".to_string(),
+                // An entry offering both: HTTP wins, it is the safer default.
+                "http://6.6.6.6:8080".to_string(),
+                "socks5h://7.7.7.7:1080".to_string(),
+                // The last one said nothing, so it keeps the host:port convention.
+                "http://10.10.10.10:3128".to_string(),
+            ]
+        );
+        assert_eq!(parsed.skipped, 2, "socks4-only entries are not usable");
+    }
+
+    #[test]
+    fn limits_are_resolved_from_config_then_catalog() {
+        use crate::config::SubscriberConfig;
+
+        let builtin = |limit| SubscriberConfig::Builtin {
+            name: "x".into(),
+            provider: "freeproxy-gh".into(),
+            url: None,
+            format: None,
+            timeout: None,
+            limit,
+            enabled: true,
+        };
+
+        // No config value: the catalog's cap applies.
+        assert_eq!(effective_limit(&builtin(None)), Some(1000));
+        // A config value wins.
+        assert_eq!(effective_limit(&builtin(Some(25))), Some(25));
+        // `0` means "no cap".
+        assert_eq!(effective_limit(&builtin(Some(0))), None);
+
+        // A provider without a catalog cap stays uncapped.
+        let uncapped = SubscriberConfig::Builtin {
+            name: "x".into(),
+            provider: "scdn".into(),
+            url: None,
+            format: None,
+            timeout: None,
+            limit: None,
+            enabled: true,
+        };
+        assert_eq!(effective_limit(&uncapped), None);
+
+        // Other kinds never have a cap.
+        let file = SubscriberConfig::File {
+            name: "f".into(),
+            path: "x".into(),
+            format: Format::Plaintext,
+            enabled: true,
+        };
+        assert_eq!(effective_limit(&file), None);
+    }
+
+    #[test]
+    fn the_limit_cuts_the_usable_end_of_the_list() {
+        let mut proxies: Vec<url::Url> = (1..=10)
+            .map(|i| model::normalize(&format!("10.0.0.{i}:8080")).unwrap())
+            .collect();
+
+        assert_eq!(apply_limit(&mut proxies, None), 0);
+        assert_eq!(proxies.len(), 10);
+        assert_eq!(apply_limit(&mut proxies, Some(50)), 0);
+        assert_eq!(proxies.len(), 10);
+
+        assert_eq!(apply_limit(&mut proxies, Some(4)), 6);
+        assert_eq!(proxies.len(), 4);
+        assert_eq!(
+            proxies[0].host_str(),
+            Some("10.0.0.1"),
+            "keeps the first entries"
+        );
+    }
+
+    #[test]
     fn parses_clash_proxies() {
         let payload = r#"
 proxies:
@@ -576,8 +811,9 @@ proxies:
             "http://user:p%40ss%20word@1.2.3.4:8080"
         );
 
+        // A clash entry naming socks5 becomes socks5h: the proxy resolves names.
         let second = model::normalize(&parsed.candidates[1]).unwrap();
-        assert_eq!(model::render_url(&second, true), "socks5://5.6.7.8:1080");
+        assert_eq!(model::render_url(&second, true), "socks5h://5.6.7.8:1080");
     }
 
     #[test]

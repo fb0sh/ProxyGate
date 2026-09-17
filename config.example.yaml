@@ -14,28 +14,31 @@ server:
   # Address of the REST API.
   api: 127.0.0.1:8081
 
-# Where proxies come from: builtin, http, file or exec.
+# Where proxies come from.
+#
+# `builtin-subscribers: enabled` subscribes to every source in the catalog that
+# ProxyGate ships (`proxygate providers` lists them with their endpoints,
+# formats and caveats). Set it to `disabled` to use only the sources you write
+# yourself below.
+#
+# They are free/public lists: expect most of what they return to fail the health
+# check (dead endpoints, and proxies that intercept TLS with their own
+# certificate — ProxyGate refuses those), and expect rate limits, so leave
+# `refresh.interval` at 10m or slower.
+builtin-subscribers: enabled
+
 subscribers:
-  # Built-in sources. ProxyGate ships a catalog of public endpoints; this file
-  # enables every entry in it, and `proxygate providers` lists them all with
-  # their endpoints, formats and caveats.
+  # Your own sources go here: builtin, http, file or exec. Individual catalog
+  # entries can be picked by name, and any of them can be tuned, e.g.
   #
-  # They are free/public lists: expect most of what they return to fail the
-  # health check (dead endpoints, and proxies that intercept TLS with their own
-  # certificate — ProxyGate refuses those), and expect rate limits, so leave
-  # `refresh.interval` at 10m or slower.
-  - name: scdn
-    type: builtin
-    provider: scdn
-    # A builtin entry is an HTTP fetch, so it takes the same optional overrides:
-    #   url:    https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20&country_code=CN
-    #   format: json
-    #   timeout: 20s
-
-  # ---------------------------------------------------------------------------
-  # The other three kinds, commented out. Uncomment and adjust what you need.
-  # ---------------------------------------------------------------------------
-
+  # - name: scdn-cn
+  #   type: builtin
+  #   provider: scdn
+  #   url: https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20&country_code=CN
+  #   format: json
+  #   timeout: 20s
+  #   limit: 200          # keep at most this many (0 = no cap)
+  #
   # A plain URL: one proxy per line, `#` starts a comment.
   # - name: provider-a
   #   type: http
@@ -44,13 +47,13 @@ subscribers:
   #   timeout: 20s
   #   headers:                   # for endpoints that need a token
   #     Authorization: Bearer <token>
-
+  #
   # A local file.
   # - name: local
   #   type: file
   #   path: ./proxies.txt
   #   format: plaintext
-
+  #
   # The escape hatch: run a command and read proxy URLs from its stdout.
   # Whatever the provider's format is (HTML, base64, protobuf, a signed API),
   # the script does the parsing and ProxyGate stays simple.

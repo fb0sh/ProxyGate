@@ -24,6 +24,11 @@ pub const CACHE_DIR_ENV: &str = "PROXYGATE_CACHE_DIR";
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Config {
+    /// Subscribe to every entry in the built-in catalog
+    /// ([`crate::providers`]) in addition to whatever `subscribers` lists.
+    /// `proxygate genconfig` writes `enabled`.
+    #[serde(rename = "builtin-subscribers", default)]
+    pub builtin_subscribers: BuiltinSubscribers,
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
@@ -247,6 +252,10 @@ pub enum SubscriberConfig {
         format: Option<Format>,
         #[serde(default, deserialize_with = "de::opt_duration")]
         timeout: Option<Duration>,
+        /// Keep at most this many usable proxies (0 = every one). Defaults to
+        /// the catalog's own cap, if it has one.
+        #[serde(default)]
+        limit: Option<usize>,
         #[serde(default = "default_true")]
         enabled: bool,
     },
@@ -366,6 +375,32 @@ impl std::str::FromStr for Format {
     }
 }
 
+/// The `builtin-subscribers` switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BuiltinSubscribers {
+    /// Add every catalog entry that is not already listed by name.
+    Enabled,
+    /// Use only the subscribers written in the config file.
+    #[default]
+    Disabled,
+}
+
+impl BuiltinSubscribers {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BuiltinSubscribers::Enabled => "enabled",
+            BuiltinSubscribers::Disabled => "disabled",
+        }
+    }
+}
+
+impl std::fmt::Display for BuiltinSubscribers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What "alive" means when several health targets are configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -476,6 +511,35 @@ impl Config {
         for (index, subscriber) in self.subscribers.iter_mut().enumerate() {
             if subscriber.name().trim().is_empty() {
                 subscriber.set_name(format!("{}-{}", subscriber.kind(), index + 1));
+            }
+        }
+
+        // `builtin-subscribers: enabled` expands the catalog into ordinary
+        // builtin subscribers, so the config can stay a single line while the
+        // endpoints live in one place. A provider that is already listed (by
+        // name, or by `provider:`) is left alone; so is a name a hand-written
+        // subscriber already uses, rather than failing on a duplicate.
+        if self.builtin_subscribers == BuiltinSubscribers::Enabled {
+            for provider in crate::providers::ALL {
+                let already = self.subscribers.iter().any(|subscriber| {
+                    subscriber.name() == provider.name
+                        || matches!(
+                            subscriber,
+                            SubscriberConfig::Builtin { provider: id, .. } if id == provider.name
+                        )
+                });
+                if already {
+                    continue;
+                }
+                self.subscribers.push(SubscriberConfig::Builtin {
+                    name: provider.name.to_string(),
+                    provider: provider.name.to_string(),
+                    url: None,
+                    format: None,
+                    timeout: None,
+                    limit: None,
+                    enabled: true,
+                });
             }
         }
 
@@ -1076,6 +1140,75 @@ subscribers:
                 .all(|name| error.contains(name)),
             "the error should list what is available: {error}"
         );
+    }
+
+    #[test]
+    fn the_builtin_switch_expands_the_catalog() {
+        let catalog = crate::providers::names();
+
+        // Off by default: a config that says nothing gets nothing implicit.
+        let mut config = Config::default();
+        config.normalize().unwrap();
+        assert!(config.subscribers.is_empty());
+        assert_eq!(config.builtin_subscribers, BuiltinSubscribers::Disabled);
+
+        // `enabled` adds every catalog entry, named after its provider.
+        let mut config: Config = serde_yaml::from_str("builtin-subscribers: enabled\n").unwrap();
+        config.normalize().unwrap();
+        let names: Vec<&str> = config
+            .subscribers
+            .iter()
+            .map(|subscriber| subscriber.name())
+            .collect();
+        assert_eq!(names, catalog);
+        assert!(
+            config
+                .subscribers
+                .iter()
+                .all(|subscriber| subscriber.kind() == "builtin" && subscriber.enabled())
+        );
+
+        // Idempotent: normalizing twice does not double the list.
+        let mut twice = config.clone();
+        twice.normalize().unwrap();
+        assert_eq!(twice.subscribers.len(), catalog.len());
+    }
+
+    #[test]
+    fn the_switch_leaves_handwritten_subscribers_alone() {
+        // A provider picked explicitly is not added a second time, and a name a
+        // hand-written subscriber already uses is not stolen.
+        let mut config: Config = serde_yaml::from_str(
+            r#"
+builtin-subscribers: enabled
+subscribers:
+  - name: scdn
+    type: http
+    url: https://example.com/mine.txt
+"#,
+        )
+        .unwrap();
+        config.normalize().unwrap();
+
+        let builds: Vec<&str> = config
+            .subscribers
+            .iter()
+            .filter(|subscriber| subscriber.kind() == "builtin")
+            .map(|subscriber| subscriber.name())
+            .collect();
+        let expected: Vec<&str> = crate::providers::names()
+            .into_iter()
+            .filter(|name| *name != "scdn")
+            .collect();
+        assert_eq!(builds, expected, "`scdn` was taken by a hand-written entry");
+
+        // And the explicit one is still an http subscriber.
+        let mine = config
+            .subscribers
+            .iter()
+            .find(|subscriber| subscriber.name() == "scdn")
+            .unwrap();
+        assert_eq!(mine.kind(), "http");
     }
 
     #[test]

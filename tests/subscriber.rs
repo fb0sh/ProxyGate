@@ -112,7 +112,8 @@ async fn file_subscriber_reads_json_apis() {
         rendered,
         vec![
             "http://1.2.3.4:8080".to_string(),
-            "socks5://u:p@5.6.7.8:1080".to_string(),
+            // The payload field said `socks5`, so the proxy resolves names.
+            "socks5h://u:p@5.6.7.8:1080".to_string(),
         ]
     );
     assert_eq!(

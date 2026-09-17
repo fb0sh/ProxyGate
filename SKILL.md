@@ -94,7 +94,13 @@ exit code `3`.
 ## Built-in sources
 
 `proxygate providers` lists the curated catalog of public endpoints shipped in
-the binary. A config enables one by name, without repeating its URL:
+the binary. One switch subscribes to all of them:
+
+```yaml
+builtin-subscribers: enabled
+```
+
+or pick one by name:
 
 ```yaml
 subscribers:
@@ -103,11 +109,13 @@ subscribers:
     provider: scdn
 ```
 
-`proxygate genconfig` enables every catalog entry, so `genconfig > config.yaml`
-followed by a `get` works with no editing. Each entry is an HTTP fetch with the
-catalog's payload format; `url`/`format`/`timeout` can be overridden per entry.
-Treat these sources as best-effort: they are free lists, they rate limit, and
-most of what they return fails the health check.
+`proxygate genconfig` writes `builtin-subscribers: enabled`, so
+`genconfig > config.yaml` followed by a `get` works with no editing. Each entry
+is an HTTP fetch with the catalog's payload format; `url`/`format`/`timeout`/
+`limit` can be overridden. Treat these sources as best-effort: they are free
+lists, they rate limit, and most of what they return fails the health check —
+roughly 25 of 1500 freshly fetched ones passed in testing, and they rot within
+minutes, so ask for a new proxy per task instead of caching one.
 
 ## Configuration
 

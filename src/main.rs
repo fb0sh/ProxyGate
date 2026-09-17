@@ -228,6 +228,8 @@ struct RefreshSummary {
     existing: usize,
     removed: usize,
     rejected: usize,
+    /// Usable proxies dropped by a source's `limit`.
+    truncated: usize,
     duration: Duration,
 }
 
@@ -392,15 +394,18 @@ impl App {
         let mut fetched = 0;
         let mut failed = 0;
         let mut rejected = 0;
+        let mut truncated = 0;
         for outcome in &outcomes {
             if outcome.ok() {
                 fetched += outcome.count();
                 rejected += outcome.rejected.len();
+                truncated += outcome.truncated;
                 debug!(
                     subscriber = %outcome.name,
                     found = outcome.count(),
                     rejected = outcome.rejected.len(),
                     skipped = outcome.skipped,
+                    truncated = outcome.truncated,
                     elapsed_ms = outcome.duration.as_millis() as u64,
                     "subscriber fetched"
                 );
@@ -442,6 +447,7 @@ impl App {
             existing: merged.existing,
             removed,
             rejected,
+            truncated,
             duration: started.elapsed(),
         })
     }
@@ -668,6 +674,18 @@ async fn cmd_list(config_path: Option<PathBuf>, args: ListArgs) -> Result<ExitCo
                     "generation": proxy.generation,
                     "last_used_at": proxy.last_used_at.map(state::to_rfc3339),
                     "last_checked_at": proxy.last_checked_at.map(state::to_rfc3339),
+                    // Same shape as `/api/v1/proxies`: which health targets this
+                    // proxy reached, so `list --json` is enough to triage a pool.
+                    "targets": proxy.targets_summary(),
+                    "probes": proxy
+                        .probes
+                        .iter()
+                        .map(|probe| serde_json::json!({
+                            "target": probe.target.as_ref(),
+                            "ok": probe.ok,
+                            "latency_ms": probe.latency.map(|d| d.as_millis() as u64),
+                        }))
+                        .collect::<Vec<_>>(),
                 })
             })
             .collect();
@@ -760,6 +778,7 @@ async fn cmd_refresh(config_path: Option<PathBuf>, args: RefreshArgs) -> Result<
             "existing": summary.existing,
             "removed": summary.removed,
             "rejected": summary.rejected,
+            "truncated": summary.truncated,
             "pool_total": app.pool.len(),
             "duration_ms": summary.duration.as_millis() as u64,
         });
@@ -768,7 +787,7 @@ async fn cmd_refresh(config_path: Option<PathBuf>, args: RefreshArgs) -> Result<
     }
 
     print_stdout(&format!(
-        "subscribers   {} ({} failed)\nfetched       {}\nadded         {}\nexisting      {}\nremoved       {}\nrejected      {}\npool total    {}\nduration      {:.2}s",
+        "subscribers   {} ({} failed)\nfetched       {}\nadded         {}\nexisting      {}\nremoved       {}\nrejected      {}\ntruncated     {}\npool total    {}\nduration      {:.2}s",
         summary.subscribers,
         summary.failed,
         summary.fetched,
@@ -776,6 +795,7 @@ async fn cmd_refresh(config_path: Option<PathBuf>, args: RefreshArgs) -> Result<
         summary.existing,
         summary.removed,
         summary.rejected,
+        summary.truncated,
         app.pool.len(),
         summary.duration.as_secs_f64()
     ))?;
