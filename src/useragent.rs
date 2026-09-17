@@ -1,8 +1,9 @@
 //! Built-in user agent pool.
 //!
 //! `proxygate getua` and `GET /api/v1/getua` hand out one of the user agents
-//! embedded in [`assets/user_agents.txt`](../assets/user_agents.txt) (100 of
-//! them, browser traffic spread over the usual platforms).
+//! embedded in [`assets/user_agents.txt`](../assets/user_agents.txt): 100
+//! desktop browsers (Chrome, Edge, Firefox, Safari on Windows, macOS and
+//! Linux). Mobile agents are deliberately not included.
 //!
 //! The pick is uniform and stateless: no rotation, no memory of what was handed
 //! out before, so the same string can come up twice in a row. That is what
@@ -99,22 +100,34 @@ mod tests {
     }
 
     #[test]
-    fn the_pool_covers_the_usual_platforms() {
+    fn the_pool_covers_the_desktop_platforms() {
         let joined = all().join("\n");
         for marker in [
             "Windows NT",
             "Macintosh",
             "X11; Linux",
-            "iPhone",
-            "iPad",
-            "Android",
-            "Firefox/",
-            "Edg/",
             "Chrome/",
+            "Edg/",
+            "Firefox/",
             "Safari/",
-            "SamsungBrowser/",
         ] {
             assert!(joined.contains(marker), "the pool has no {marker}");
+        }
+    }
+
+    #[test]
+    fn the_pool_is_desktop_only() {
+        for agent in all() {
+            for marker in ["Mobile", "Android", "iPhone", "iPad", "iPod"] {
+                assert!(
+                    !agent.contains(marker),
+                    "a mobile user agent is in a desktop-only pool: {agent}"
+                );
+            }
+            assert!(
+                !agent.contains("SamsungBrowser/"),
+                "Samsung Internet is mobile-only: {agent}"
+            );
         }
     }
 

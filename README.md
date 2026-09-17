@@ -1,12 +1,12 @@
 # ProxyGate
 
-Turn any proxy source into a uniform, always-ready proxy pool.
+**中文** · [English](README.en.md)
 
-ProxyGate collects proxies from HTTP endpoints, local files or arbitrary scripts,
-normalizes whatever it finds into `scheme://user:pass@host:port`, checks which
-ones actually work, and then hands them out — through a CLI, a REST API, or as a
-transparent HTTP proxy gateway that hides the upstream (and its credentials)
-from your clients.
+把任意代理来源，变成一个统一、随时可用的代理池。
+
+ProxyGate 从 HTTP 接口、本地文件或任意脚本里收集代理，统一归一化成
+`scheme://user:pass@host:port`，探测哪些真的能用，然后通过 CLI、REST API 或一个
+透明 HTTP 代理网关把它们发出去——客户端完全看不到上游地址和上游凭据。
 
 ```text
                 Subscribers
@@ -28,44 +28,43 @@ from your clients.
                                 HTTP Proxy
 ```
 
-From the moment a proxy enters the pool, nothing cares where it came from.
+代理一旦进入 Pool，后续任何环节都不再关心它最初是什么格式。
 
-## Quick start
+## 快速开始
 
 ```bash
-# 1. One real upstream proxy.
+# 1. 拿到一个真实可用的上游代理
 proxygate get
 http://user:pass@1.2.3.4:8080
 
-# 2. Use it directly.
+# 2. 直接用它
 curl -x "$(proxygate get)" https://example.com
 
-# 3. Or run the always-on gateway.
+# 3. 或者起一个常驻网关
 proxygate serve
 curl -x http://127.0.0.1:8080 https://example.com
 
-# 4. Or ask the REST API.
+# 4. 或者问 REST API
 curl http://127.0.0.1:8081/api/v1/get
 ```
 
-The gateway can also require credentials of its own:
+网关也可以要求客户端认证：
 
 ```bash
 proxygate serve --listen 0.0.0.0:8080 --auth admin:secret
 curl -x http://admin:secret@127.0.0.1:8080 https://example.com
 ```
 
-Two layers of authentication stay completely independent: your clients
-authenticate to ProxyGate, ProxyGate authenticates to the upstream provider.
+两层认证完全独立：客户端向 ProxyGate 认证，ProxyGate 向上游认证。
 
-## Install
+## 安装
 
 ```bash
 cargo build --release
 install -m755 target/release/proxygate ~/.local/bin/proxygate
 ```
 
-Or with Docker (see [`Dockerfile`](Dockerfile)):
+或者用 Docker（见 [`Dockerfile`](Dockerfile)）：
 
 ```bash
 docker build -t proxygate .
@@ -75,63 +74,64 @@ docker run --rm -p 8080:8080 -p 8081:8081 \
   proxygate
 ```
 
-Requirements: Rust 1.85+ to build. No database, no Redis, no async runtime
-beyond Tokio.
+构建需要 Rust 1.85+。没有数据库、没有 Redis、除 Tokio 外没有别的异步运行时。
 
-CI ([`.github/workflows/build.yml`](.github/workflows/build.yml)) builds two
-platforms on every push and attaches a ready-to-run archive to the run:
-Linux amd64 and macOS arm64.
+CI（[`.github/workflows/build.yml`](.github/workflows/build.yml)）每次 push 都会构建
+两个平台，并把可直接运行的压缩包挂到该次运行上：**Linux amd64** 和 **macOS arm64**。
 
-## Configuration
+## 配置
 
-ProxyGate looks for a config file in this order:
+配置文件查找顺序：
 
-1. `--config <path>` (or `$PROXYGATE_CONFIG`)
+1. `--config <path>`（或环境变量 `$PROXYGATE_CONFIG`）
 2. `./config.yaml`
 3. `~/.config/proxygate/config.yaml`
 
-With no config file it starts with an empty pool, which is useful for testing
-but not much else. Start from [`config.example.yaml`](config.example.yaml).
+完全没有配置文件也能跑（空池子）。最快的起步方式是让程序自己吐一份：
 
-| Key                   | Default                                   | Meaning                                              |
-| --------------------- | ----------------------------------------- | ---------------------------------------------------- |
-| `server.proxy`        | `127.0.0.1:8080`                          | HTTP proxy gateway address                            |
-| `server.api`          | `127.0.0.1:8081`                          | REST API address                                      |
-| `subscribers`         | `[]`                                      | Where proxies come from (see below)                   |
-| `refresh.interval`    | `10m`                                     | How long a fetched list is reused                     |
-| `refresh.timeout`     | `20s`                                     | Per-subscriber timeout                                |
-| `health.targets`      | Google 204 + `cn.bing.com`                | URLs fetched *through* each proxy, probed concurrently |
-| `health.require`      | `any`                                     | `any` target may answer, or `all` of them must          |
-| `health.interval`     | `30s`                                     | Health pass interval, and health cache lifetime       |
-| `health.timeout`      | `5s`                                      | Per-proxy probe timeout                               |
-| `health.concurrency`  | `100`                                     | Proxies probed in parallel                            |
-| `health.max_failures` | `3`                                       | Consecutive failures tolerated for a working proxy    |
-| `selection.strategy`  | `random`                                  | `random` or `latency`                                 |
-| `selection.reuse_after` | `30m`                                   | Prefer proxies unused in this window                  |
-| `gateway.retries`     | `2`                                       | Extra upstream attempts after the first failure       |
-| `gateway.connect_timeout` | `10s`                                 | Upstream connect + CONNECT handshake timeout       |
-| `gateway.auth`        | –                                         | `user:password` required from clients                 |
-| `state.dir`           | `~/.cache/proxygate`                      | Where `state.json` and `cache.json` live              |
+```bash
+proxygate genconfig > config.yaml     # 带注释的完整示例，直接重定向即可
+```
 
-Durations accept `30s`, `10m`, `2h`, `1d`, `250ms`, `1h30m`, or plain seconds.
+也可以参考仓库里的 [`config.example.yaml`](config.example.yaml)。
 
-Note that the probe runs *through the proxy*, so a target you cannot reach
-directly is not a problem — it is the proxy that has to get there. That is the
-whole point of the default pair: `google.com/generate_204` only answers if the
-proxy really has international connectivity, and `cn.bing.com` proves the tunnel
-is not broken for everything else. By default `require: any` accepts a proxy
-that reaches either one; the `TARGETS` column tells you which.
+| 配置项 | 默认值 | 含义 |
+| --- | --- | --- |
+| `server.proxy` | `127.0.0.1:8080` | HTTP 代理网关地址 |
+| `server.api` | `127.0.0.1:8081` | REST API 地址 |
+| `subscribers` | `[]` | 代理来源，见下一节 |
+| `refresh.interval` | `10m` | 拉取结果复用时⻓ |
+| `refresh.timeout` | `20s` | 单个 subscriber 超时 |
+| `health.targets` | Google 204 + `cn.bing.com` | **通过代理**去访问的探测目标，并发探测 |
+| `health.require` | `any` | 目标全部要通（`all`）还是通一个就算（`any`） |
+| `health.interval` | `30s` | 探测周期，同时也是健康结果缓存有效期 |
+| `health.timeout` | `5s` | 单个代理的探测超时 |
+| `health.concurrency` | `100` | 同时探测的代理数量 |
+| `health.max_failures` | `3` | 原本可用的代理连续失败多少次后判死 |
+| `selection.strategy` | `random` | `random` 或 `latency` |
+| `selection.reuse_after` | `30m` | 优先避开这段时间内用过的代理 |
+| `gateway.retries` | `2` | 首个上游失败后的额外重试次数 |
+| `gateway.connect_timeout` | `10s` | 连接上游并完成 CONNECT 握手的超时 |
+| `gateway.auth` | – | 要求客户端提供的 `user:password` |
+| `state.dir` | `~/.cache/proxygate` | `state.json` / `cache.json` 所在目录 |
 
-### Subscribers
+时⻓支持 `30s`、`10m`、`2h`、`1d`、`250ms`、`1h30m` 或纯秒数。
 
-Three kinds, and an escape hatch for everything else:
+> **注意 `health.targets` 的语义**：探测请求是**通过代理**发出的，所以「你本机连不上
+> Google」不是问题——要连上的是代理。默认两个目标里，Google 只有代理真的能出国才会
+> 应答，`cn.bing.com` 则证明这条隧道不是对所有站点都坏。默认 `require: any`，通一个
+> 就算可用；想只发放两边都通的代理就设成 `all`。
+
+### Subscriber（代理来源）
+
+只有三种，其余情况用最后一个逃生口：
 
 ```yaml
 subscribers:
   - name: provider-a
     type: http
     url: https://example.com/proxies.txt
-    format: plaintext        # plaintext (default) | json | clash
+    format: plaintext        # plaintext（默认）| json | clash
     timeout: 20s
     headers:
       Authorization: Bearer <token>
@@ -148,97 +148,96 @@ subscribers:
       API_TOKEN: "..."
 ```
 
-A subscriber only has to produce proxy URLs — one per line on stdout for `exec`.
-The built-in parsers cover plaintext lists, JSON APIs (arrays, bare
-`host:port` strings, objects with `ip`/`host`/`server` + `port` + credentials,
-and arbitrarily nested envelopes such as
-`{"code":200,"data":{"proxies":["1.2.3.4:8080"]}}`) and Clash/Clash.Meta
-`proxies:` lists. Anything else belongs in a script; see
-[`subscribers/README.md`](subscribers/README.md) and
-[`subscribers/example.py`](subscribers/example.py).
+subscriber 的唯一职责是产出代理 URL：`exec` 在 stdout 上一行一个。内置解析器覆盖纯文本
+列表、JSON 接口（数组、裸 `host:port` 字符串、带 `ip`/`host`/`server` + `port` + 凭据的
+对象，以及任意层数的包装，例如 `{"code":200,"data":{"proxies":["1.2.3.4:8080"]}}`）和
+Clash / Clash.Meta 的 `proxies:` 列表。其他格式都交给脚本，见
+[`subscribers/README.md`](subscribers/README.md) 和
+[`subscribers/example.py`](subscribers/example.py)。
 
-Accepted URL shapes:
+接受的 URL 写法：
 
 ```text
 http://1.2.3.4:8080          socks5://1.2.3.4:1080
 user:pass@1.2.3.4:3128       socks5h://user:pass@[2001:db8::1]:1080
-1.2.3.4:8080                 # scheme and port get sensible defaults
+1.2.3.4:8080                 # 协议和端口都会补默认值
 ```
 
-A real provider wired up as the first subscriber of
-[`config.example.yaml`](config.example.yaml) is
-[proxy.scdn.io](https://proxy.scdn.io/api_docs.php): it answers with a JSON
-envelope holding bare `host:port` entries, which the `json` format reads
-directly. Since the payload carries no scheme, such entries are treated as HTTP
-proxies — ask for `protocol=http`, and use an `exec` wrapper if you want its
-`socks4`/`socks5` endpoints.
+[`config.example.yaml`](config.example.yaml) 里的第一个 subscriber 接的是一个真实接口：
+[proxy.scdn.io](https://proxy.scdn.io/api_docs.php)。它返回 JSON 包装、里面是裸
+`host:port`，内置 `json` 格式可以直接读。因为返回体不带协议，这类条目一律按 HTTP 代理
+处理（所以示例请求 `protocol=http`）；想用它家的 `socks4`/`socks5` 端点得用 `exec` 包一层
+补上 `socks5://` 前缀。
 
-Two things to expect from free lists like that one, both of which the health
-check is designed to surface: most entries are simply dead, and a fair share of
-the "HTTPS-capable" ones intercept TLS and present a certificate signed by
-themselves. ProxyGate rejects those (`invalid peer certificate`) — a proxy that
-re-signs traffic is not a proxy you want, and a client that verifies
-certificates could not use it anyway.
+关于这类免费池要有心理准备，下面两点正是健康探测存在的意义：**大部分条目是死的**，并且
+相当一部分「支持 HTTPS」的其实在中间人劫持 TLS、拿自己的证书签发。ProxyGate 会拒绝这类
+代理（`invalid peer certificate`）——会重新签发流量的代理不是你要的代理，而且客户端只要
+校验证书也用不了它。
 
-## CLI
+## 命令行
 
 ```text
-proxygate get     [--format text|json] [--strategy random|latency] [--no-refresh] [--no-check] [--mask]
-proxygate list    [--alive] [--all] [--show-auth] [--json] [--no-refresh] [--no-check]
-proxygate refresh [--json]
-proxygate check   [--json] [--concurrency N] [--alive-only]
-proxygate serve   [--listen ADDR] [--api ADDR] [--auth USER:PASS] [--no-refresh]
-proxygate genconfig                       # the annotated example config, to stdout
-proxygate getua   [--format text|json]    # one random user agent
+proxygate get       [--format text|json] [--strategy random|latency] [--no-refresh] [--no-check] [--mask]
+proxygate list      [--alive] [--all] [--show-auth] [--json] [--no-refresh] [--no-check]
+proxygate refresh   [--json]
+proxygate check     [--json] [--concurrency N] [--alive-only]
+proxygate serve     [--listen ADDR] [--api ADDR] [--auth USER:PASS] [--no-refresh]
+proxygate genconfig                             # 带注释的示例配置，输出到 stdout
+proxygate getua     [--format text|json]        # 一个随机 User-Agent
+proxygate skill                                 # 面向 agent 的 SKILL.md，输出到 stdout
 ```
 
-Global flags: `-c/--config <path>`, `-v` (info), `-vv` (debug), `-vvv` (trace),
-`-q` (errors only). `RUST_LOG` overrides the log filter.
+全局参数：`-c/--config <path>`、`-v`（info）、`-vv`（debug）、`-vvv`（trace）、
+`-q`（只输出错误）。`RUST_LOG` 可覆盖日志级别。
 
-`proxygate get` writes **exactly one line** — the proxy URL — to stdout; every
-log line goes to stderr. That is what makes `curl -x "$(proxygate get)"` work.
+`proxygate get` 的 stdout **严格只有一行**——就是代理 URL；所有日志走 stderr。所以
+`curl -x "$(proxygate get)"` 永远成立。
 
-Exit codes: `0` success, `1` error, `3` no proxy available.
-
-`genconfig` prints the annotated example config that is embedded in the binary,
-so an installed `proxygate` can bootstrap a config with no checkout around:
-
-```bash
-proxygate genconfig > config.yaml
-```
-
-`getua` prints one user agent out of 100 built into the binary
-([`assets/user_agents.txt`](assets/user_agents.txt) — desktop and mobile Chrome,
-Firefox, Safari, Edge and Samsung Internet). It is uniformly random and
-stateless: no rotation, no memory of previous calls, so the same string can come
-up twice in a row. Handy for pairing with a fresh proxy:
-
-```bash
-curl -x "$(proxygate get)" -A "$(proxygate getua)" https://example.com
-```
+退出码：`0` 成功，`1` 出错，`3` 池内无可用代理。
 
 ```console
 $ proxygate list
 PROXY                           STATUS   TARGETS  LATENCY
 http://***:***@127.0.0.1:18080  alive    2/2      824ms
-http://127.0.0.1:18083          alive    1/2      817ms    # only cn.bing.com answers
+http://127.0.0.1:18083          alive    1/2      817ms    # 只通 cn.bing.com
 http://203.0.113.7:3128         dead     0/2      -
 
 $ proxygate get --format json
 {"proxy":"http://user:pass@127.0.0.1:18080","latency_ms":824,"round":3}
 ```
 
+三个辅助命令：
+
+- **`genconfig`** 把带注释的示例配置打印到 stdout（内容编进了二进制，装好的 `proxygate`
+  不需要仓库在旁边就能起一份配置）：`proxygate genconfig > config.yaml`。
+- **`getua`** 从内置的 100 个 User-Agent 里随机取一个，全部是**桌面浏览器**（Chrome /
+  Edge / Firefox / Safari，覆盖 Windows、macOS、Linux），不含移动端。纯随机、无状态：
+  不轮换、不记「用过没用过」，连抽两次可能相同。适合和新拿到的代理配对：
+
+  ```bash
+  curl -x "$(proxygate get)" -A "$(proxygate getua)" https://example.com
+  ```
+
+- **`skill`** 把 [`SKILL.md`](SKILL.md) 打印到 stdout，那是写给 **AI agent** 看的完整
+  使用说明（命令、退出码含义、API、配置要点，以及哪些输出不能轻信）。它只输出内容、
+  不创建文件，落在哪里由调用方决定：
+
+  ```bash
+  proxygate skill > SKILL.md          # 想存就存
+  proxygate skill | pbcopy            # 或者直接喂给 agent
+  ```
+
 ## REST API
 
-| Endpoint                        | Returns                                                     |
-| ------------------------------- | ----------------------------------------------------------- |
-| `GET /api/v1/get`               | one proxy URL as `text/plain`                                |
-| `GET /api/v1/get?format=json`   | `{"proxy": "...", "latency_ms": 83, "round": 3}`             |
-| `GET /api/v1/getua`             | one random user agent as `text/plain`                         |
-| `GET /api/v1/getua?format=json` | `{"user_agent": "Mozilla/5.0 ..."}`                          |
-| `GET /api/v1/proxies`           | the pool as JSON, credentials masked                         |
-| `GET /api/v1/health`            | `{"status": "ok", "proxies": {"total": 2, "alive": 2, ...}}` |
-| `GET /`                         | a small index of the above                                   |
+| 端点 | 返回 |
+| --- | --- |
+| `GET /api/v1/get` | 一个代理 URL，`text/plain` |
+| `GET /api/v1/get?format=json` | `{"proxy": "...", "latency_ms": 83, "round": 3}` |
+| `GET /api/v1/getua` | 一个 User-Agent，`text/plain` |
+| `GET /api/v1/getua?format=json` | `{"user_agent": "Mozilla/5.0 ..."}` |
+| `GET /api/v1/proxies` | 整个池的 JSON，凭据已脱敏 |
+| `GET /api/v1/health` | `{"status": "ok", "proxies": {"total": 2, "alive": 2, ...}}` |
+| `GET /` | 以上端点的索引 |
 
 ```console
 $ curl http://127.0.0.1:8081/api/v1/get
@@ -246,121 +245,102 @@ http://user:pass@1.2.3.4:8080
 
 $ curl -s http://127.0.0.1:8081/api/v1/health
 {"status":"ok","version":"0.1.0","uptime_seconds":42,"generation":3,
- "strategy":"random","health_target":"https://example.com/",
+ "strategy":"random","health_targets":["https://www.google.com/generate_204",
+ "https://cn.bing.com/"],"health_require":"any",
  "proxies":{"total":2,"alive":2,"dead":0}}
 ```
 
-`/get` answers `503` when no healthy proxy is available. Credentials are never
-exposed by `/proxies` (they are replaced with `***:***`).
+池内没有可用代理时 `/get` 返回 `503`（含义同退出码 `3`）。`/proxies` 永远不会暴露凭据
+（替换成 `***:***`），但会带上每个代理的逐目标探测结果。
 
-## Gateway
+## 网关
 
-`proxygate serve` runs four things on one Tokio runtime: subscriber refresh,
-health checking, the REST API and the HTTP proxy gateway.
+`proxygate serve` 在同一个 Tokio runtime 上只跑四件事：subscriber 刷新、健康探测、
+REST API、HTTP 网关。
 
-* **CONNECT** (HTTPS) becomes a byte tunnel. The upstream is chosen, dialled and
-  handshaked *before* the client sees `200`, so a broken upstream is retried
-  transparently. One tunnel is pinned to one upstream for its whole lifetime.
-* **Plain HTTP** is forwarded with the absolute request target preserved, so the
-  upstream does the DNS and the connecting.
-* Client credentials (`--auth`) are consumed by ProxyGate and never forwarded;
-  upstream credentials are added by ProxyGate and never exposed.
+- **CONNECT**（HTTPS）会被变成一条字节隧道。上游是在客户端看到 `200` **之前**就选好、
+  连上并完成握手的，所以坏上游可以被透明重试；一条隧道全程固定一个上游。
+- **纯 HTTP** 转发时保留绝对形式请求目标，DNS 和建连交给上游。
+- 客户端凭据（`--auth`）由 ProxyGate 消费，绝不转发；上游凭据由 ProxyGate 补上，绝不
+  暴露。
 
-Retries follow the boring, safe rule:
+重试规则保守且安全：
 
-| Request     | Retried on                                             |
-| ----------- | ------------------------------------------------------ |
-| `CONNECT`   | any failure (connect, handshake, non-2xx from upstream) |
-| `GET`/`HEAD`| connect and timeout errors                              |
-| anything else | never — a body must not be sent twice                 |
+| 请求 | 何时重试 |
+| --- | --- |
+| `CONNECT` | 任何失败（建连、握手、上游返回非 2xx） |
+| `GET`/`HEAD` | 建连和超时错误 |
+| 其他方法 | 从不——body 不能被发两次 |
 
-Every failed attempt bumps the upstream's failure counter; after
-`health.max_failures` in a row, that upstream drops out of rotation until a
-probe or a request succeeds.
+每次失败都会给上游记一次失败；连续失败到 `health.max_failures` 次后，该上游退出轮换，
+直到某次探测或请求成功才回来。
 
-Supported upstreams: `http://`, `socks5://` (DNS resolved locally) and
-`socks5h://` (DNS resolved by the proxy). `https://` upstreams are **not**
-supported in v0.1 — they are rejected when the list is loaded rather than
-silently entering the pool as proxies that cannot serve CONNECT.
+支持的上游：`http://`、`socks5://`（DNS 本地解析）、`socks5h://`（DNS 交给代理解析）。
+`https://` 上游 **v0.1 不支持**——它在加载列表时就被拒绝，而不是进池之后在 CONNECT 阶段
+才失败。
 
-## How selection works
+## 选择与轮换规则
 
-The rule users actually feel:
+用户真正能感觉到的规则只有这几条：
 
 ```text
-healthy proxies
+只从健康代理里选
       ↓
-skip the ones already handed out in this round
+跳过本轮已经发放过的
       ↓
-prefer the ones unused within selection.reuse_after  (default 30m)
+优先选 reuse_after（默认 30 分钟）内没用过的
       ↓
-hand one out and remember it
+发放并记下这次使用
 ```
 
-When every healthy proxy has been handed out, the round increments
-**immediately** — there is no waiting for the 30 minutes to expire:
+当所有健康代理都发放过之后，轮次**立即**加一——不会干等那 30 分钟：
 
 ```text
-A, B, C in the pool
+池里 A、B、C
 proxygate get   →  A
 proxygate get   →  B
 proxygate get   →  C
-proxygate get   →  round 2 starts, A/B/C are all fair game again
+proxygate get   →  进入下一轮，A/B/C 重新可用
 ```
 
-`state.json` persists the round number and each proxy's last use, so the
-rotation continues across CLI invocations and restarts. A proxy that is added
-later (a refresh found a new one) is unused in the current round and therefore
-handed out first — new proxies get exercised instead of gathering dust.
+轮次号和每个代理的最后使用时间会写进 `state.json`，所以跨进程、跨重启都接着轮。后加入的
+代理（比如刷新时新发现的）在当前轮里算未用过，会优先被发放——新代理先被用上，而不是在池
+里落灰。
 
-## Health checking
+## 健康探测
 
-For every proxy the checker asks three questions: can a request be made through
-it, did the request succeed, and how long did it take. Concurrency is bounded by
-a semaphore (`health.concurrency`), and the pool lock is never held while a
-request is in flight — the checker works on a snapshot and writes results back
-in one short critical section.
+每个代理都会去访问全部 `health.targets`，同一代理的多个目标**并发**探测（所以多一个目标
+不会让一轮探测时间翻倍）。`health.require` 决定结论：
 
-Every target is probed through the proxy, and the targets of one proxy are
-probed **concurrently**, so a second endpoint costs no extra wall clock time.
-`health.require` decides what the results mean:
+| `require` | 判定为可用的条件 | 适用 |
+| --- | --- | --- |
+| `any`（默认） | 至少一个目标应答 | 池子不至于空；`TARGETS` 列告诉你它通哪边 |
+| `all` | 每个目标都应答 | 只发放「你要的都能通」的代理 |
 
-| `require` | a proxy is alive when            | use it for                                            |
-| --------- | -------------------------------- | ----------------------------------------------------- |
-| `any` (default) | at least one target answered | a pool that stays usable; `TARGETS` shows what each proxy reaches |
-| `all`     | every target answered            | only hand out proxies that reach everything you need   |
+每个代理都会记住逐目标结果（`list` 里的 `TARGETS` 列显示为 `2/2`，`list --json`、
+`/api/v1/proxies`、`/api/v1/health` 都有完整明细），并写入 `cache.json` 供重启复用，所以
+「半通」的代理是可见的，而不是只能看到它不在池里。
 
-`any` is the default because an empty pool is worse than an imperfect one — on a
-network where one of the targets is hard to reach, `all` can reject every proxy
-you have. Pick `all` when "cannot reach X" makes a proxy useless to you.
+单次探测的结论是权威的：
 
-Each proxy remembers the per-target outcome (`list` shows it as `2/2`,
-`list --json` and `/api/v1/proxies` carry the full breakdown), so a pool of
-half-working proxies is visible instead of merely absent.
+- 探测成功 → 代理可用，失败计数清零；
+- **从未成功过的代理，第一次失败就判死**；
+- 原本可用的代理，能容忍 `health.max_failures` 次连续探测失败，避免一次抖动就淘汰好
+  上游；
+- 网关另外单独统计自己请求的失败次数，达到同样阈值就把上游踢出轮换；之后任意一次成功
+  探测或请求都能让它回来。
 
-A probe verdict is authoritative:
+`alive`、`latency`、`failures` 从不被当作永久事实，但结果**会**按 `health.interval`
+（默认 30s）缓存，这样连续调用 `proxygate get` 不必每次都去重探一万个代理；subscriber
+结果同理按 `refresh.interval` 复用。`--no-check` / `--no-refresh` 表示「即便过期也用
+缓存」，适合紧凑循环或断网环境。
 
-* a probe that succeeds makes a proxy alive and resets its failure counter;
-* a proxy that **never** answered is dead after its first failure;
-* a proxy that was working survives up to `health.max_failures` consecutive
-  probe failures, so one flaky timeout does not evict a good upstream;
-* the gateway independently counts its own request failures and drops an
-  upstream after the same threshold; a later success revives it.
+## 状态文件
 
-`alive`, `latency` and `failures` are never treated as permanent facts — but the
-last result *is* cached for `health.interval` (30s by default) so that a burst of
-`proxygate get` calls does not re-probe a 10,000-proxy pool every time. Likewise,
-subscriber output is reused for `refresh.interval`. `--no-check` / `--no-refresh`
-tell the CLI to trust those caches even when they are stale, which is what you
-want in a tight loop or an air-gapped test.
+两个文件都在缓存目录（`state.dir`，否则 `$PROXYGATE_CACHE_DIR`，否则
+`~/.cache/proxygate`），目录权限 `0700`、文件 `0600`。
 
-## State files
-
-Both files live in the cache directory (`state.dir`, else
-`$PROXYGATE_CACHE_DIR`, else `~/.cache/proxygate`), which is created `0700` with
-`0600` files.
-
-`state.json` — only usage facts, nothing that a fresh check could not re-derive:
+`state.json` 只存使用事实，不存任何「重新探测就能得到」的东西：
 
 ```json
 {
@@ -371,107 +351,104 @@ Both files live in the cache directory (`state.dir`, else
 }
 ```
 
-`cache.json` — the last subscriber payload and health results, each with a
-timestamp:
+只有发放过的代理才会有条目，所以文件大小跟「用过的代理数」成正比，而不是池子大小。
+
+`cache.json` 存最近一次拉取结果和健康结果，各带时间戳：
 
 ```json
 {
   "fetched_at": "2026-09-17T10:29:58Z",
   "proxies": ["http://user:pass@1.2.3.4:8080"],
   "checked_at": "2026-09-17T10:30:12Z",
-  "health": { "4f1c9a2e5b7d8031": { "alive": true, "latency_ms": 82, "failures": 0 } }
+  "health": {
+    "4f1c9a2e5b7d8031": {
+      "alive": true, "latency_ms": 82, "failures": 0,
+      "targets": [
+        { "target": "https://www.google.com/generate_204", "ok": false },
+        { "target": "https://cn.bing.com/", "ok": true, "latency_ms": 82 }
+      ]
+    }
+  }
 }
 ```
 
-`cache.json` contains proxy URLs **including credentials** in plaintext (it has
-to, to rebuild the pool), which is why the directory is private. Delete both
-files to start from scratch; `proxygate refresh` rebuilds the pool.
+`cache.json` 里的代理 URL **含明文凭据**（要重建池子就必须有），这也是目录权限收紧的原
+因。两个文件删掉即可从零开始；`proxygate refresh` 会重建池子。
 
-## Security notes
+配置或缓存目录写不进去时，网关会**降级继续服务**（只打警告、不再持久化轮换状态），不会
+因为一个只读卷就起不来。
 
-* **`exec` subscribers run arbitrary commands.** `config.yaml` is trusted input;
-  do not load a config you would not run as a shell script.
-* The API has no authentication of its own. It binds `127.0.0.1` by default —
-  exposing it publishes your working proxies to whoever can reach the port.
-* Set `gateway.auth` (or `--auth`) before binding the gateway to a public
-  interface. Credentials are compared in constant time and `Proxy-Authorization`
-  is stripped before forwarding.
-* Proxy credentials are masked in `proxygate list`, the REST API and all logs.
-  The one place they appear is `proxygate get` (that is its job) and the private
-  `cache.json`.
+## 安全注意
 
-## Not in v0.1
+- **`exec` subscriber 会执行任意命令。** `config.yaml` 属于可信输入，不要加载你不会当
+  脚本执行的配置。
+- **REST API 自身没有认证**，默认只监听 `127.0.0.1`——把它暴露出去，等于把你的可用代理
+  公开给所有能访问该端口的人。
+- 把网关绑到公网前先设 `gateway.auth`（或 `--auth`）。凭据用常量时间比较，
+  `Proxy-Authorization` 在转发前会被剥掉。
+- 代理凭据在 `proxygate list`、REST API 和所有日志里都脱敏；只有 `proxygate get`（它就
+  是干这个的）和私有目录下的 `cache.json` 里会出现明文。
 
-Deliberate omissions, so the core stays small: no database or Redis, no plugin
-framework, no rate limiting or per-client quotas, no `https://` upstream
-proxies, no SOCKS5 *server* (clients speak HTTP proxy), and no upstream
-selection by geolocation or provider.
+## v0.1 不包含
 
-## Development
+有意省略，为了让核心足够小：没有数据库/Redis、没有插件框架、没有限流和按客户端的配额、
+不支持 `https://` 上游代理、不提供 SOCKS5 **服务端**（客户端说 HTTP 代理协议）、没有按
+地区或供应商挑上游。
+
+## 开发
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets
-cargo test              # 101 tests: unit + integration (fake upstreams, no network)
+cargo test              # 单元 + 集成（内置假上游，不依赖网络）
 cargo build --release
 ```
 
-The integration tests spin up hand written HTTP and SOCKS5 upstreams plus fake
-target servers in-process, so they need no network access and no external
-binaries:
+集成测试自己在进程内起手写的 HTTP / SOCKS5 上游和假目标服务器，所以不需要网络、也不依赖
+外部程序：
 
-| File                       | Covers                                                        |
-| -------------------------- | ------------------------------------------------------------- |
-| `tests/pool.rs`            | dedupe, usage persistence, health thresholds, state round trip |
-| `tests/selector.rs`        | the rotation contract, reuse window, restart behaviour         |
-| `tests/subscriber.rs`      | file/http/exec, the three formats, failure isolation           |
-| `tests/gateway.rs`         | CONNECT, plain HTTP, auth, retries, SOCKS5 and SOCKS5 auth     |
+| 文件 | 覆盖内容 |
+| --- | --- |
+| `tests/pool.rs` | 去重、使用状态持久化、健康阈值、state 往返 |
+| `tests/selector.rs` | 轮换契约、reuse 窗口、重启后继续轮换 |
+| `tests/subscriber.rs` | file/http/exec、三种格式、失败隔离 |
+| `tests/gateway.rs` | CONNECT、纯 HTTP、认证、重试、SOCKS5 及 SOCKS5 认证 |
 
-## Project layout
+## 目录结构
 
 ```text
 src/
-  main.rs        binary: CLI dispatch, App runtime, background loops
-  cli.rs         clap definitions
-  config.rs      config.yaml model, defaults, validation
-  model.rs       Proxy, stable ids, URL normalization, small codecs
-  subscriber.rs  http/file/exec subscribers and the built-in parsers
-  pool.rs        the pool: merge, health updates, selection (rounds)
-  checker.rs     health checker + shared upstream client cache
-  selector.rs    candidate filtering and the random/latency strategies
-  gateway.rs     HTTP proxy gateway: CONNECT tunnels, forwarding, auth
+  main.rs        CLI 分发、App 运行时、后台任务
+  cli.rs         clap 定义
+  config.rs      config.yaml 模型、默认值、校验
+  model.rs       Proxy、稳定 ID、URL 归一化、小工具编解码
+  subscriber.rs  http/file/exec subscriber 与内置解析器
+  pool.rs        池子：合并、健康写入、选择（轮次）
+  checker.rs     健康探测 + 共享上游 client 缓存
+  selector.rs    候选过滤与 random/latency 策略
+  gateway.rs     HTTP 代理网关：CONNECT 隧道、转发、认证
   api.rs         axum REST API
-  useragent.rs   the built-in user agent pool (100 agents)
-  state.rs       state.json / cache.json, RFC 3339 timestamps
-  error.rs       error type shared by every module
-assets/          data embedded in the binary (user agent pool)
-subscribers/     exec subscriber contract + example.py
-tests/           integration tests with in-process fake upstreams
+  useragent.rs   内置 User-Agent 池（100 个桌面 UA）
+  state.rs       state.json / cache.json、RFC 3339 时间戳
+  error.rs       整个 crate 共用的错误类型
+assets/          编进二进制的数据（User-Agent 池）
+subscribers/     exec subscriber 契约 + example.py
+tests/           集成测试（进程内假上游）
+SKILL.md         面向 AI agent 的说明（`proxygate skill` 输出它）
 ```
 
-Two deviations from a single-binary crate, both for testability: the code lives
-in a library (`src/lib.rs`) with a thin binary on top, so the integration tests
-can drive the real gateway, and `tests/common/mod.rs` holds the fake upstreams.
+为了可测试性，代码放在库（`src/lib.rs`）里、二进制只是薄壳，这样集成测试能驱动真实的
+网关；`tests/common/mod.rs` 放那些假上游。除此之外还有几处与设计说明不同，都是实际做的
+时候发现问题才改的：
 
-Deviations from the v0.1 design notes, each for a reason found while building it:
+- 包名小写 `proxygate`，让二进制名和文档里的命令一致。
+- `state.json` 与设计一致，但额外有 `cache.json` 存 subscriber 和健康结果。没有它，
+  一万个代理时每次 `get` 都要重探全池。
+- `health.targets` 是列表、并发探测，`health.require` 选择 `any`（默认）/`all`；设计
+  说明里只有一个 `target`。默认目标是 Google 加 `cn.bing.com`。
+- **从未成功过的代理一次失败即判死**，`health.max_failures` 只对原本可用的代理生效。
+- `https://` 上游在加载列表时就被拒绝，而不是接受之后在 CONNECT 阶段失败。
 
-* `src/lib.rs` as above; the package is lowercase (`proxygate`) so the binary
-  name matches the commands in this document.
-* `state.json` holds exactly what the notes describe, *plus* a separate
-  `cache.json` for subscriber and health results. Without it, one `get` against a
-  10,000-proxy pool re-probes all 10,000 every time.
-* A proxy that has **never** answered is dead after its first failed probe;
-  `health.max_failures` only applies to a proxy that was working. Strictly
-  speaking the notes only define the counter, but the literal reading hands out
-  proxies that have never worked once.
-* `health.targets` is a list probed concurrently, with `health.require`
-  choosing between "any" (default) and "all"; the notes only described a single
-  target. The default pair is Google plus `cn.bing.com` — one endpoint that only
-  answers if the proxy can leave the country, one that proves the tunnel is not
-  broken for everything else.
-* `https://` upstream proxies are rejected when a list is loaded rather than
-  accepted and then failing at CONNECT time.
-
-## License
+## 许可
 
 [MIT](LICENSE)

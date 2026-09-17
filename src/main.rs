@@ -85,7 +85,17 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Serve(args) => cmd_serve(config, args).await,
         Command::Genconfig => cmd_genconfig(),
         Command::Getua(args) => cmd_getua(args),
+        Command::Skill => cmd_skill(),
     }
+}
+
+/// `proxygate skill` — this tool's own documentation for an agent to read.
+///
+/// Prints `SKILL.md` (embedded in the binary) to stdout. It is deliberately not
+/// written to disk: the caller decides where, if anywhere, it belongs.
+fn cmd_skill() -> Result<ExitCode> {
+    print_stdout(proxygate::SKILL.trim_end())?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `proxygate genconfig` — the annotated example, straight to stdout.

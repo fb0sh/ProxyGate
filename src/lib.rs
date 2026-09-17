@@ -34,3 +34,44 @@ pub use pool::ProxyPool;
 
 /// Version string reported by the CLI, the API and logs.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The agent-facing skill document (`SKILL.md`), embedded at compile time.
+///
+/// `proxygate skill` prints this verbatim so an agent can read the whole
+/// contract — commands, exit codes, API, config, and what not to trust — without
+/// a checkout next to the binary.
+pub const SKILL: &str = include_str!("../SKILL.md");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_skill_document_is_usable_on_its_own() {
+        // An agent reads this without any other file, so it has to carry the
+        // whole contract: frontmatter, the commands, the exit codes, the API.
+        assert!(SKILL.starts_with("---\n"), "missing skill frontmatter");
+        assert!(SKILL.contains("\nname: proxygate"), "missing skill name");
+        assert!(SKILL.contains("description:"), "missing skill description");
+
+        for needle in [
+            "proxygate get",
+            "proxygate getua",
+            "proxygate serve",
+            "proxygate genconfig",
+            "curl -x \"$(proxygate get)\"",
+            "exit code",
+            "/api/v1/getua",
+            "health:",
+            "require:",
+        ] {
+            assert!(SKILL.contains(needle), "SKILL.md does not mention {needle}");
+        }
+
+        assert!(
+            SKILL.len() > 2_000 && SKILL.len() < 20_000,
+            "SKILL.md is {} bytes; too thin or too long for an agent to load",
+            SKILL.len()
+        );
+    }
+}

@@ -64,6 +64,8 @@ pub enum Command {
     Genconfig,
     /// Print a random user agent from the built-in pool
     Getua(GetUaArgs),
+    /// Print the agent-facing skill document (SKILL.md) to stdout
+    Skill,
 }
 
 #[derive(Debug, Args)]

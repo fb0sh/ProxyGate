@@ -102,7 +102,7 @@ jobs:
           name="proxygate-${version}-${{ matrix.target }}"
           mkdir -p "dist/${name}"
           cp "target/${{ matrix.target }}/release/proxygate" "dist/${name}/"
-          cp README.md LICENSE config.example.yaml "dist/${name}/"
+          cp README.md README.en.md SKILL.md LICENSE config.example.yaml "dist/${name}/"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           echo "packaged dist/${name}.tar.gz"
           tar -tzf "dist/${name}.tar.gz"
