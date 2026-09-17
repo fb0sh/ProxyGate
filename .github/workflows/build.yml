@@ -180,11 +180,17 @@ jobs:
           Write-Host "packaged dist/$name.zip"
           Get-ChildItem "dist/$name" | Select-Object Name, Length
 
+      # Only the archives: `dist/*` would also upload the unpacked directory the
+      # packaging step created, which doubles the artifact and — worse — makes
+      # `gh release create dist/*` try to upload a directory, which fails after
+      # the release has already been created (an empty release, no binaries).
       - name: Upload the binary
         uses: actions/upload-artifact@v4
         with:
           name: proxygate-${{ matrix.target }}
-          path: dist/*
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
           if-no-files-found: error
 
   # Only a tag publishes: that is what makes the binaries downloadable without
@@ -219,15 +225,38 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Fail here with a readable annotation rather than inside `gh`, where the
+      # release would already exist and the reason would be buried in a log
+      # nobody can download.
+      - name: Check the archives are here
+        shell: bash
+        run: |
+          ls -l dist
+          found=$(ls dist/*.tar.gz dist/*.zip 2>/dev/null | wc -l)
+          echo "archives found: $found"
+          if [ "$found" -ne 3 ]; then
+            echo "::error::expected 3 archives (one per platform), found $found"
+            exit 1
+          fi
+
+      # Idempotent on purpose: re-running a tag (or re-pushing it after a failed
+      # upload) uploads into the existing release instead of failing because it
+      # is already there.
       - name: Publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ls -l dist
-          gh release create "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            --verify-tag \
-            dist/*
+          files=(dist/*.tar.gz dist/*.zip)
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME exists; uploading into it"
+            gh release upload "$GITHUB_REF_NAME" "${files[@]}" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              --verify-tag \
+              "${files[@]}"
+          fi
