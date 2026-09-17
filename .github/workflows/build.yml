@@ -1,11 +1,15 @@
 name: build
 
-# Builds the two platforms ProxyGate ships for:
+# Builds and tests the three platforms ProxyGate ships binaries for:
 #   * Linux amd64   (x86_64-unknown-linux-gnu)
 #   * macOS arm64   (aarch64-apple-darwin)
+#   * Windows amd64 (x86_64-pc-windows-msvc)
 #
-# Nothing else: no Windows, no Linux arm64, no releases. Binaries are attached
-# to the run as artifacts.
+# Nothing else: no Windows arm64, no Linux arm64, no other macOS targets.
+#
+# On a `v*` tag the same archives are published as a GitHub Release, which is
+# the download path for people who do not want to build it themselves; on
+# branches they are only attached to the workflow run.
 on:
   push:
     branches: [main, master]
@@ -31,16 +35,19 @@ jobs:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
-      # Report both platforms even if one of them breaks.
+      # Report every platform even if one of them breaks.
       fail-fast: false
       matrix:
         include:
           # GitHub's ubuntu runners are x86_64, macos-14 runners are Apple
-          # silicon: both builds are native, no cross-compilation.
+          # silicon and windows runners are x86_64: every build is native, no
+          # cross-compilation.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: macos-14
             target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
 
     steps:
       - uses: actions/checkout@v4
@@ -74,6 +81,8 @@ jobs:
 
       # Debug build on purpose: it also enables the overflow checks that release
       # builds turn off, and the suite (fake upstreams, no network) takes ~1s.
+      # Windows is not a second-class target here: the only tests skipped there
+      # are the ones that need a POSIX shell.
       - name: Test
         run: cargo test --locked
 
@@ -86,9 +95,31 @@ jobs:
         run: cargo doc --no-deps --locked
 
       - name: Smoke test
-        run: ./target/${{ matrix.target }}/release/proxygate --version
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/proxygate"
+          if [ ! -f "$bin" ]; then bin="$bin.exe"; fi
+          "$bin" --version
 
-      - name: Verify the binary architecture
+      # Running the binary already proves it is the right architecture (a
+      # foreign-arch executable cannot start); these steps additionally read the
+      # header so a mistake is reported as "wrong arch" instead of a vague
+      # failure somewhere else.
+      - name: Verify the binary architecture (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release/proxygate.exe"
+          $bytes = [IO.File]::ReadAllBytes($bin)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          "PE machine = 0x{0:X4}" -f $machine
+          if ($machine -ne 0x8664) {
+            throw ("expected an x86-64 (0x8664) executable, got 0x{0:X4}" -f $machine)
+          }
+
+      - name: Verify the binary architecture (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           bin="target/${{ matrix.target }}/release/proxygate"
@@ -104,6 +135,7 @@ jobs:
           esac
 
       - name: Package
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
@@ -115,9 +147,68 @@ jobs:
           echo "packaged dist/${name}.tar.gz"
           tar -tzf "dist/${name}.tar.gz"
 
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $name = "proxygate-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/proxygate.exe" "dist/$name/"
+          Copy-Item README.md, README.en.md, SKILL.md, LICENSE, config.example.yaml "dist/$name/"
+          # Same layout as the tar.gz archives: one top-level directory.
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip" -Force
+          Write-Host "packaged dist/$name.zip"
+          Get-ChildItem "dist/$name" | Select-Object Name, Length
+
       - name: Upload the binary
         uses: actions/upload-artifact@v4
         with:
           name: proxygate-${{ matrix.target }}
-          path: dist/*.tar.gz
+          path: dist/*
           if-no-files-found: error
+
+  # Only a tag publishes: that is what makes the binaries downloadable without
+  # cloning and building.
+  release:
+    name: Publish the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # A tag that disagrees with Cargo.toml would publish archives whose name
+      # and embedded version lie, so refuse before uploading anything.
+      - name: The tag matches Cargo.toml
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          tag="${GITHUB_REF_NAME#v}"
+          echo "tag:     $GITHUB_REF_NAME"
+          echo "version: $version"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the Cargo.toml version $version"
+            exit 1
+          fi
+
+      # `merge-multiple` flattens the three artifact directories into dist/.
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag \
+            dist/*

@@ -84,9 +84,21 @@ docker run --rm -p 8080:8080 -p 8081:8081 \
 Requirements: Rust 1.85+ to build. No database, no Redis, no async runtime
 beyond Tokio.
 
-CI ([`.github/workflows/build.yml`](.github/workflows/build.yml)) builds two
-platforms on every push and attaches a ready-to-run archive to the run:
-Linux amd64 and macOS arm64.
+Or download a build: pushing a `v*` tag triggers the
+[Releases](https://github.com/fb0sh/ProxyGate/releases) workflow, which attaches
+a ready-to-run archive for each platform:
+
+| Platform | File |
+| --- | --- |
+| Linux amd64 | `proxygate-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS arm64 | `proxygate-<version>-aarch64-apple-darwin.tar.gz` |
+| Windows amd64 | `proxygate-<version>-x86_64-pc-windows-msvc.zip` |
+
+Each archive holds the binary plus both READMEs, `SKILL.md`, `LICENSE` and
+`config.example.yaml`. Ordinary pushes attach the same archives to the
+[`build.yml`](.github/workflows/build.yml) run instead. On Windows the cache
+directory is `%LOCALAPPDATA%\proxygate` (override with `state.dir` or
+`$PROXYGATE_CACHE_DIR`).
 
 ## Configuration
 
@@ -247,7 +259,7 @@ Protocol fields in payloads are understood in the shapes lists actually use:
 | ---------------- | ------- | --- |
 | `http` / `https` / `ssl` | `http://` | in a list, "https" means the proxy can CONNECT to HTTPS, not TLS-to-proxy |
 | `socks5` / `socks5h` / `socks` | `socks5h://` | the proxy resolves names: with poisoned local DNS, `socks5://` hands the proxy a bogus address and both the probe and real use fail |
-| `socks4`, anything else | dropped | v0.1 cannot tunnel it |
+| `socks4`, anything else | dropped | cannot be tunneled |
 
 An entry offering both picks `http`.
 
@@ -412,7 +424,7 @@ probe or a request succeeds.
 
 Supported upstreams: `http://`, `socks5://` (DNS resolved locally) and
 `socks5h://` (DNS resolved by the proxy). `https://` upstreams are **not**
-supported in v0.1 — they are rejected when the list is loaded rather than
+supported yet — they are rejected when the list is loaded rather than
 silently entering the pool as proxies that cannot serve CONNECT.
 
 ## How selection works
@@ -532,7 +544,7 @@ files to start from scratch; `proxygate refresh` rebuilds the pool.
   The one place they appear is `proxygate get` (that is its job) and the private
   `cache.json`.
 
-## Not in v0.1
+## Not included yet
 
 Deliberate omissions, so the core stays small: no database or Redis, no plugin
 framework, no rate limiting or per-client quotas, no `https://` upstream

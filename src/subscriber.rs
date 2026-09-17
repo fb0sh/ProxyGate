@@ -873,16 +873,23 @@ proxies:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 用当前平台的 shell 跑一小段脚本，让 exec 订阅源的测试两边都能跑。
+    fn shell(script: &str) -> Vec<String> {
+        if cfg!(windows) {
+            vec!["cmd".into(), "/C".into(), script.into()]
+        } else {
+            vec!["sh".into(), "-c".into(), script.into()]
+        }
+    }
+
     #[tokio::test]
     async fn exec_subscriber_uses_stdout() {
         let config = Config {
             subscribers: vec![SubscriberConfig::Exec {
                 name: "custom".into(),
-                command: vec![
-                    "/bin/sh".into(),
-                    "-c".into(),
-                    "echo 1.2.3.4:8080; echo '# ignored'".into(),
-                ],
+                // 注释行/空行的处理由 `parses_plaintext_lists` 覆盖，
+                // 这里只验证 stdout 被当作载荷。
+                command: shell("echo 1.2.3.4:8080"),
                 env: BTreeMap::new(),
                 format: Format::Plaintext,
                 timeout: None,
@@ -902,7 +909,7 @@ proxies:
             subscribers: vec![
                 SubscriberConfig::Exec {
                     name: "broken".into(),
-                    command: vec!["/bin/sh".into(), "-c".into(), "exit 3".into()],
+                    command: shell("exit 3"),
                     env: BTreeMap::new(),
                     format: Format::Plaintext,
                     timeout: None,
@@ -930,7 +937,7 @@ proxies:
         let config = Config {
             subscribers: vec![SubscriberConfig::Exec {
                 name: "off".into(),
-                command: vec!["/bin/sh".into(), "-c".into(), "echo 1.2.3.4:8080".into()],
+                command: shell("echo 1.2.3.4:8080"),
                 env: BTreeMap::new(),
                 format: Format::Plaintext,
                 timeout: None,

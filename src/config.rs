@@ -834,8 +834,12 @@ impl Config {
         Ok(())
     }
 
-    /// 缓存目录：依次取 `state.dir`、`$PROXYGATE_CACHE_DIR`、
-    /// `~/.cache/proxygate`。
+    /// 缓存目录：依次取 `state.dir`、`$PROXYGATE_CACHE_DIR`，然后是平台的
+    /// 用户缓存目录（Windows 上是 `%LOCALAPPDATA%\proxygate`，其它平台是
+    /// `~/.cache/proxygate`）。
+    ///
+    /// 都没拿到时退回当前目录下的 `.proxygate`，而不是直接失败：只读环境
+    /// 里缓存会退化成"永不新鲜"，但程序仍然能跑。
     pub fn cache_dir(&self) -> PathBuf {
         if let Some(dir) = &self.state.dir {
             return dir.clone();
@@ -845,9 +849,7 @@ impl Config {
                 return PathBuf::from(dir);
             }
         }
-        home_dir()
-            .map(|home| home.join(".cache").join("proxygate"))
-            .unwrap_or_else(|| PathBuf::from(".proxygate"))
+        platform_cache_dir().unwrap_or_else(|| PathBuf::from(".proxygate"))
     }
 
     /// 解析后的网关凭据（如果有）。
@@ -880,6 +882,26 @@ pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+        // Windows 上没有 `HOME`，`USERPROFILE` 才是那个意思。
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
+/// 平台约定的用户缓存目录。
+///
+/// Windows 上的进程通常没有 `HOME`，所以不能只认那一个变量，否则缓存放到了
+/// 当前目录里；那里用 `%LOCALAPPDATA%`，与其它程序的习惯一致。
+fn platform_cache_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
+            return Some(PathBuf::from(local).join("proxygate"));
+        }
+    }
+    home_dir().map(|home| home.join(".cache").join("proxygate"))
 }
 
 /// 解析 `30s`、`10m`、`2h`、`1d`、`250ms`、`1h30m`，或纯数字表示的

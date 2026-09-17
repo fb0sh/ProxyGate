@@ -211,6 +211,10 @@ on the proxy port instead of `127.0.0.1:8081`.
 * **`--auth` does not cover the REST API when the port is shared.** The API has
   no authentication of its own; keep the shared port on `127.0.0.1` or put a
   firewall in front of it.
+* **On Windows the cache directory is `%LOCALAPPDATA%\proxygate`** (Linux/macOS:
+  `~/.cache/proxygate`); override it with `state.dir` or `$PROXYGATE_CACHE_DIR`.
+  `type: exec` subscribers run through `cmd /C`, so write commands in cmd syntax
+  there — a POSIX shell script will not work.
 * **`proxygate serve` needs a writable cache directory** (`~/.cache/proxygate`,
   or `state.dir` / `$PROXYGATE_CACHE_DIR`). If it cannot write, it keeps serving
   but stops persisting rotation state.

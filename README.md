@@ -79,8 +79,19 @@ docker run --rm -p 8080:8080 -p 8081:8081 \
 
 构建需要 Rust 1.85+。没有数据库、没有 Redis、除 Tokio 外没有别的异步运行时。
 
-CI（[`.github/workflows/build.yml`](.github/workflows/build.yml)）每次 push 都会构建
-两个平台，并把可直接运行的压缩包挂到该次运行上：**Linux amd64** 和 **macOS arm64**。
+不想自己编译就直接下载：打 `v*` 标签会触发 [Releases](https://github.com/fb0sh/ProxyGate/releases)
+构建，三个平台的可执行文件都在那里：
+
+| 平台 | 文件 |
+| --- | --- |
+| Linux amd64 | `proxygate-<版本>-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS arm64 | `proxygate-<版本>-aarch64-apple-darwin.tar.gz` |
+| Windows amd64 | `proxygate-<版本>-x86_64-pc-windows-msvc.zip` |
+
+每个压缩包里是二进制加上两份 README、`SKILL.md`、`LICENSE` 和 `config.example.yaml`。
+普通 push 也会在 [`build.yml`](.github/workflows/build.yml) 的运行结果里挂同样的包。
+Windows 上缓存目录是 `%LOCALAPPDATA%\proxygate`（可用 `state.dir` 或
+`$PROXYGATE_CACHE_DIR` 覆盖）。
 
 ## 配置
 
@@ -230,7 +241,7 @@ subscriber 返回体里的协议字段也认：`protocol`（字符串）、`prot
 | --- | --- | --- |
 | `http` / `https` / `ssl` | `http://` | 列表里的 https 指「这个代理能 CONNECT 到 HTTPS」，不是「对代理做 TLS」 |
 | `socks5` / `socks5h` / `socks` | `socks5h://` | 让代理去解析域名：本机 DNS 被污染时，`socks5://`（本地解析）会把假 IP 交给代理，探测和实际使用都会失败 |
-| `socks4` / 其它 | 丢弃 | v0.1 不能用 |
+| `socks4` / 其它 | 丢弃 | 无法隧穿 |
 
 同一行既写 `http` 又写 `socks5` 时优先 `http`。
 
@@ -327,7 +338,7 @@ $ curl http://127.0.0.1:8081/api/v1/get
 http://user:pass@1.2.3.4:8080
 
 $ curl -s http://127.0.0.1:8081/api/v1/health
-{"status":"ok","version":"0.1.0","uptime_seconds":42,"generation":3,
+{"status":"ok","version":"0.2.0","uptime_seconds":42,"generation":3,
  "strategy":"random","health_targets":["https://www.google.com/generate_204",
  "https://cn.bing.com/"],"health_require":"any",
  "ready":true,"initializing":false,"initialization_attempts":1,
@@ -378,7 +389,7 @@ REST API、HTTP 网关。
 直到某次探测或请求成功才回来。
 
 支持的上游：`http://`、`socks5://`（DNS 本地解析）、`socks5h://`（DNS 交给代理解析）。
-`https://` 上游 **v0.1 不支持**——它在加载列表时就被拒绝，而不是进池之后在 CONNECT 阶段
+`https://` 上游 **目前不支持**——它在加载列表时就被拒绝，而不是进池之后在 CONNECT 阶段
 才失败。
 
 ## 选择与轮换规则
@@ -491,7 +502,7 @@ proxygate get   →  进入下一轮，A/B/C 重新可用
 - 代理凭据在 `proxygate list`、REST API 和所有日志里都脱敏；只有 `proxygate get`（它就
   是干这个的）和私有目录下的 `cache.json` 里会出现明文。
 
-## v0.1 不包含
+## 尚未包含
 
 有意省略，为了让核心足够小：没有数据库/Redis、没有插件框架、没有限流和按客户端的配额、
 不支持 `https://` 上游代理、不提供 SOCKS5 **服务端**（客户端说 HTTP 代理协议）、没有按

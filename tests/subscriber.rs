@@ -207,6 +207,9 @@ async fn http_subscriber_reports_a_broken_endpoint() {
 
 /// The `exec` escape hatch: whatever the provider's format is, a small script
 /// turns it into URLs and the core stays simple.
+///
+/// 这段脚本用的是 POSIX shell 和 grep，Windows 上没有等价物；跨平台的
+/// `exec` 覆盖由 `src/subscriber.rs` 里用 `cmd /C` 的那几个单测承担。
 #[cfg(unix)]
 #[tokio::test]
 async fn exec_subscriber_handles_a_custom_format() {
