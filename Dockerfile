@@ -49,7 +49,11 @@ RUN mkdir -p src \
     && cargo build --release --locked \
     && rm -rf src
 
+# `src/` pulls in two files with `include_str!`: the user agent pool and the
+# annotated example config. Both have to be copied or the build fails.
 COPY src ./src
+COPY assets ./assets
+COPY config.example.yaml ./
 RUN touch src/main.rs src/lib.rs \
     && cargo build --release --locked \
     && strip target/release/proxygate

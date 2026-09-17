@@ -69,6 +69,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/v1/get", get(get_proxy))
+        .route("/api/v1/getua", get(get_user_agent))
         .route("/api/v1/proxies", get(list_proxies))
         .route("/api/v1/health", get(health))
         .with_state(state)
@@ -189,6 +190,28 @@ async fn get_proxy(State(state): State<Arc<ApiState>>, Query(query): Query<GetQu
         .into_response()
 }
 
+/// `GET /api/v1/getua` — one random user agent from the built-in pool.
+///
+/// Stateless and uniform, exactly like `proxygate getua`: no rotation, no memory
+/// of previous calls.
+async fn get_user_agent(Query(query): Query<GetQuery>) -> Response {
+    let user_agent = crate::useragent::random();
+
+    if query.format.as_deref() == Some("json") {
+        return Json(serde_json::json!({ "user_agent": user_agent })).into_response();
+    }
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        format!("{user_agent}\n"),
+    )
+        .into_response()
+}
+
 /// `GET /api/v1/proxies` — the whole pool, credentials masked.
 async fn list_proxies(State(state): State<Arc<ApiState>>) -> Json<Vec<ProxyEntry>> {
     let mut proxies: Vec<ProxyEntry> = state
@@ -265,6 +288,8 @@ async fn index() -> Json<serde_json::Value> {
         "endpoints": {
             "get": "/api/v1/get",
             "get_json": "/api/v1/get?format=json",
+            "getua": "/api/v1/getua",
+            "getua_json": "/api/v1/getua?format=json",
             "proxies": "/api/v1/proxies",
             "health": "/api/v1/health",
         },
@@ -347,6 +372,40 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["proxy"], "http://user:pass@1.2.3.4:3128");
         assert_eq!(value["latency_ms"], 82);
+    }
+
+    #[tokio::test]
+    async fn getua_returns_a_built_in_agent() {
+        let response = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/getua")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = body_string(response).await;
+        let agent = body.trim();
+        assert!(
+            crate::useragent::all().contains(&agent),
+            "not from the built-in pool: {agent}"
+        );
+
+        let response = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/getua?format=json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        let agent = value["user_agent"].as_str().expect("user_agent field");
+        assert!(crate::useragent::all().contains(&agent));
     }
 
     #[tokio::test]

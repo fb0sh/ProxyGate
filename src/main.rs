@@ -22,7 +22,7 @@ use tracing_subscriber::EnvFilter;
 use proxygate::api::{self, ApiState};
 use proxygate::checker::{CheckReport, HealthChecker, ProxyClients};
 use proxygate::cli::{
-    CheckArgs, Cli, Command, GetArgs, ListArgs, OutputFormat, RefreshArgs, ServeArgs,
+    CheckArgs, Cli, Command, GetArgs, GetUaArgs, ListArgs, OutputFormat, RefreshArgs, ServeArgs,
 };
 use proxygate::config::Config;
 use proxygate::error::{Error, Result};
@@ -83,7 +83,35 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Refresh(args) => cmd_refresh(config, args).await,
         Command::Check(args) => cmd_check(config, args).await,
         Command::Serve(args) => cmd_serve(config, args).await,
+        Command::Genconfig => cmd_genconfig(),
+        Command::Getua(args) => cmd_getua(args),
     }
+}
+
+/// `proxygate genconfig` — the annotated example, straight to stdout.
+///
+/// The content is embedded in the binary, so this works from an installed
+/// build with no checkout next to it. Redirect it to get a starting point:
+/// `proxygate genconfig > config.yaml`.
+fn cmd_genconfig() -> Result<ExitCode> {
+    // `print_stdout` adds the trailing newline; the file already has one.
+    print_stdout(proxygate::config::EXAMPLE_CONFIG.trim_end())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `proxygate getua` — one random user agent, same shape as `get`.
+fn cmd_getua(args: GetUaArgs) -> Result<ExitCode> {
+    let user_agent = proxygate::useragent::random();
+
+    match args.format {
+        OutputFormat::Text => print_stdout(user_agent)?,
+        OutputFormat::Json => {
+            let value = serde_json::json!({ "user_agent": user_agent });
+            print_stdout(&serde_json::to_string(&value)?)?;
+        }
+    }
+
+    Ok(ExitCode::SUCCESS)
 }
 
 // ---------------------------------------------------------------------------

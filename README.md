@@ -188,6 +188,8 @@ proxygate list    [--alive] [--all] [--show-auth] [--json] [--no-refresh] [--no-
 proxygate refresh [--json]
 proxygate check   [--json] [--concurrency N] [--alive-only]
 proxygate serve   [--listen ADDR] [--api ADDR] [--auth USER:PASS] [--no-refresh]
+proxygate genconfig                       # the annotated example config, to stdout
+proxygate getua   [--format text|json]    # one random user agent
 ```
 
 Global flags: `-c/--config <path>`, `-v` (info), `-vv` (debug), `-vvv` (trace),
@@ -197,6 +199,23 @@ Global flags: `-c/--config <path>`, `-v` (info), `-vv` (debug), `-vvv` (trace),
 log line goes to stderr. That is what makes `curl -x "$(proxygate get)"` work.
 
 Exit codes: `0` success, `1` error, `3` no proxy available.
+
+`genconfig` prints the annotated example config that is embedded in the binary,
+so an installed `proxygate` can bootstrap a config with no checkout around:
+
+```bash
+proxygate genconfig > config.yaml
+```
+
+`getua` prints one user agent out of 100 built into the binary
+([`assets/user_agents.txt`](assets/user_agents.txt) — desktop and mobile Chrome,
+Firefox, Safari, Edge and Samsung Internet). It is uniformly random and
+stateless: no rotation, no memory of previous calls, so the same string can come
+up twice in a row. Handy for pairing with a fresh proxy:
+
+```bash
+curl -x "$(proxygate get)" -A "$(proxygate getua)" https://example.com
+```
 
 ```console
 $ proxygate list
@@ -215,6 +234,8 @@ $ proxygate get --format json
 | ------------------------------- | ----------------------------------------------------------- |
 | `GET /api/v1/get`               | one proxy URL as `text/plain`                                |
 | `GET /api/v1/get?format=json`   | `{"proxy": "...", "latency_ms": 83, "round": 3}`             |
+| `GET /api/v1/getua`             | one random user agent as `text/plain`                         |
+| `GET /api/v1/getua?format=json` | `{"user_agent": "Mozilla/5.0 ..."}`                          |
 | `GET /api/v1/proxies`           | the pool as JSON, credentials masked                         |
 | `GET /api/v1/health`            | `{"status": "ok", "proxies": {"total": 2, "alive": 2, ...}}` |
 | `GET /`                         | a small index of the above                                   |
@@ -420,8 +441,10 @@ src/
   selector.rs    candidate filtering and the random/latency strategies
   gateway.rs     HTTP proxy gateway: CONNECT tunnels, forwarding, auth
   api.rs         axum REST API
+  useragent.rs   the built-in user agent pool (100 agents)
   state.rs       state.json / cache.json, RFC 3339 timestamps
   error.rs       error type shared by every module
+assets/          data embedded in the binary (user agent pool)
 subscribers/     exec subscriber contract + example.py
 tests/           integration tests with in-process fake upstreams
 ```

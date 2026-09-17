@@ -13,6 +13,10 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 
+/// The annotated example config, embedded at compile time so `proxygate
+/// genconfig` works from an installed binary that has no checkout next to it.
+pub const EXAMPLE_CONFIG: &str = include_str!("../config.example.yaml");
+
 /// Environment variable pointing at the config file.
 pub const CONFIG_ENV: &str = "PROXYGATE_CONFIG";
 /// Environment variable overriding the cache directory.
@@ -911,6 +915,28 @@ health:
             config.normalize().is_err(),
             "only http(s) targets make sense"
         );
+    }
+
+    #[test]
+    fn the_shipped_example_config_is_valid() {
+        // `config.example.yaml` is embedded and printed by `proxygate genconfig`,
+        // so it has to parse and validate at all times.
+        let mut config: Config =
+            serde_yaml::from_str(EXAMPLE_CONFIG).expect("config.example.yaml must parse");
+        config
+            .normalize()
+            .expect("config.example.yaml must validate");
+
+        assert!(
+            !config.subscribers.is_empty(),
+            "the example shows how to subscribe"
+        );
+        assert_eq!(
+            config.health.targets().len(),
+            2,
+            "the example shows both probes"
+        );
+        assert!(EXAMPLE_CONFIG.contains("genconfig") || EXAMPLE_CONFIG.contains("subscribers"));
     }
 
     #[test]

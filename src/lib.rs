@@ -26,6 +26,7 @@ pub mod pool;
 pub mod selector;
 pub mod state;
 pub mod subscriber;
+pub mod useragent;
 
 pub use error::{Error, Result};
 pub use model::Proxy;

@@ -60,6 +60,10 @@ pub enum Command {
     Check(CheckArgs),
     /// Run the HTTP proxy gateway and the REST API
     Serve(ServeArgs),
+    /// Print the annotated example config to stdout
+    Genconfig,
+    /// Print a random user agent from the built-in pool
+    Getua(GetUaArgs),
 }
 
 #[derive(Debug, Args)]
@@ -132,6 +136,13 @@ pub struct CheckArgs {
     /// Only probe proxies that are currently alive (skip known-dead ones)
     #[arg(long)]
     pub alive_only: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct GetUaArgs {
+    /// Output format
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
 }
 
 #[derive(Debug, Args)]
