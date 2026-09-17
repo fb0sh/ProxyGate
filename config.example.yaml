@@ -7,7 +7,9 @@
 
 server:
   # Address of the HTTP proxy gateway. Keep it on the loopback address unless
-  # you really mean to expose it (and set `gateway.auth` if you do).
+  # you really mean to expose it: clients are not asked for credentials by
+  # default, so anyone who can reach this port can use your pool. See the
+  # "Security" section of README.md before changing this.
   proxy: 127.0.0.1:8080
   # Address of the REST API.
   api: 127.0.0.1:8081
@@ -122,8 +124,9 @@ gateway:
   retries: 2
   # Timeout for connecting to an upstream and completing the CONNECT handshake.
   connect_timeout: 10s
-  # Require clients to authenticate. Can also be set with `--auth user:pass`.
-  # auth: admin:secret
+  # No client authentication: this file assumes the gateway stays reachable only
+  # from this machine. Requiring credentials is a command line decision
+  # (`proxygate serve --help`), which keeps them out of a checked-in config.
 
 state:
   # Where state.json and cache.json live.

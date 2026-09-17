@@ -95,6 +95,11 @@ ProxyGate looks for a config file in this order:
 With no config file it starts with an empty pool, which is useful for testing
 but not much else. Start from [`config.example.yaml`](config.example.yaml).
 
+> The generated config carries **no client authentication**: it assumes the
+> gateway stays reachable only from this machine. Add `--auth user:pass` on the
+> command line when you expose it — that keeps credentials out of a checked-in
+> file.
+
 | Key                   | Default                                   | Meaning                                              |
 | --------------------- | ----------------------------------------- | ---------------------------------------------------- |
 | `server.proxy`        | `127.0.0.1:8080`                          | HTTP proxy gateway address                            |

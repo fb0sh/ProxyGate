@@ -937,6 +937,21 @@ health:
             "the example shows both probes"
         );
         assert!(EXAMPLE_CONFIG.contains("genconfig") || EXAMPLE_CONFIG.contains("subscribers"));
+
+        // The generated config must not ask clients for credentials: it is meant
+        // to be dropped in and used on the loopback address, and gateway auth
+        // belongs on the command line (`--auth`) rather than in a checked-in
+        // file. Re-adding an `auth:` line here makes this test fail.
+        assert!(
+            config.gateway.auth.is_none(),
+            "config.example.yaml must not configure gateway.auth"
+        );
+        for line in EXAMPLE_CONFIG.lines() {
+            assert!(
+                !line.trim_start().starts_with("auth:"),
+                "config.example.yaml must not carry an auth directive: {line}"
+            );
+        }
     }
 
     #[test]

@@ -95,6 +95,9 @@ proxygate genconfig > config.yaml     # 带注释的完整示例，直接重定�
 
 也可以参考仓库里的 [`config.example.yaml`](config.example.yaml)。
 
+> `genconfig` 生成的配置**不含客户端认证**：它假设网关只在本机可达。要对外开放时在命令行
+> 加 `--auth user:pass` —— 这样凭据不会落在会被提交的配置文件里。
+
 | 配置项 | 默认值 | 含义 |
 | --- | --- | --- |
 | `server.proxy` | `127.0.0.1:8080` | HTTP 代理网关地址 |
