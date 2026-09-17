@@ -1,20 +1,19 @@
-//! The HTTP proxy gateway.
+//! HTTP 代理网关。
 //!
-//! Clients talk plain HTTP proxy to ProxyGate and never learn which upstream —
-//! or which upstream credentials — served the request:
+//! 客户端只是以普通 HTTP 代理的方式与 ProxyGate 通信，
+//! 永远不会知道是哪个上游——或者哪份上游凭据——真正服务了请求：
 //!
 //! ```text
 //! Client -> ProxyGate -> Selector -> http://user:pass@upstream:3128 -> Target
 //! ```
 //!
-//! * `CONNECT` requests become a byte tunnel picked once for the whole tunnel
-//!   (the upstream is chosen, dialled and handshaked before the 200 is sent, so
-//!   a broken upstream can be retried transparently).
-//! * Plain HTTP requests are forwarded with `reqwest`, which already knows how
-//!   to speak HTTP-proxy and SOCKS5 (including credentials) upstream.
+//! * `CONNECT` 请求会成为一条字节隧道，整条隧道只挑选一次上游
+//!   （上游在 200 发出之前就已完成选择、拨号与握手，
+//!   因此失效的上游可以被透明地重试）。
+//! * 普通 HTTP 请求交给 `reqwest` 转发，
+//!   它本身就会与 HTTP 代理和 SOCKS5（含凭据）上游对话。
 //!
-//! Client authentication (`--auth user:pass`) is completely independent from
-//! upstream authentication.
+//! 客户端认证（`--auth user:pass`）与上游认证完全独立。
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -40,36 +39,41 @@ use crate::model::{self, Proxy, ProxyScheme};
 use crate::pool::{ProxyPool, Selection};
 use crate::selector::Strategy;
 
-/// Supertrait alias for a tunnel endpoint.
+/// 隧道端点使用的 supertrait 别名。
 ///
-/// A trait object cannot combine `AsyncRead` and `AsyncWrite` directly, so the
-/// two are bundled here and the tunnel works with `Box<dyn ProxyStream>`.
+/// trait object 无法直接同时组合 `AsyncRead` 与 `AsyncWrite`，
+/// 因此这里把两者打包在一起，隧道统一使用 `Box<dyn ProxyStream>`。
 pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Unpin {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + ?Sized> ProxyStream for T {}
 
-/// A stream whose concrete type depends on the upstream scheme.
+/// 具体类型取决于上游 scheme 的流。
 pub type BoxedStream = Pin<Box<dyn ProxyStream>>;
 
-/// What the proxy service returns to hyper.
+/// 代理服务返回给 hyper 的响应。
 pub type ProxyResponse = Response<Body>;
+/// 代理服务的内部结果类型，其错误类型为 `Infallible`，不会失败。
 type ProxyResult = std::result::Result<ProxyResponse, Infallible>;
 
-/// Everything the gateway needs that is not the pool.
+/// 网关除代理池之外需要的全部配置。
 #[derive(Debug, Clone)]
 pub struct GatewayOptions {
+    /// 挑选上游时所使用的选择器策略。
     pub strategy: Strategy,
+    /// 距上次使用超过该时长后，允许再次选中同一个上游。
     pub reuse_after: Duration,
-    /// Extra attempts after the first upstream fails.
+    /// 首个上游失败之后额外尝试的次数。
     pub retries: u32,
+    /// 连接上游的超时时间。
     pub connect_timeout: Duration,
-    /// Consecutive failures after which an upstream is considered dead.
+    /// 连续失败多少次之后认为上游已失效。
     pub max_failures: u32,
-    /// Optional `(user, password)` required from clients.
+    /// 要求客户端提供的可选 `(用户名, 密码)` 凭据。
     pub credentials: Option<(String, String)>,
 }
 
 impl Default for GatewayOptions {
+    /// 返回内置的默认网关配置。
     fn default() -> Self {
         Self {
             strategy: Strategy::default(),
@@ -82,24 +86,54 @@ impl Default for GatewayOptions {
     }
 }
 
-/// The HTTP proxy gateway.
-#[derive(Debug, Clone)]
+/// HTTP 代理网关。
+///
+/// 它还可以在同一端口上提供 REST API：代理请求是 `CONNECT`
+/// 或带有绝对形式请求目标的请求（`GET http://host/path`），
+/// 而 API 调用是普通的原始形式请求（`GET /api/v1/get`）。
+/// 同一个请求不可能同时属于两者，因此一个监听器就能区分它们。
+/// 客户端认证只作用于代理请求——共用端口**不会**为 API 加上凭据校验。
+#[derive(Clone)]
 pub struct Gateway {
     pool: Arc<ProxyPool>,
     clients: Arc<ProxyClients>,
     options: GatewayOptions,
+    /// 在该监听器上同时提供的 REST API，当 `server.api` 为 `same` 时存在。
+    api: Option<axum::Router>,
+}
+
+impl std::fmt::Debug for Gateway {
+    /// 打印网关摘要，只记录是否挂载了 API，不展开 router 内部。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Gateway")
+            .field("pool", &self.pool)
+            .field("options", &self.options)
+            .field("api", &self.api.is_some())
+            .finish()
+    }
 }
 
 impl Gateway {
+    /// 用给定的代理池、客户端缓存与配置创建网关，初始不挂载 API。
     pub fn new(pool: Arc<ProxyPool>, clients: Arc<ProxyClients>, options: GatewayOptions) -> Self {
         Self {
             pool,
             clients,
             options,
+            api: None,
         }
     }
 
-    /// Accepts connections until `shutdown` resolves.
+    /// 让同一个监听器同时响应 REST API。
+    ///
+    /// 传入的 router 必须已经附加好状态，也就是来自
+    /// [`crate::api::router`]。
+    pub fn with_api(mut self, api: axum::Router) -> Self {
+        self.api = Some(api);
+        self
+    }
+
+    /// 持续接受连接，直到 `shutdown` 完成。
     pub async fn serve<S>(
         self: Arc<Self>,
         listener: TcpListener,
@@ -148,8 +182,16 @@ impl Gateway {
         }
     }
 
-    /// Entry point for one client request.
+    /// 单个客户端请求的入口。
     async fn handle(&self, request: Request<Incoming>, peer: std::net::SocketAddr) -> ProxyResult {
+        // The REST API shares this port when configured to: anything that is
+        // not shaped like a proxy request belongs to it.
+        if let Some(api) = &self.api {
+            if !is_proxy_request(&request) {
+                return Ok(dispatch_api(api.clone(), request).await);
+            }
+        }
+
         if let Some(rejection) = self.rejection(&request) {
             tracing::debug!(client = %peer, "rejected unauthenticated client");
             return Ok(rejection);
@@ -162,10 +204,11 @@ impl Gateway {
         }
     }
 
-    /// Enforces gateway credentials, if configured.
+    /// 在配置了网关凭据时执行认证检查。
     ///
-    /// Returns the `407` to send back when the client is not allowed in, or
-    /// `None` when the request may proceed.
+    /// 客户端不被允许时返回要发回的 `407` 响应，允许通过时返回
+    /// `None`。该检查只作用于代理请求：与 REST API 共用端口时，
+    /// API 请求在此之前就已被分派出去，因此 API 始终开放。
     fn rejection(&self, request: &Request<Incoming>) -> Option<ProxyResponse> {
         let Some((user, password)) = &self.options.credentials else {
             return None;
@@ -195,7 +238,7 @@ impl Gateway {
         }
     }
 
-    /// Picks an upstream using the configured strategy.
+    /// 按配置的策略挑选一个上游。
     fn select(&self) -> Option<Selection> {
         let selection = self.pool.select(
             self.options.strategy,
@@ -212,6 +255,7 @@ impl Gateway {
         Some(selection)
     }
 
+    /// 处理 `CONNECT`：建立隧道，成功时回复 `200`。
     async fn handle_connect(&self, mut request: Request<Incoming>) -> ProxyResponse {
         let target = connect_target(&request);
         let Some((host, port)) = target else {
@@ -298,6 +342,7 @@ impl Gateway {
         )
     }
 
+    /// 处理普通 HTTP 代理请求：经上游客户端转发。
     async fn handle_http(
         &self,
         request: Request<Incoming>,
@@ -427,7 +472,7 @@ impl Gateway {
         )
     }
 
-    /// Dials the upstream and, for HTTP proxies, performs the CONNECT handshake.
+    /// 拨通上游，并对 HTTP 代理执行 CONNECT 握手。
     async fn open_tunnel(
         &self,
         upstream: &Proxy,
@@ -445,6 +490,7 @@ impl Gateway {
         }
     }
 
+    /// `open_tunnel` 的实际实现，本身不施加超时。
     async fn open_tunnel_inner(
         &self,
         upstream: &Proxy,
@@ -500,7 +546,27 @@ impl Gateway {
     }
 }
 
-/// Small helper so the two SOCKS5 call shapes stay in one place.
+/// 当请求要求建立隧道（`CONNECT`）或带有绝对目标
+/// （`GET http://host/path`）时，它就是代理请求——
+/// 这正是被配置为使用代理的客户端所发出的请求形态。
+fn is_proxy_request(request: &Request<Incoming>) -> bool {
+    request.method() == Method::CONNECT || request.uri().scheme().is_some()
+}
+
+/// 把请求交给提供 REST API 的 axum router。
+async fn dispatch_api(router: axum::Router, request: Request<Incoming>) -> ProxyResponse {
+    use tower::ServiceExt;
+
+    let (parts, body) = request.into_parts();
+    let request = Request::from_parts(parts, Body::new(body));
+
+    match router.oneshot(request).await {
+        Ok(response) => response,
+        Err(never) => match never {},
+    }
+}
+
+/// 小助手，让两种 SOCKS5 调用形态集中在一处。
 async fn socks5_connect<'t, T>(
     proxy_address: (&str, u16),
     target: T,
@@ -519,8 +585,7 @@ where
     stream.map_err(|error| Error::other(format!("socks5 handshake failed: {error}")))
 }
 
-/// Bidirectional copy, flushing any bytes that were already read from the
-/// upstream while parsing its CONNECT response.
+/// 双向拷贝，并把解析上游 CONNECT 响应时已读到的字节先冲刷过去。
 async fn relay(
     client: &mut BoxedStream,
     mut upstream: BoxedStream,
@@ -533,7 +598,7 @@ async fn relay(
     tokio::io::copy_bidirectional(client, &mut upstream).await
 }
 
-/// Reads up to the end of an HTTP head, returning it with any extra bytes.
+/// 最多读到 HTTP 头部结束，返回头部本身以及多读出的字节。
 async fn read_head<S: AsyncRead + Unpin>(
     stream: &mut S,
     limit: usize,
@@ -560,7 +625,7 @@ async fn read_head<S: AsyncRead + Unpin>(
     }
 }
 
-/// Position just past the blank line that ends a head.
+/// 结束头部的空行之后的位置。
 fn find_head_end(buffer: &[u8]) -> Option<usize> {
     buffer
         .windows(4)
@@ -568,7 +633,7 @@ fn find_head_end(buffer: &[u8]) -> Option<usize> {
         .map(|position| position + 4)
 }
 
-/// Status code of `HTTP/1.1 200 Connection established`.
+/// `HTTP/1.1 200 Connection established` 中的状态码。
 fn parse_status_code(head: &[u8]) -> Result<u16> {
     let text = String::from_utf8_lossy(head);
     text.lines()
@@ -578,7 +643,7 @@ fn parse_status_code(head: &[u8]) -> Result<u16> {
         .ok_or_else(|| Error::other("upstream sent a malformed status line"))
 }
 
-/// `host:port` for a CONNECT request (authority-form, port defaults to 443).
+/// `CONNECT` 请求的 `host:port`（authority 形式，端口默认 443）。
 fn connect_target(request: &Request<Incoming>) -> Option<(String, u16)> {
     let authority = request
         .uri()
@@ -587,7 +652,7 @@ fn connect_target(request: &Request<Incoming>) -> Option<(String, u16)> {
     split_host_port(&authority, 443)
 }
 
-/// Splits `host:port`, tolerating bracketed IPv6 and a missing port.
+/// 拆分 `host:port`，兼容带方括号的 IPv6 以及缺省端口。
 pub fn split_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> {
     let authority = authority.trim();
     if let Some(rest) = authority.strip_prefix('[') {
@@ -609,7 +674,7 @@ pub fn split_host_port(authority: &str, default_port: u16) -> Option<(String, u1
     }
 }
 
-/// Headers that apply to one hop only and must not be forwarded.
+/// 只作用于单跳、禁止转发的逐跳头部。
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -625,6 +690,7 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
     )
 }
 
+/// 用上游响应重建发回客户端的响应，并过滤逐跳头部。
 fn build_response(response: reqwest::Response) -> ProxyResponse {
     let status = response.status();
     let headers = response.headers().clone();
@@ -644,6 +710,7 @@ fn build_response(response: reqwest::Response) -> ProxyResponse {
     }
 }
 
+/// 构造纯文本错误响应。
 fn error_response(status: StatusCode, message: &str) -> ProxyResponse {
     Response::builder()
         .status(status)
@@ -652,7 +719,7 @@ fn error_response(status: StatusCode, message: &str) -> ProxyResponse {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-/// Extracts `user:password` from a `Basic` proxy authorization header.
+/// 从 `Basic` 代理认证头中提取 `user:password`。
 pub fn decode_basic_credentials(value: &str) -> Option<(String, String)> {
     let (scheme, encoded) = value.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("basic") {
@@ -664,7 +731,7 @@ pub fn decode_basic_credentials(value: &str) -> Option<(String, String)> {
     Some((user.to_string(), password.to_string()))
 }
 
-/// Comparison that does not short-circuit on the first differing byte.
+/// 不会在首个不同字节处提前返回的比较。
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

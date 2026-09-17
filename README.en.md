@@ -32,6 +32,10 @@ from your clients.
 
 From the moment a proxy enters the pool, nothing cares where it came from.
 
+> The Rust API docs (**Chinese**) live at <https://docs.rs/proxygate> — the doc
+> comments in the source are what is published. Locally:
+> `cargo doc --no-deps --open`.
+
 ## Quick start
 
 ```bash
@@ -103,7 +107,7 @@ but not much else. Start from [`config.example.yaml`](config.example.yaml).
 | Key                   | Default                                   | Meaning                                              |
 | --------------------- | ----------------------------------------- | ---------------------------------------------------- |
 | `server.proxy`        | `127.0.0.1:8080`                          | HTTP proxy gateway address                            |
-| `server.api`          | `127.0.0.1:8081`                          | REST API address                                      |
+| `server.api`          | `127.0.0.1:8081`                          | REST API address; `same` shares the gateway port      |
 | `subscribers`         | `[]`                                      | Where proxies come from (see below)                   |
 | `refresh.interval`    | `10m`                                     | How long a fetched list is reused                     |
 | `refresh.timeout`     | `20s`                                     | Per-subscriber timeout                                |
@@ -128,6 +132,36 @@ whole point of the default pair: `google.com/generate_204` only answers if the
 proxy really has international connectivity, and `cn.bing.com` proves the tunnel
 is not broken for everything else. By default `require: any` accepts a proxy
 that reaches either one; the `TARGETS` column tells you which.
+
+### Sharing one port with the API
+
+`server.api` also accepts `same` (or `proxy`, or a literal copy of the
+`server.proxy` address):
+
+```yaml
+server:
+  proxy: 127.0.0.1:8080
+  api: same          # the REST API shares 127.0.0.1:8080 with the gateway
+```
+
+The port splits traffic by request shape:
+
+| Request received                    | Verdict       | Destination |
+| ----------------------------------- | ------------- | ----------- |
+| `CONNECT host:443`                  | proxy request | HTTP gateway |
+| `GET http://host/path` (absolute)   | proxy request | HTTP gateway |
+| `GET /api/v1/get` (origin-form)     | API request   | REST API     |
+
+> **Auth covers proxy requests only.** `gateway.auth` (`--auth user:pass`)
+> rejects proxy requests, but an API sharing the port stays open — anyone who can
+> reach the port can read `/api/v1/proxies`. Only share the port on a trusted
+> interface (the default is `127.0.0.1`). `proxygate serve` logs a warning when
+> you do. Expose it publicly with the API back on its own port, or behind a
+> firewall rule.
+
+There is no functional difference between the two layouts; share a port when
+mapping one container port is convenient, split them when you want them
+separable while debugging.
 
 ### Subscribers
 
@@ -234,6 +268,11 @@ certificates could not use it anyway.
 
 ## CLI
 
+`proxygate --help` (and every subcommand's `--help`) is printed in Chinese: clap
+uses the doc comments as help text. Only clap's own structural headings
+(`Usage:`, `Options:`) and its generated error messages stay English — clap has
+no localization hook for them.
+
 ```text
 proxygate get     [--format text|json] [--strategy random|latency] [--no-refresh] [--no-check] [--mask]
 proxygate list    [--alive] [--all] [--show-auth] [--json] [--no-refresh] [--no-check]
@@ -314,6 +353,9 @@ $ curl -s http://127.0.0.1:8081/api/v1/health
  "strategy":"random","health_target":"https://example.com/",
  "proxies":{"total":2,"alive":2,"dead":0}}
 ```
+
+With `server.api: same`, use port `8080` in the examples above; the paths
+are unchanged.
 
 `/get` answers `503` when no healthy proxy is available. Credentials are never
 exposed by `/proxies` (they are replaced with `***:***`).
@@ -478,6 +520,7 @@ selection by geolocation or provider.
 cargo fmt --check
 cargo clippy --all-targets
 cargo test              # unit + integration (fake upstreams, no network)
+cargo doc --no-deps --open   # the Chinese API docs, as published on docs.rs
 cargo build --release
 ```
 
@@ -494,9 +537,17 @@ binaries:
 
 ## Project layout
 
+This is a **library crate with a thin binary**: `src/lib.rs` holds all the
+logic and `src/main.rs` is a few dozen lines that parse arguments, initialize
+tracing, dispatch and map errors to exit codes. To use ProxyGate from another
+Rust program, add the dependency and `use proxygate::...` — the CLI is optional.
+
 ```text
 src/
-  main.rs        binary: CLI dispatch, App runtime, background loops
+  lib.rs         crate root: module list, crate docs, embedded SKILL.md
+  main.rs        thin shell: parse, init tracing, dispatch, exit code
+  app.rs         shared runtime: pool + state store + HTTP clients + checker
+  commands.rs    one function per CLI subcommand
   cli.rs         clap definitions
   config.rs      config.yaml model, defaults, validation
   model.rs       Proxy, stable ids, URL normalization, small codecs
@@ -516,14 +567,16 @@ tests/           integration tests with in-process fake upstreams
 SKILL.md         the agent-facing document printed by `proxygate skill`
 ```
 
-Two deviations from a single-binary crate, both for testability: the code lives
-in a library (`src/lib.rs`) with a thin binary on top, so the integration tests
-can drive the real gateway, and `tests/common/mod.rs` holds the fake upstreams.
+Splitting out the library lets the integration tests drive the real gateway
+directly (`tests/common/mod.rs` holds the fake upstreams) instead of spawning a
+child process.
 
 Deviations from the v0.1 design notes, each for a reason found while building it:
 
 * `src/lib.rs` as above; the package is lowercase (`proxygate`) so the binary
   name matches the commands in this document.
+* `server.api` accepts `same` so the REST API and the proxy gateway can share a
+  single port, dispatched by request shape.
 * `state.json` holds exactly what the notes describe, *plus* a separate
   `cache.json` for subscriber and health results. Without it, one `get` against a
   10,000-proxy pool re-probes all 10,000 every time.
@@ -546,6 +599,8 @@ Deviations from the v0.1 design notes, each for a reason found while building it
   hands the proxy a bogus address.
 * A source can carry a default `limit`, because pulling tens of thousands of
   proxies makes the health loop unable to keep up with its own interval.
+* Doc comments are written in Chinese (the project's primary audience), so
+  docs.rs is readable in Chinese only; this README stays bilingual.
 
 ## License
 

@@ -1,17 +1,19 @@
-//! Persisted state.
+//! 持久化状态。
 //!
-//! `proxygate` is a CLI, so every invocation is a fresh process: the rotation
-//! state and the subscriber/health caches have to live on disk. Two files in the
-//! cache directory (`~/.cache/proxygate` by default):
+//! `proxygate` 是 CLI，每次调用都是一个新进程：轮换状态以及订阅源和健康检查
+//! 的缓存必须落到磁盘上。默认放在缓存目录（`~/.cache/proxygate`）里的两个
+//! 文件：
 //!
-//! * `state.json` — only usage facts (`generation`, `last_used_at`). Health is
-//!   never persisted as a fact; the health *cache* below only remembers the last
-//!   check time so that a burst of `proxygate get` calls does not re-probe the
-//!   whole pool every time.
-//! * `cache.json` — the last subscriber payload plus the last health results,
-//!   each with a timestamp so they can expire.
+//! * `state.json` —— 只记录使用事实（`generation`、`last_used_at`），只有真正
+//!   发放过的代理才有条目。健康状态从不作为事实持久化；下面的健康缓存只记住
+//!   最后一次检查时间，这样连续的 `proxygate get` 调用不必每次都重新探测
+//!   整个池。
+//! * `cache.json` —— 最近一次订阅源响应体，加上最近一次健康检查结果，各带
+//!   时间戳以便过期；健康检查用过的探测目标也一并记录。
 //!
-//! Both files are written atomically (temp file + rename).
+//! 两个文件都以原子写入（临时文件 + rename）方式保存，目录以 0700、文件以
+//! 0600 创建。缓存写入失败不是致命错误，只会记一条警告并继续服务；写入被
+//! 权限拒绝时，错误信息还会附带可操作的排查提示。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,81 +25,105 @@ use crate::error::{Error, Result};
 use crate::model::ProxyId;
 use crate::pool::ProxyPool;
 
+/// `state.json` 的文件名。
 pub const STATE_FILE: &str = "state.json";
+/// `cache.json` 的文件名。
 pub const CACHE_FILE: &str = "cache.json";
 
-/// Entries older than this are dropped from `state.json` so the file cannot grow
-/// forever as providers rotate their proxy lists.
+/// 超过这个时长的条目会从 `state.json` 里丢弃，这样文件不会随着服务商不断
+/// 轮换代理列表而无限增长。
 pub const USAGE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// `state.json` — the shape documented in the README.
+/// `state.json` —— README 中记录的结构。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StateFile {
+    /// 当前代，发完一整轮后递增。
     #[serde(default)]
     pub generation: u64,
+    /// 按代理 ID 索引的使用记录。
     #[serde(default)]
     pub proxies: HashMap<ProxyId, ProxyUsageFile>,
 }
 
+/// `state.json` 里单个代理的使用记录。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProxyUsageFile {
+    /// 该代理最后一次被发放时所处的代。
     #[serde(default)]
     pub generation: u64,
+    /// 最后一次被发放的时间，RFC3339 格式。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<String>,
 }
 
-/// `cache.json` — subscriber results and health results with timestamps.
+/// `cache.json` —— 带时间戳的订阅源结果与健康检查结果。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheFile {
+    /// 最近一次成功拉取订阅源的时间，RFC3339 格式。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetched_at: Option<String>,
+    /// 最近一次拉取到的代理 URL，含明文凭据。
     #[serde(default)]
     pub proxies: Vec<String>,
+    /// 最近一次健康检查的时间，RFC3339 格式。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_at: Option<String>,
+    /// 按代理 ID 索引的健康检查结果。
     #[serde(default)]
     pub health: HashMap<ProxyId, HealthFile>,
 }
 
+/// `cache.json` 里单个代理的健康检查结果。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HealthFile {
+    /// 该代理是否存活。
     pub alive: bool,
+    /// 最近一次健康检查的延迟，单位毫秒。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
+    /// 连续失败次数。
     #[serde(default)]
     pub failures: u32,
-    /// Per-target results of the last pass, so a restart knows which endpoint a
-    /// proxy could not reach without re-probing.
+    /// 最近一轮的逐目标结果，这样重启后无需重新探测就能知道该代理连不上
+    /// 哪个端点。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub targets: Vec<TargetHealthFile>,
 }
 
+/// 针对单个探测目标的健康检查结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetHealthFile {
+    /// 探测目标的 URL。
     pub target: String,
+    /// 该目标是否可达。
     pub ok: bool,
+    /// 该目标的延迟，单位毫秒。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
 }
 
-/// Reads and writes the files in the cache directory.
+/// 读写缓存目录中的文件。
 #[derive(Debug)]
 pub struct StateStore {
     dir: PathBuf,
-    /// Unix seconds of the last successful write, used to throttle `state.json`
-    /// writes when the API serves a burst of requests.
+    /// 最近一次成功写入的 Unix 秒数，用于在 API 承受突发请求时限流
+    /// `state.json` 的写入。
     last_write: std::sync::atomic::AtomicU64,
 }
 
+/// 一次状态恢复的结果统计。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RestoreSummary {
+    /// 成功恢复使用记录的代理数。
     pub restored: usize,
+    /// 文件里有记录、但已不在代理池中的代理数。
     pub missing: usize,
+    /// 从 `state.json` 恢复出的代。
     pub generation: u64,
 }
 
 impl StateStore {
+    /// 用给定的缓存目录创建状态存储。
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
@@ -105,22 +131,25 @@ impl StateStore {
         }
     }
 
+    /// 返回缓存目录。
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
+    /// 返回 `state.json` 的完整路径。
     pub fn state_path(&self) -> PathBuf {
         self.dir.join(STATE_FILE)
     }
 
+    /// 返回 `cache.json` 的完整路径。
     pub fn cache_path(&self) -> PathBuf {
         self.dir.join(CACHE_FILE)
     }
 
-    /// Ensures the cache directory exists.
+    /// 确保缓存目录存在。
     ///
-    /// On Unix the directory is created `0700`: `cache.json` holds proxy URLs
-    /// including credentials, so it must not be world readable.
+    /// 在 Unix 上目录以 `0700` 创建：`cache.json` 里含有带凭据的代理 URL，
+    /// 不能被其他用户读取。
     pub fn ensure_dir(&self) -> Result<()> {
         std::fs::create_dir_all(&self.dir)
             .map_err(|error| write_error(&self.dir, &error, "create"))?;
@@ -128,25 +157,27 @@ impl StateStore {
         Ok(())
     }
 
-    /// Loads `state.json`, falling back to an empty state when the file is
-    /// missing or unreadable.
+    /// 读取 `state.json`，文件缺失或不可读时回退为空状态。
     pub fn load_state(&self) -> StateFile {
         load_json(&self.state_path()).unwrap_or_default()
     }
 
+    /// 写入 `state.json`。
     pub fn save_state(&self, state: &StateFile) -> Result<()> {
         save_json(&self.state_path(), state)
     }
 
+    /// 读取 `cache.json`，文件缺失或不可读时回退为空缓存。
     pub fn load_cache(&self) -> CacheFile {
         load_json(&self.cache_path()).unwrap_or_default()
     }
 
+    /// 写入 `cache.json`。
     pub fn save_cache(&self, cache: &CacheFile) -> Result<()> {
         save_json(&self.cache_path(), cache)
     }
 
-    /// Copies generation and per-proxy usage from disk into the pool.
+    /// 把磁盘上的代和逐代理使用记录复制回代理池。
     pub fn restore(&self, pool: &ProxyPool) -> RestoreSummary {
         let state = self.load_state();
         let mut summary = RestoreSummary {
@@ -167,13 +198,12 @@ impl StateStore {
         summary
     }
 
-    /// Writes the pool's usage facts back to `state.json`, dropping entries
-    /// that carry no information: proxies that are gone, proxies that were never
-    /// handed out (their defaults are the defaults), and entries nobody used for
-    /// [`USAGE_RETENTION`].
+    /// 把代理池的使用事实写回 `state.json`，并丢弃不携带信息的条目：已经
+    /// 消失的代理、从未被发放过的代理（它们的默认值就是默认值），以及超过
+    /// [`USAGE_RETENTION`] 没人使用的条目。
     ///
-    /// Keeping the file proportional to *used* proxies rather than to the pool
-    /// matters once a provider list holds thousands of them.
+    /// 当服务商的列表里有成千上万个代理时，让文件大小与用过的代理数成正比、
+    /// 而不是与代理池大小成正比就很重要。
     pub fn persist(&self, pool: &ProxyPool, now: SystemTime) -> Result<StateFile> {
         // `usage()` only ever lists proxies that are currently in the pool, so
         // entries for departed proxies disappear by construction.
@@ -206,10 +236,10 @@ impl StateStore {
         Ok(state)
     }
 
-    /// Persists at most once every `min_interval`, so a burst of `get` calls
-    /// does not rewrite `state.json` on every request.
+    /// 最多每 `min_interval` 持久化一次，这样突发的 `get` 调用不会每个请求
+    /// 都重写 `state.json`。
     ///
-    /// Returns `true` when the state was actually written.
+    /// 真正写入状态时返回 `true`。
     pub fn persist_throttled(
         &self,
         pool: &ProxyPool,
@@ -238,18 +268,18 @@ impl StateStore {
 }
 
 impl CacheFile {
-    /// True when the subscriber payload is still within `max_age`.
+    /// 订阅源响应体仍在 `max_age` 内时返回 `true`。
     pub fn proxies_fresh(&self, max_age: Duration, now: SystemTime) -> bool {
         is_fresh(self.fetched_at.as_deref(), max_age, now) && !self.proxies.is_empty()
     }
 
-    /// True when the health results are still within `max_age`.
+    /// 健康检查结果仍在 `max_age` 内时返回 `true`。
     pub fn health_fresh(&self, max_age: Duration, now: SystemTime) -> bool {
         is_fresh(self.checked_at.as_deref(), max_age, now)
     }
 }
 
-/// Freshness test used by both caches.
+/// 两个缓存共用的新鲜度判断。
 pub fn is_fresh(timestamp: Option<&str>, max_age: Duration, now: SystemTime) -> bool {
     let Some(timestamp) = timestamp.and_then(parse_rfc3339) else {
         return false;
@@ -259,6 +289,7 @@ pub fn is_fresh(timestamp: Option<&str>, max_age: Duration, now: SystemTime) -> 
         .unwrap_or(true)
 }
 
+/// 读取并解析 JSON 文件；文件缺失、不可读或损坏时返回 `None`。
 fn load_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Option<T> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
@@ -277,6 +308,7 @@ fn load_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Option<T> {
     }
 }
 
+/// 以原子写入方式保存 JSON 文件：先写临时文件，再 rename 覆盖目标文件。
 fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| write_error(parent, &error, "create"))?;
@@ -293,11 +325,10 @@ fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
-/// Builds an actionable message for a cache-file failure.
+/// 为缓存文件写入失败构造带可操作提示的错误信息。
 ///
-/// A read-only cache directory is the classic failure mode (a container volume
-/// owned by another user, a service account without `$HOME`), so say what to do
-/// about it rather than repeating the bare `os error 13`.
+/// 缓存目录只读是最典型的失败场景（容器卷属于其他用户、服务账号没有
+/// `$HOME`），所以要说明该怎么办，而不是重复裸的 `os error 13`。
 fn write_error(path: &Path, error: &std::io::Error, verb: &str) -> Error {
     let hint = if error.kind() == std::io::ErrorKind::PermissionDenied {
         " (the cache directory must be writable; set `state.dir` in the config or $PROXYGATE_CACHE_DIR)"
@@ -307,17 +338,18 @@ fn write_error(path: &Path, error: &std::io::Error, verb: &str) -> Error {
     Error::Other(format!("cannot {verb} {}: {error}{hint}", path.display()))
 }
 
-/// Best effort permission tightening; a failure is not worth aborting a write.
+/// 尽力收紧权限；失败也不值得中断一次写入。
 #[cfg(unix)]
 fn restrict_permissions(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
 }
 
+/// 非 Unix 平台没有权限位，此函数不做任何事。
 #[cfg(not(unix))]
 fn restrict_permissions(_path: &Path, _mode: u32) {}
 
-/// Seconds since the Unix epoch (negative before 1970).
+/// 自 Unix 纪元起的秒数（1970 年之前为负）。
 pub fn unix_secs(time: SystemTime) -> i64 {
     match time.duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_secs() as i64,
@@ -325,6 +357,7 @@ pub fn unix_secs(time: SystemTime) -> i64 {
     }
 }
 
+/// 把自 Unix 纪元起的秒数还原为 `SystemTime`。
 pub fn from_unix_secs(secs: i64) -> SystemTime {
     if secs >= 0 {
         UNIX_EPOCH + Duration::from_secs(secs as u64)
@@ -333,7 +366,7 @@ pub fn from_unix_secs(secs: i64) -> SystemTime {
     }
 }
 
-/// RFC 3339 in UTC, second precision: `2026-09-17T10:30:00Z`.
+/// UTC 的 RFC3339 时间戳，精确到秒：`2026-09-17T10:30:00Z`。
 pub fn to_rfc3339(time: SystemTime) -> String {
     let secs = unix_secs(time);
     let days = secs.div_euclid(86_400);
@@ -347,7 +380,7 @@ pub fn to_rfc3339(time: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-/// Parses the RFC 3339 timestamps this module writes (and most others).
+/// 解析本模块写入的（以及大多数其他来源的）RFC3339 时间戳。
 pub fn parse_rfc3339(input: &str) -> Option<SystemTime> {
     let bytes = input.as_bytes();
     if bytes.len() < 19 {
@@ -399,7 +432,7 @@ pub fn parse_rfc3339(input: &str) -> Option<SystemTime> {
     Some(from_unix_secs(secs))
 }
 
-/// Days-from-civil (Howard Hinnant's algorithm), valid for any year.
+/// 由年月日求天数（Howard Hinnant 算法），对任意年份有效。
 fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = if year >= 0 { year } else { year - 399 } / 400;
@@ -410,7 +443,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     era * 146_097 + day_of_era as i64 - 719_468
 }
 
-/// Civil-from-days (Howard Hinnant's algorithm).
+/// 由天数求年月日（Howard Hinnant 算法）。
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;

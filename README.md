@@ -30,6 +30,9 @@ ProxyGate 从 HTTP 接口、本地文件或任意脚本里收集代理，统一�
 
 代理一旦进入 Pool，后续任何环节都不再关心它最初是什么格式。
 
+> Rust API 文档（**中文**）在 <https://docs.rs/proxygate>，源码里的文档注释就是它；
+> 想在本机看：`cargo doc --no-deps --open`。
+
 ## 快速开始
 
 ```bash
@@ -101,7 +104,7 @@ proxygate genconfig > config.yaml     # 带注释的完整示例，直接重定�
 | 配置项 | 默认值 | 含义 |
 | --- | --- | --- |
 | `server.proxy` | `127.0.0.1:8080` | HTTP 代理网关地址 |
-| `server.api` | `127.0.0.1:8081` | REST API 地址 |
+| `server.api` | `127.0.0.1:8081` | REST API 地址；填 `same` 可与网关共用同一端口 |
 | `subscribers` | `[]` | 代理来源，见下一节 |
 | `refresh.interval` | `10m` | 拉取结果复用时⻓ |
 | `refresh.timeout` | `20s` | 单个 subscriber 超时 |
@@ -124,6 +127,32 @@ proxygate genconfig > config.yaml     # 带注释的完整示例，直接重定�
 > Google」不是问题——要连上的是代理。默认两个目标里，Google 只有代理真的能出国才会
 > 应答，`cn.bing.com` 则证明这条隧道不是对所有站点都坏。默认 `require: any`，通一个
 > 就算可用；想只发放两边都通的代理就设成 `all`。
+
+### 让 API 和代理共用一个端口
+
+`server.api` 可以写成 `same`（也接受 `proxy`，或者直接把 `server.proxy` 的地址抄一遍）：
+
+```yaml
+server:
+  proxy: 127.0.0.1:8080
+  api: same          # REST API 和代理网关共用 127.0.0.1:8080
+```
+
+同一个监听端口上按**请求形状**分流：
+
+| 收到的请求 | 判定 | 去向 |
+| --- | --- | --- |
+| `CONNECT host:443` | 代理请求 | HTTP 网关 |
+| `GET http://host/path`（绝对形式） | 代理请求 | HTTP 网关 |
+| `GET /api/v1/get`（原始形式） | API 请求 | REST API |
+
+> **认证只覆盖代理请求。** `gateway.auth`（`--auth user:pass`）只拦代理请求，共用端口时
+> API 本身仍然是开放的——谁连上这个端口都能读 `/api/v1/proxies`。所以共用端口只适合
+> 监听在受信任的接口（默认就是 `127.0.0.1`）。`proxygate serve` 在这种情况下会打一条
+> 警告日志。要对外提供服务，就把 API 放回独立端口，或者用防火墙限制来源。
+
+分端口和共端口的选择没有功能差别，纯粹看部署习惯：容器里映射一个端口更省事，本地开发
+分开更好排查。
 
 ### Subscriber（代理来源）
 
@@ -220,6 +249,10 @@ user:pass@1.2.3.4:3128       socks5h://user:pass@[2001:db8::1]:1080
 
 ## 命令行
 
+`proxygate --help`（以及每个子命令的 `--help`）的内容是中文——clap 会直接把文档注释当
+帮助文本用。只有 `Usage:` / `Options:` 这类结构性标题和 clap 自动生成的报错信息是英文，
+clap 没有本地化接口。
+
 ```text
 proxygate get       [--format text|json] [--strategy random|latency] [--no-refresh] [--no-check] [--mask]
 proxygate list      [--alive] [--all] [--show-auth] [--json] [--no-refresh] [--no-check]
@@ -294,6 +327,8 @@ $ curl -s http://127.0.0.1:8081/api/v1/health
  "https://cn.bing.com/"],"health_require":"any",
  "proxies":{"total":2,"alive":2,"dead":0}}
 ```
+
+`server.api: same` 时把上面的 `8081` 换成 `8080` 即可，路径不变。
 
 池内没有可用代理时 `/get` 返回 `503`（含义同退出码 `3`）。`/proxies` 永远不会暴露凭据
 （替换成 `***:***`），但会带上每个代理的逐目标探测结果。
@@ -446,6 +481,7 @@ proxygate get   →  进入下一轮，A/B/C 重新可用
 cargo fmt --check
 cargo clippy --all-targets
 cargo test              # 单元 + 集成（内置假上游，不依赖网络）
+cargo doc --no-deps --open   # 中文文档注释，docs.rs 上就是这个
 cargo build --release
 ```
 
@@ -461,9 +497,16 @@ cargo build --release
 
 ## 目录结构
 
+这是一个**库 crate + 薄二进制**：`src/lib.rs` 装全部逻辑，`src/main.rs` 只有几十行
+（解析参数、初始化日志、分发、打印错误）。想在自己的 Rust 程序里用 `ProxyGate`，加依赖
+后 `use proxygate::...` 即可，CLI 不是必须的。
+
 ```text
 src/
-  main.rs        CLI 分发、App 运行时、后台任务
+  lib.rs         库入口：模块声明、crate 文档、内置 SKILL.md
+  main.rs        薄壳：解析参数、初始化日志、分发、按错误映射退出码
+  app.rs         共享运行时：池 + 状态存储 + HTTP client + 健康检查器
+  commands.rs    每个子命令对应一个函数
   cli.rs         clap 定义
   config.rs      config.yaml 模型、默认值、校验
   model.rs       Proxy、稳定 ID、URL 归一化、小工具编解码
@@ -483,9 +526,8 @@ tests/           集成测试（进程内假上游）
 SKILL.md         面向 AI agent 的说明（`proxygate skill` 输出它）
 ```
 
-为了可测试性，代码放在库（`src/lib.rs`）里、二进制只是薄壳，这样集成测试能驱动真实的
-网关；`tests/common/mod.rs` 放那些假上游。除此之外还有几处与设计说明不同，都是实际做的
-时候发现问题才改的：
+拆成库之后集成测试能直接驱动真实网关（`tests/common/mod.rs` 放那些假上游），不用起子
+进程。除此之外还有几处与设计说明不同，都是实际做的时候发现问题才改的：
 
 - 包名小写 `proxygate`，让二进制名和文档里的命令一致。
 - `state.json` 与设计一致，但额外有 `cache.json` 存 subscriber 和健康结果。没有它，
@@ -500,6 +542,9 @@ SKILL.md         面向 AI agent 的说明（`proxygate skill` 输出它）
 - 返回体里的协议字段会被归一化（上表），其中 `socks5` → `socks5h` 是刻意的：本机 DNS 被
   污染时，本地解析会把假地址交给代理。
 - 每个源可以有默认 `limit`，因为一次拉上万条代理会让健康探测循环跑不完。
+- `server.api` 支持 `same`，让 REST API 和代理网关共用一个端口（按请求形状分流）。
+- 文档注释一律写成中文，docs.rs 展示的就是它（也正因如此 `proxygate --help`
+  的内容是中文）。`SKILL.md` 保持英文，因为它面向 agent。
 
 ## 许可
 

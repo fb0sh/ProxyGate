@@ -1,7 +1,7 @@
-//! Built-in proxy sources.
+//! 内置代理来源。
 //!
-//! A curated catalog of public endpoints that hand out proxies. A config can
-//! refer to one by name instead of repeating its URL:
+//! 一份精心整理的公开端点目录，这些端点会分发代理。配置里可以按名字引用
+//! 某个来源，而不必重复它的 URL：
 //!
 //! ```yaml
 //! subscribers:
@@ -10,46 +10,43 @@
 //!     provider: scdn
 //! ```
 //!
-//! The catalog lives in code (not in the config template) so the endpoints,
-//! their payload format and their caveats stay in one place, and so
-//! `proxygate providers` can describe them without a checkout. Everything a
-//! `builtin` entry does is an HTTP fetch — the catalog only saves you from
-//! copying a URL that changes.
+//! 目录放在代码里（而不是配置模板里），这样端点、它们的载荷格式和注意事项
+//! 都集中在一处，`proxygate providers` 也无需检出代码就能描述它们。`builtin`
+//! 条目所做的一切都是一次 HTTP 拉取——目录只是省去了复制一个会变化的 URL。
 //!
-//! Adding a provider is one [`Provider`] literal plus a line in
-//! `config.example.yaml`; a test keeps the two in sync.
+//! 新增一个内置来源＝一条 [`Provider`] 字面量，再加 `config.example.yaml`
+//! 里的一行；有测试保证两者同步。
 
 use std::time::Duration;
 
 use crate::config::Format;
 
-/// One curated source.
+/// 一个内置来源。
 #[derive(Debug, Clone, Copy)]
 pub struct Provider {
-    /// The id used as `provider:` in config and printed by `proxygate providers`.
+    /// 在配置中作为 `provider:` 使用、并由 `proxygate providers`
+    /// 打印出来的 id。
     pub name: &'static str,
-    /// Endpoint to fetch. Query parameters belong here.
+    /// 要拉取的端点。查询参数也写在这里。
     pub url: &'static str,
-    /// How to read the response body.
+    /// 如何读取响应体。
     pub format: Format,
-    /// Documentation or landing page.
+    /// 文档或落地页。
     pub homepage: &'static str,
-    /// One line of operational reality, shown by `proxygate providers`.
+    /// 一行关于实际使用情况的说明，由 `proxygate providers` 展示。
     pub notes: &'static str,
-    /// Timeout for fetching this endpoint, when the default `refresh.timeout`
-    /// is too short for it. Overridable per config entry.
+    /// 拉取该端点时的超时；当默认的 `refresh.timeout` 不够长时使用。
+    /// 可在每个配置条目上覆盖。
     pub timeout: Option<Duration>,
-    /// Keep at most this many usable proxies from this source, taking them in
-    /// the order the endpoint returns them (the big lists are ordered
-    /// fastest-first, so this keeps the useful end). `None` means no cap.
+    /// 最多保留这么多个来自该来源的可用代理，按端点返回的顺序取（大型列表
+    /// 以最快优先排序，因此取到的是有用的一端）。`None` 表示不限。
     ///
-    /// This exists because the health checker has to probe every proxy it is
-    /// given: 16,000 of them is a twelve minute pass at the default
-    /// concurrency. Overridable per config entry (0 = no cap).
+    /// 之所以有这个字段，是因为健康检查必须探测拿到的每一个代理：在默认
+    /// 并发下，16000 条要跑十二分钟。可在每个配置条目上覆盖（0 = 不限）。
     pub limit: Option<usize>,
 }
 
-/// Every built-in source, in the order `proxygate providers` prints them.
+/// 所有内置来源，顺序即 `proxygate providers` 的打印顺序。
 pub const ALL: &[Provider] = &[
     Provider {
         name: "scdn",
@@ -97,15 +94,15 @@ pub const ALL: &[Provider] = &[
     },
 ];
 
-/// Default cap when a config asks for `limit: 0` (unlimited) — used by tests.
+/// 当配置要求 `limit: 0`（不限）时使用的默认上限——测试会用到。
 pub const NO_LIMIT: Option<usize> = None;
 
-/// Looks a provider up by name.
+/// 按名称查找一个内置来源。
 pub fn find(name: &str) -> Option<&'static Provider> {
     ALL.iter().find(|provider| provider.name == name)
 }
 
-/// Every provider name, for error messages.
+/// 所有来源名称，用于错误信息。
 pub fn names() -> Vec<&'static str> {
     ALL.iter().map(|provider| provider.name).collect()
 }

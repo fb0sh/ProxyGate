@@ -154,6 +154,84 @@ async fn forwards_plain_http_in_absolute_form() {
 }
 
 #[tokio::test]
+async fn serves_the_rest_api_on_the_proxy_port() {
+    use proxygate::api::{self, ApiState};
+    use proxygate::config::HealthRequirement;
+
+    let upstream = fake_http_proxy(ProxyBehaviour::Serve).await;
+    let pool = pool_from(&http_proxy(&[upstream.address]));
+    let store = Arc::new(proxygate::state::StateStore::new(
+        std::env::temp_dir().join(format!("proxygate-shared-{}", std::process::id())),
+    ));
+    let api_state = Arc::new(ApiState::new(
+        pool.clone(),
+        store,
+        Strategy::Random,
+        Duration::from_secs(1800),
+        vec!["https://example.test/".to_string()],
+        HealthRequirement::Any,
+    ));
+
+    let clients = Arc::new(ProxyClients::new(
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    ));
+    let gateway = Arc::new(
+        Gateway::new(
+            pool,
+            clients,
+            GatewayOptions {
+                retries: 0,
+                ..GatewayOptions::default()
+            },
+        )
+        .with_api(api::router(api_state)),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        let _ = gateway.serve(listener, std::future::pending::<()>()).await;
+    });
+
+    // An API call is an ordinary origin-form request.
+    let mut client = TcpStream::connect(address).await.expect("connect");
+    client
+        .write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("send");
+    // Read through the body in one go: the response usually arrives as a single
+    // segment, so a second read would start from an empty buffer.
+    let response = read_until_contains(&mut client, "\"proxies\"", WAIT).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        response.contains("content-type: application/json")
+            || response.contains("Content-Type: application/json"),
+        "expected the JSON API payload: {response}"
+    );
+    assert!(response.contains("\"status\""), "{response}");
+
+    // The same port still behaves as a proxy.
+    let mut client = TcpStream::connect(address).await.expect("connect");
+    client
+        .write_all(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")
+        .await
+        .expect("send CONNECT");
+    let head = read_until_contains(&mut client, "\r\n\r\n", WAIT).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    client.write_all(b"ping\n").await.expect("write");
+    let echoed = read_until_contains(&mut client, "echo:ping", WAIT).await;
+    assert!(echoed.contains("echo:ping"), "{echoed}");
+
+    let mut client = TcpStream::connect(address).await.expect("connect");
+    client
+        .write_all(b"GET http://example.test/hello HTTP/1.1\r\nHost: example.test\r\n\r\n")
+        .await
+        .expect("send GET");
+    let response = read_until_contains(&mut client, "hello from the upstream proxy", WAIT).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+}
+
+#[tokio::test]
 async fn rejects_a_request_without_an_absolute_uri() {
     let upstream = fake_http_proxy(ProxyBehaviour::Serve).await;
     let gateway = start_gateway(

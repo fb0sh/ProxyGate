@@ -1,8 +1,10 @@
-//! Command line interface.
+//! 命令行界面。
 //!
-//! Five subcommands, no more: `get`, `list`, `refresh`, `check`, `serve`.
+//! 核心子命令只有五个：`get`、`list`、`refresh`、`check`、
+//! `serve`；此外还有 `genconfig`、`getua`、`skill`、`providers`
+//! 四个辅助子命令。
 //!
-//! `get` writes exactly one line — the proxy URL — to stdout, so it composes:
+//! `get` 只往 STDOUT 写一行，也就是代理 URL，因此很容易组合使用：
 //!
 //! ```text
 //! curl -x "$(proxygate get)" https://example.com
@@ -15,21 +17,25 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::selector::Strategy;
 
-/// Turn any proxy source into a uniform, always-ready proxy pool.
+/// 把任意代理来源变成统一、始终就绪的代理池。
 #[derive(Debug, Parser)]
 #[command(
     name = "proxygate",
     version,
-    about = "Turn any proxy source into a uniform, always-ready proxy pool",
+    about = "把任意代理来源变成统一、始终就绪的代理池",
     long_about = None,
     disable_help_subcommand = true,
     propagate_version = true
 )]
 pub struct Cli {
+    /// 要执行的子命令。
     #[command(subcommand)]
     pub command: Command,
 
-    /// Path to config.yaml (default: ./config.yaml, then ~/.config/proxygate/config.yaml)
+    /// config.yaml 的路径。
+    ///
+    /// 默认先找 ./config.yaml，再找
+    /// ~/.config/proxygate/config.yaml。
     #[arg(
         short,
         long,
@@ -39,156 +45,170 @@ pub struct Cli {
     )]
     pub config: Option<PathBuf>,
 
-    /// Increase log verbosity: -v for info, -vv for debug, -vvv for trace
+    /// 提高日志详细程度：-v 为 info，-vv 为 debug，-vvv 为 trace。
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// Only log errors
+    /// 只记录错误日志。
     #[arg(short, long, global = true, conflicts_with = "verbose")]
     pub quiet: bool,
 }
 
+/// 全部子命令。
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Print one healthy proxy URL to stdout
+    /// 向 STDOUT 打印一个健康代理的 URL。
     Get(GetArgs),
-    /// List the proxies currently in the pool
+    /// 列出当前代理池中的代理。
     List(ListArgs),
-    /// Fetch every subscriber and rebuild the pool
+    /// 抓取全部订阅源并重建代理池。
     Refresh(RefreshArgs),
-    /// Probe the health of the proxies in the pool
+    /// 探测代理池中代理的健康状态。
     Check(CheckArgs),
-    /// Run the HTTP proxy gateway and the REST API
+    /// 运行 HTTP 代理网关与 REST API。
     Serve(ServeArgs),
-    /// Print the annotated example config to stdout
+    /// 向 STDOUT 打印带注释的示例配置。
     Genconfig,
-    /// Print a random user agent from the built-in pool
+    /// 从内置池中打印一个随机 User-Agent。
     Getua(GetUaArgs),
-    /// Print the agent-facing skill document (SKILL.md) to stdout
+    /// 向 STDOUT 打印面向 agent 的技能文档（SKILL.md）。
     Skill,
-    /// List the built-in proxy sources and how to enable them
+    /// 列出内置代理来源以及如何启用它们。
     Providers(ProvidersArgs),
 }
 
+/// `get` 的参数。
 #[derive(Debug, Args)]
 pub struct GetArgs {
-    /// Output format
+    /// 输出格式。
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
 
-    /// Selection strategy for this call
+    /// 本次调用使用的选择策略。
     #[arg(long, value_enum, value_name = "STRATEGY")]
     pub strategy: Option<Strategy>,
 
-    /// Do not fetch subscribers; work with the cached pool
+    /// 不抓取订阅源，直接使用缓存的代理池。
     #[arg(long)]
     pub no_refresh: bool,
 
-    /// Do not probe proxies; trust the cached health results
+    /// 不探测代理，直接信任缓存的健康检查结果。
     #[arg(long)]
     pub no_check: bool,
 
-    /// Print the proxy with credentials masked
+    /// 打印代理时对凭据脱敏。
     #[arg(long)]
     pub mask: bool,
 }
 
+/// `list` 的参数。
 #[derive(Debug, Args)]
 pub struct ListArgs {
-    /// Only show healthy proxies
+    /// 只显示健康代理。
     #[arg(long)]
     pub alive: bool,
 
-    /// Also show proxies that failed their last check (default)
+    /// 同时显示上次检查失败的代理（默认行为）。
     #[arg(long, conflicts_with = "alive")]
     pub all: bool,
 
-    /// Show credentials instead of `***:***`
+    /// 显示真实凭据，而不是 `***:***`。
     #[arg(long)]
     pub show_auth: bool,
 
-    /// Machine readable output
+    /// 机器可读的输出。
     #[arg(long)]
     pub json: bool,
 
-    /// Do not probe proxies; trust the cached health results
+    /// 不探测代理，直接信任缓存的健康检查结果。
     #[arg(long)]
     pub no_check: bool,
 
-    /// Do not fetch subscribers; work with the cached pool
+    /// 不抓取订阅源，直接使用缓存的代理池。
     #[arg(long)]
     pub no_refresh: bool,
 }
 
+/// `refresh` 的参数。
 #[derive(Debug, Args)]
 pub struct RefreshArgs {
-    /// Machine readable output
+    /// 机器可读的输出。
     #[arg(long)]
     pub json: bool,
 }
 
+/// `check` 的参数。
 #[derive(Debug, Args)]
 pub struct CheckArgs {
-    /// Machine readable output
+    /// 机器可读的输出。
     #[arg(long)]
     pub json: bool,
 
-    /// Override health.concurrency for this run
+    /// 本次运行覆盖 health.concurrency。
     #[arg(long, value_name = "N")]
     pub concurrency: Option<usize>,
 
-    /// Only probe proxies that are currently alive (skip known-dead ones)
+    /// 只探测当前存活的代理（跳过已知失效的代理）。
     #[arg(long)]
     pub alive_only: bool,
 }
 
+/// `providers` 的参数。
 #[derive(Debug, Args)]
 pub struct ProvidersArgs {
-    /// Machine readable output
+    /// 机器可读的输出。
     #[arg(long)]
     pub json: bool,
 }
 
+/// `getua` 的参数。
 #[derive(Debug, Args)]
 pub struct GetUaArgs {
-    /// Output format
+    /// 输出格式。
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
 }
 
+/// `serve` 的参数。
 #[derive(Debug, Args)]
 pub struct ServeArgs {
-    /// Address for the HTTP proxy gateway (default: config or 127.0.0.1:8080)
+    /// HTTP 代理网关的监听地址。
+    ///
+    /// 默认取配置，或 127.0.0.1:8080。
     #[arg(long, value_name = "ADDR")]
     pub listen: Option<String>,
 
-    /// Address for the REST API (default: config or 127.0.0.1:8081)
+    /// REST API 的监听地址；用 `same` 表示与代理共用一个端口。
+    ///
+    /// 默认取配置，或 127.0.0.1:8081。
     #[arg(long, value_name = "ADDR")]
     pub api: Option<String>,
 
-    /// Require `user:password` from gateway clients
+    /// 要求网关客户端提供 `user:password`。
     #[arg(long, value_name = "USER:PASS")]
     pub auth: Option<String>,
 
-    /// Do not fetch subscribers at startup; work with the cached pool
+    /// 启动时不抓取订阅源，直接使用缓存的代理池。
     #[arg(long)]
     pub no_refresh: bool,
 }
 
-/// stdout format of `proxygate get`.
+/// `proxygate get` 的 STDOUT 输出格式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
-    /// Just the proxy URL, one line
+    /// 只输出代理 URL，一行。
     Text,
-    /// `{"proxy": "...", "latency_ms": 83}`
+    /// JSON 形式：`{"proxy": "...", "latency_ms": 83}`。
     Json,
 }
 
 impl ValueEnum for Strategy {
+    /// 返回全部可选策略。
     fn value_variants<'a>() -> &'a [Self] {
         &Strategy::ALL
     }
 
+    /// 把策略映射为 clap 的取值。
     fn to_possible_value(&self) -> Option<PossibleValue> {
         Some(PossibleValue::new(self.as_str()))
     }

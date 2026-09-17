@@ -1,19 +1,17 @@
-//! Subscribers: where proxies come from.
+//! 订阅源：代理从哪里来。
 //!
-//! Three kinds only:
+//! 只有三种类型：
 //!
-//! * `http` — fetch a URL (`proxies.txt`, an API, a subscription);
-//! * `file` — read a local file;
-//! * `exec` — run a command and read its stdout.
+//! * `http` —— 拉取一个 URL（`proxies.txt`、API 或订阅）；
+//! * `file` —— 读取本地文件；
+//! * `exec` —— 运行一条命令并读取其 stdout。
 //!
-//! Whatever the payload looks like, a subscriber's only job is to produce proxy
-//! URLs. Built-in parsers cover `plaintext`, `json` and `clash`; everything else
-//! belongs in an `exec` script, which keeps this module (and the whole core)
-//! small.
+//! 无论载荷长什么样，订阅源唯一的职责就是产出代理 URL。内置解析器覆盖
+//! `plaintext`、`json` 和 `clash` 三种格式；其余格式都该交给 `exec` 脚本，
+//! 这让本模块（乃至整个核心）保持小巧。
 //!
-//! Note that `exec` runs a command from the config file with the privileges of
-//! the ProxyGate process. It is an intentional escape hatch — treat
-//! `config.yaml` as trusted input.
+//! 注意：`exec` 会以 ProxyGate 进程的权限运行配置文件里的命令。这是一条
+//! 有意留出的逃生通道——请把 `config.yaml` 当作可信输入。
 
 use std::collections::BTreeMap;
 use std::process::Stdio;
@@ -28,35 +26,43 @@ use crate::config::{Config, Format, SubscriberConfig};
 use crate::error::{Error, Result};
 use crate::model::{self, ProxyScheme};
 
-/// Outcome of one subscriber fetch. Subscriber failures are data, not errors:
-/// one broken provider must not stop the others.
+/// 一次订阅源拉取的结果。订阅源失败属于数据而非错误：
+/// 一个来源坏掉不能拖停其他来源。
 #[derive(Debug, Clone)]
 pub struct FetchOutcome {
+    /// 订阅源名称。
     pub name: String,
+    /// 订阅源类型（`http`、`file` 或 `exec`）。
     pub kind: &'static str,
+    /// 解析响应体时使用的格式。
     pub format: Format,
+    /// 成功归一化得到的代理。
     pub proxies: Vec<Url>,
-    /// Lines that could not be turned into a proxy URL.
+    /// 无法转换为代理 URL 的行。
     pub rejected: Vec<String>,
-    /// Entries the parser deliberately ignored (e.g. unsupported clash types).
+    /// 解析器有意忽略的条目（例如不支持的 clash 类型）。
     pub skipped: usize,
-    /// Usable proxies dropped because the source has a `limit`.
+    /// 因来源设有 `limit` 而被丢弃的可用代理。
     pub truncated: usize,
+    /// 本次拉取的耗时。
     pub duration: Duration,
+    /// 失败原因；成功时为 `None`。
     pub error: Option<String>,
 }
 
 impl FetchOutcome {
+    /// 本次拉取是否成功。
     pub fn ok(&self) -> bool {
         self.error.is_none()
     }
 
+    /// 解析出的代理条数。
     pub fn count(&self) -> usize {
         self.proxies.len()
     }
 }
 
-/// Fetches every configured subscriber.
+/// 负责拉取所有已配置的订阅源。
 pub struct SubscriberSet {
     subscribers: Vec<SubscriberConfig>,
     timeout: Duration,
@@ -64,6 +70,7 @@ pub struct SubscriberSet {
 }
 
 impl SubscriberSet {
+    /// 依据配置构建订阅源集合，并创建共享的 HTTP 客户端。
     pub fn new(config: &Config) -> Result<Self> {
         let client = reqwest::Client::builder()
             .user_agent(concat!("proxygate/", env!("CARGO_PKG_VERSION")))
@@ -76,28 +83,32 @@ impl SubscriberSet {
         })
     }
 
-    /// Only the subscribers that are enabled.
+    /// 只包含已启用的订阅源。
     pub fn active(&self) -> impl Iterator<Item = &SubscriberConfig> {
         self.subscribers.iter().filter(|s| s.enabled())
     }
 
+    /// 没有任何已启用的订阅源时返回 `true`。
     pub fn is_empty(&self) -> bool {
         self.active().next().is_none()
     }
 
+    /// 配置中订阅源的总数，含未启用的。
     pub fn configured(&self) -> usize {
         self.subscribers.len()
     }
 
+    /// 已启用的订阅源数量。
     pub fn enabled(&self) -> usize {
         self.active().count()
     }
 
+    /// 已启用订阅源的名称。
     pub fn names(&self) -> Vec<&str> {
         self.active().map(|s| s.name()).collect()
     }
 
-    /// Fetches all subscribers concurrently.
+    /// 并发拉取所有订阅源。
     pub async fn fetch_all(&self) -> Vec<FetchOutcome> {
         let futures = self
             .active()
@@ -106,7 +117,7 @@ impl SubscriberSet {
         futures_util::future::join_all(futures).await
     }
 
-    /// Fetches one subscriber, converting every failure into `FetchOutcome::error`.
+    /// 拉取单个订阅源，并把任何失败都转换为 `FetchOutcome::error`。
     pub async fn fetch_one(&self, subscriber: &SubscriberConfig) -> FetchOutcome {
         let started = Instant::now();
         let mut outcome = FetchOutcome {
@@ -156,8 +167,8 @@ impl SubscriberSet {
         outcome
     }
 
-    /// Effective per-source cap: the config wins, `0` means unlimited, and
-    /// otherwise the catalog's own cap applies.
+    /// 每个来源的生效条数上限：配置值优先，`0` 表示不限，
+    /// 否则采用目录自带的上限。
     fn limit_for(&self, subscriber: &SubscriberConfig) -> Option<usize> {
         let SubscriberConfig::Builtin {
             provider, limit, ..
@@ -172,6 +183,7 @@ impl SubscriberSet {
         }
     }
 
+    /// 按订阅源类型读取响应体。
     async fn read_payload(&self, subscriber: &SubscriberConfig) -> Result<String> {
         match subscriber {
             SubscriberConfig::Http {
@@ -213,6 +225,7 @@ impl SubscriberSet {
         }
     }
 
+    /// 发起一次 HTTP GET 请求并返回响应体文本。
     async fn fetch_http(
         &self,
         subscriber: &SubscriberConfig,
@@ -262,7 +275,7 @@ impl SubscriberSet {
     }
 }
 
-/// Runs an `exec` subscriber and returns its stdout.
+/// 运行一个 `exec` 订阅源并返回其 stdout。
 async fn run_command(
     command: &[String],
     env: &std::collections::BTreeMap<String, String>,
@@ -309,8 +322,8 @@ async fn run_command(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Effective per-source cap: the config wins, `0` means unlimited, and
-/// otherwise the catalog's own cap applies. Only `builtin` entries have one.
+/// 每个来源的生效条数上限：配置值优先，`0` 表示不限，
+/// 否则采用目录自带的上限。只有 `builtin` 条目才有上限。
 pub fn effective_limit(subscriber: &SubscriberConfig) -> Option<usize> {
     let SubscriberConfig::Builtin {
         provider, limit, ..
@@ -325,7 +338,7 @@ pub fn effective_limit(subscriber: &SubscriberConfig) -> Option<usize> {
     }
 }
 
-/// Truncates a proxy list to `limit`, returning how many were dropped.
+/// 把代理列表截断到 `limit`，并返回被丢弃的条数。
 pub fn apply_limit(proxies: &mut Vec<Url>, limit: Option<usize>) -> usize {
     match limit {
         Some(limit) if proxies.len() > limit => {
@@ -337,16 +350,16 @@ pub fn apply_limit(proxies: &mut Vec<Url>, limit: Option<usize>) -> usize {
     }
 }
 
-/// Result of running a payload through one of the built-in format parsers.
+/// 把一段响应体交给某个内置格式解析器处理得到的结果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedPayload {
-    /// Candidate proxy strings, not yet normalized.
+    /// 候选代理字符串，尚未归一化。
     pub candidates: Vec<String>,
-    /// Entries skipped because their protocol is not supported.
+    /// 因协议不受支持而跳过的条目。
     pub skipped: usize,
 }
 
-/// Parses a subscriber payload into candidate proxy strings.
+/// 把订阅源响应体解析为候选代理字符串。
 pub fn parse_payload(text: &str, format: Format) -> Result<ParsedPayload> {
     match format {
         Format::Plaintext => Ok(parse_plaintext(text)),
@@ -364,7 +377,7 @@ pub fn parse_payload(text: &str, format: Format) -> Result<ParsedPayload> {
     }
 }
 
-/// One proxy per line; blank lines and `#` comments are ignored.
+/// 每行一个代理；空行与 `#` 注释会被忽略。
 fn parse_plaintext(text: &str) -> ParsedPayload {
     let mut parsed = ParsedPayload::default();
     for line in text.lines() {
@@ -379,25 +392,28 @@ fn parse_plaintext(text: &str) -> ParsedPayload {
     parsed
 }
 
-/// Walks a JSON/YAML blob looking for proxies.
+/// 遍历一段 JSON/YAML 数据以寻找代理。
 ///
-/// Recognised shapes: an array of strings/objects, an object with a `proxies`
-/// or `data` array, or a single proxy object.
+/// 可识别的形态：字符串或对象组成的数组、带 `proxies` 或 `data`
+/// 数组的对象，或者单个代理对象。
 fn parse_json_value(value: &JsonValue) -> ParsedPayload {
     let mut parsed = ParsedPayload::default();
     walk(value, &mut parsed, 0);
     parsed
 }
 
+/// 数据嵌套深度的上限，超过就计为跳过。
 const MAX_DEPTH: usize = 6;
 
-/// Keys whose array value holds the proxies.
+/// 其数组值存放代理的容器字段名。
 const CONTAINER_KEYS: [&str; 5] = ["proxies", "data", "items", "list", "result"];
 
-/// Keys that hold a proxy endpoint, as a host name or a full URL.
+/// 存放代理端点（主机名或完整 URL）的主机字段名。
 const HOST_KEYS: [&str; 6] = ["server", "host", "hostname", "ip", "address", "addr"];
+/// 直接存放完整代理 URL 的字段名。
 const URL_KEYS: [&str; 4] = ["url", "proxy", "uri", "address_url"];
 
+/// 递归遍历一个 JSON 值，把识别到的代理追加到 `parsed`。
 fn walk(value: &JsonValue, parsed: &mut ParsedPayload, depth: usize) {
     if depth > MAX_DEPTH {
         parsed.skipped += 1;
@@ -473,6 +489,7 @@ fn walk(value: &JsonValue, parsed: &mut ParsedPayload, depth: usize) {
     }
 }
 
+/// 按顺序查找一组键，返回第一个命中且非空的字符串值。
 fn lookup(map: &serde_json::Map<String, JsonValue>, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         map.get(*key)
@@ -482,10 +499,10 @@ fn lookup(map: &serde_json::Map<String, JsonValue>, keys: &[&str]) -> Option<Str
     })
 }
 
-/// Builds a proxy URL from the field names used by most JSON APIs and by Clash.
+/// 依据大多数 JSON API 和 Clash 使用的字段名拼出一个代理 URL。
 ///
-/// Returns `None` for entries whose protocol ProxyGate cannot use (Shadowsocks,
-/// VMess, Trojan, ...) so that they are reported as skipped rather than rejected.
+/// 对 ProxyGate 无法使用的协议（Shadowsocks、VMess、Trojan……）返回
+/// `None`，这样它们会被记为跳过而不是拒绝。
 fn proxy_from_fields(map: &serde_json::Map<String, JsonValue>) -> Option<String> {
     let host = lookup(map, &HOST_KEYS)?;
 
@@ -520,13 +537,13 @@ fn proxy_from_fields(map: &serde_json::Map<String, JsonValue>) -> Option<String>
     Some(format!("{}://{auth}{host}:{port}", scheme.as_str()))
 }
 
-/// The scheme an entry advertises, or `None` when ProxyGate cannot use it.
+/// 条目声明的协议，ProxyGate 无法使用时为 `None`。
 ///
-/// Naming is loose in these lists: `https` means "an HTTP proxy that can also
-/// CONNECT to HTTPS", not "TLS to the proxy", and `socks5` becomes
-/// [`ProxyScheme::Socks5h`] so the *proxy* resolves names. That matters: a
-/// client on a network with poisoned DNS resolving `www.google.com` itself
-/// would hand the proxy a bogus address, while remote resolution works.
+/// 这些列表里的命名很随意：`https` 指的是“能够 CONNECT 到 HTTPS 的
+/// HTTP 代理”，而不是“到代理的 TLS”；`socks5` 会被改写为
+/// [`ProxyScheme::Socks5h`]，由*代理*去解析域名。这一点很关键：在 DNS
+/// 被污染的网络里，客户端自己解析 `www.google.com` 会把伪造的地址交给
+/// 代理，而由代理远端解析则能正常工作。
 fn scheme_from_fields(map: &serde_json::Map<String, JsonValue>) -> Option<ProxyScheme> {
     let mut named: Vec<String> = Vec::new();
     for key in ["type", "scheme", "protocol", "protocols", "proxy_type"] {
@@ -554,8 +571,8 @@ fn scheme_from_fields(map: &serde_json::Map<String, JsonValue>) -> Option<ProxyS
     None
 }
 
-/// Flattens a protocol field (string, list or joined string) into lowercased
-/// names, so `["http", "socks5"]` and `"socks4+socks5"` both work.
+/// 把协议字段（字符串、列表或拼接字符串）摊平成小写名称，
+/// 因此 `["http", "socks5"]` 和 `"socks4+socks5"` 都能工作。
 fn collect_scheme_names(value: &JsonValue, out: &mut Vec<String>) {
     match value {
         JsonValue::String(text) => {
@@ -575,7 +592,7 @@ fn collect_scheme_names(value: &JsonValue, out: &mut Vec<String>) {
     }
 }
 
-/// Percent-encodes the characters that would break a URL's userinfo section.
+/// 对会破坏 URL userinfo 段的字符做百分号编码。
 fn encode_userinfo(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {

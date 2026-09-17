@@ -1,13 +1,18 @@
-//! REST API.
+//! REST API。
 //!
-//! Three endpoints, exactly as much as the CLI needs to be usable from other
-//! languages:
+//! 路由覆盖 CLI 需要的最小端点集，让其他语言也能直接调用：
 //!
 //! ```text
-//! GET /api/v1/get       one proxy (plain text, or ?format=json)
-//! GET /api/v1/proxies   the pool, with credentials masked
-//! GET /api/v1/health    liveness and pool counters
+//! GET /                 端点索引
+//! GET /api/v1/get       一个代理（纯文本，或 ?format=json）
+//! GET /api/v1/getua     一个内置 User-Agent（纯文本，或 ?format=json）
+//! GET /api/v1/proxies   整个代理池，凭据已脱敏
+//! GET /api/v1/health    存活状态与代理池计数
 //! ```
+//!
+//! 只有 `GET /api/v1/get?format=json` 会返回 JSON；默认情况下该端点只回一行
+//! `host:port`。响应里的凭据一律脱敏（替换成 `***:***`）。网关也可以把这个
+//! 路由挂到代理端口上，二者能区分彼此的请求。
 
 use std::future::Future;
 use std::sync::Arc;
@@ -26,24 +31,30 @@ use crate::pool::ProxyPool;
 use crate::selector::Strategy;
 use crate::state::{self, StateStore};
 
-/// How often a selection may rewrite `state.json`.
+/// 相邻两次重写 `state.json` 之间的最小间隔。
 const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Shared state behind the API router.
+/// API 路由背后的共享状态。
 #[derive(Debug)]
 pub struct ApiState {
+    /// 用来挑选代理的代理池。
     pub pool: Arc<ProxyPool>,
+    /// 选择代理时使用的选择器策略。
     pub strategy: Strategy,
+    /// 同一代理在被再次选中前需要等待的时长。
     pub reuse_after: Duration,
+    /// 轮换状态的状态存储。
     pub store: Arc<StateStore>,
+    /// 进程启动时刻，用于计算 `uptime_seconds`。
     pub started: Instant,
-    /// Health check targets, reported by `/health` so operators can see them.
+    /// 健康检查的探测目标，由 `/health` 返回，便于运维查看。
     pub health_targets: Vec<String>,
-    /// Whether every target is required for a proxy to count as alive.
+    /// 是否要求所有探测目标都通过，代理才算存活。
     pub health_require: HealthRequirement,
 }
 
 impl ApiState {
+    /// 用给定的代理池、状态存储和选择参数构造共享状态。
     pub fn new(
         pool: Arc<ProxyPool>,
         store: Arc<StateStore>,
@@ -64,7 +75,7 @@ impl ApiState {
     }
 }
 
-/// Builds the API router.
+/// 构建 API 路由。
 pub fn router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/", get(index))
@@ -75,7 +86,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .with_state(state)
 }
 
-/// Serves the API until `shutdown` resolves.
+/// 提供 API 服务，直到 `shutdown` 完成。
 pub async fn serve<S>(
     state: Arc<ApiState>,
     listener: tokio::net::TcpListener,
@@ -91,60 +102,92 @@ where
         .map_err(|error| Error::Other(format!("api server failed: {error}")))
 }
 
+/// `/api/v1/get` 与 `/api/v1/getua` 的查询参数。
 #[derive(Debug, Deserialize)]
 pub struct GetQuery {
+    /// 可选的响应格式；取值为 `json` 时返回 JSON，否则返回纯文本。
     #[serde(default)]
     format: Option<String>,
 }
 
+/// `/api/v1/get?format=json` 的响应体。
 #[derive(Debug, Serialize)]
 struct GetResponse {
+    /// 完整的代理 URL，含凭据。
     proxy: String,
+    /// 最近一次健康检查测得的延迟，单位毫秒。
     latency_ms: Option<u64>,
+    /// 该代理被发放时所处的轮次。
     round: u64,
 }
 
+/// `/api/v1/proxies` 中的一个代理条目。
 #[derive(Debug, Serialize)]
 struct ProxyEntry {
+    /// 脱敏后的代理 URL。
     proxy: String,
+    /// 状态，例如 `alive`、`dead`。
     status: &'static str,
+    /// 最近一次健康检查的延迟，单位毫秒。
     latency_ms: Option<u64>,
+    /// 连续失败次数。
     failures: u32,
+    /// 该代理最后一次被发放时所处的代。
     generation: u64,
+    /// 最后一次被发放的时间，RFC3339 格式。
     last_used_at: Option<String>,
+    /// 最后一次健康检查的时间，RFC3339 格式。
     last_checked_at: Option<String>,
-    /// `2/2` — how many health targets answered, out of how many were probed.
+    /// `2/2` —— 探测目标中有多少应答，以及一共探测了多少个。
     targets: String,
+    /// 逐个探测目标的结果。
     probes: Vec<ProbeEntry>,
 }
 
+/// 针对单个探测目标的探测结果。
 #[derive(Debug, Serialize)]
 struct ProbeEntry {
+    /// 探测目标的 URL。
     target: String,
+    /// 该目标是否可达。
     ok: bool,
+    /// 该目标的延迟，单位毫秒。
     latency_ms: Option<u64>,
 }
 
+/// `/api/v1/health` 的响应体。
 #[derive(Debug, Serialize)]
 struct HealthResponse {
+    /// 整体状态：`ok`、`degraded`（没有存活代理）或 `empty`（池为空）。
     status: &'static str,
+    /// crate 版本号。
     version: &'static str,
+    /// 已运行秒数。
     uptime_seconds: u64,
+    /// 当前代。
     generation: u64,
+    /// 当前选择器策略名。
     strategy: &'static str,
+    /// 健康检查使用的探测目标。
     health_targets: Vec<String>,
+    /// 健康检查的通过要求。
     health_require: &'static str,
+    /// 代理池计数。
     proxies: HealthCounts,
 }
 
+/// 代理池的分类计数。
 #[derive(Debug, Serialize)]
 struct HealthCounts {
+    /// 代理总数。
     total: usize,
+    /// 存活代理数。
     alive: usize,
+    /// 已失效代理数。
     dead: usize,
 }
 
-/// `GET /api/v1/get` — hands out one healthy proxy.
+/// `GET /api/v1/get` —— 发放一个健康代理。
 async fn get_proxy(State(state): State<Arc<ApiState>>, Query(query): Query<GetQuery>) -> Response {
     let now = SystemTime::now();
     let Some(selection) = state.pool.select(state.strategy, state.reuse_after, now) else {
@@ -190,10 +233,10 @@ async fn get_proxy(State(state): State<Arc<ApiState>>, Query(query): Query<GetQu
         .into_response()
 }
 
-/// `GET /api/v1/getua` — one random user agent from the built-in pool.
+/// `GET /api/v1/getua` —— 从内置池里随机取一个 User-Agent。
 ///
-/// Stateless and uniform, exactly like `proxygate getua`: no rotation, no memory
-/// of previous calls.
+/// 无状态且分布均匀，与 `proxygate getua` 完全一致：不做轮换，也不记忆
+/// 之前的调用。
 async fn get_user_agent(Query(query): Query<GetQuery>) -> Response {
     let user_agent = crate::useragent::random();
 
@@ -212,7 +255,7 @@ async fn get_user_agent(Query(query): Query<GetQuery>) -> Response {
         .into_response()
 }
 
-/// `GET /api/v1/proxies` — the whole pool, credentials masked.
+/// `GET /api/v1/proxies` —— 返回整个代理池，凭据已脱敏。
 async fn list_proxies(State(state): State<Arc<ApiState>>) -> Json<Vec<ProxyEntry>> {
     let mut proxies: Vec<ProxyEntry> = state
         .pool
@@ -253,7 +296,7 @@ async fn list_proxies(State(state): State<Arc<ApiState>>) -> Json<Vec<ProxyEntry
     Json(proxies)
 }
 
-/// `GET /api/v1/health` — liveness plus pool counters.
+/// `GET /api/v1/health` —— 存活状态与代理池计数。
 async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
     let stats = state.pool.stats();
     let status = if stats.total == 0 {
@@ -280,7 +323,7 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
     })
 }
 
-/// `GET /` — a tiny index so the port explains itself.
+/// `GET /` —— 一个极简索引，让端口自己说明用途。
 async fn index() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "name": "proxygate",

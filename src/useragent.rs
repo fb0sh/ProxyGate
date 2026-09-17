@@ -1,22 +1,23 @@
-//! Built-in user agent pool.
+//! 内置 User-Agent 池。
 //!
-//! `proxygate getua` and `GET /api/v1/getua` hand out one of the user agents
-//! embedded in [`assets/user_agents.txt`](../assets/user_agents.txt): 100
-//! desktop browsers (Chrome, Edge, Firefox, Safari on Windows, macOS and
-//! Linux). Mobile agents are deliberately not included.
+//! `proxygate getua` 与 `GET /api/v1/getua` 会返回下列之一：
+//! 即内嵌文件 [`assets/user_agents.txt`](../assets/user_agents.txt)：
+//! 共 100 个桌面浏览器（Windows、macOS 和 Linux 上的 Chrome、
+//! Edge、Firefox、Safari）；移动端 User-Agent 被有意排除在外。
 //!
-//! The pick is uniform and stateless: no rotation, no memory of what was handed
-//! out before, so the same string can come up twice in a row. That is what
-//! "random" means here, and it keeps the feature free of the bookkeeping the
-//! proxy rotation needs.
+//! 挑选过程均匀且无状态：不轮换，也不记录之前发过什么。
+//! 因此同一个字符串可能连续出现两次。
+//! 这就是这里的“随机”含义，
+//! 也让这个功能不需要代理轮换所需的那套记账。
 
 use std::sync::LazyLock;
 
 use rand::RngExt;
 
-/// One user agent per line; `#` comments and blank lines are ignored.
+/// 每行一个 User-Agent；`#` 注释和空行会被忽略。
 const SOURCE: &str = include_str!("../assets/user_agents.txt");
 
+/// 解析并过滤后的内置 User-Agent 列表。
 static USER_AGENTS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     SOURCE
         .lines()
@@ -25,20 +26,19 @@ static USER_AGENTS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         .collect()
 });
 
-/// Every built-in user agent, in file order.
+/// 全部内置 User-Agent，按文件顺序排列。
 pub fn all() -> &'static [&'static str] {
     &USER_AGENTS
 }
 
-/// How many user agents are built in.
+/// 内置 User-Agent 的数量。
 pub fn count() -> usize {
     USER_AGENTS.len()
 }
 
-/// Picks one at random, uniformly.
+/// 均匀随机地挑选一个。
 ///
-/// The list is embedded in the binary and validated by the tests below, so this
-/// cannot fail.
+/// 列表嵌在二进制里并由下面的测试校验，因此这里不会失败。
 pub fn random() -> &'static str {
     let pool = all();
     debug_assert!(!pool.is_empty(), "the embedded user agent list is empty");

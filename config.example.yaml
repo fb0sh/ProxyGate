@@ -11,8 +11,12 @@ server:
   # default, so anyone who can reach this port can use your pool. See the
   # "Security" section of README.md before changing this.
   proxy: 127.0.0.1:8080
-  # Address of the REST API.
+  # Address of the REST API. `same` serves it on the proxy port: a proxy request
+  # is a CONNECT or an absolute-form target, an API call is `/api/v1/...`, so one
+  # listener can tell them apart. Client authentication applies to proxy requests
+  # only, so sharing the port leaves the API open.
   api: 127.0.0.1:8081
+  # api: same
 
 # Where proxies come from.
 #

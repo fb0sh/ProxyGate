@@ -1,15 +1,14 @@
-//! Health checker.
+//! 健康检查器。
 //!
-//! For every proxy the checker asks three questions: can a request be made
-//! through it, did the request succeed, and how long did it take.
+//! 对每个代理，检查器问三个问题：能否通过它发出请求、
+//! 请求是否成功、以及请求耗时多久。
 //!
-//! Concurrency is bounded by a [`Semaphore`], and the pool lock is never held
-//! while a request is in flight: the checker works on a snapshot and writes the
-//! results back in one short critical section.
+//! 并发由 [`Semaphore`] 限制，并且请求在途期间绝不持有代理池锁：
+//! 检查器基于快照工作，最后在一个很短的临界区里把结果写回。
 //!
-//! The same module owns [`ProxyClients`], the small cache of pre-configured
-//! upstream HTTP clients shared by the checker and by the gateway's plain HTTP
-//! path. Building a client is not free, so one is kept per (proxy, purpose).
+//! 同一模块还负责 [`ProxyClients`]：一份预配置上游 HTTP 客户端的小缓存，
+//! 由检查器和网关的普通 HTTP 路径共享。
+//! 构建客户端并不廉价，因此每个 `(代理, 用途)` 组合保留一个。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -24,26 +23,30 @@ use crate::error::{Error, Result};
 use crate::model::{ProbeOutcome, Proxy, ProxyId};
 use crate::pool::{HealthUpdate, PoolStats, ProxyPool};
 
-/// What an upstream client is used for; the two flavours need different
-/// timeouts and redirect behaviour.
+/// 上游客户端用于什么用途；两种用途需要不同的超时与重定向行为。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClientMode {
-    /// Short-lived health probes.
+    /// 生命周期很短的探测请求。
     Check,
-    /// Client requests forwarded by the gateway.
+    /// 由网关转发的客户端请求。
     Forward,
 }
 
-/// Cache of upstream-configured reqwest clients.
+/// 预先配置好上游的 reqwest 客户端缓存。
 #[derive(Debug)]
 pub struct ProxyClients {
+    /// 以 `(用途, 代理 ID)` 为键的客户端缓存。
     clients: Mutex<HashMap<(ClientMode, ProxyId), Client>>,
+    /// 探测请求的总超时时间。
     check_timeout: Duration,
+    /// 建立连接的超时时间。
     connect_timeout: Duration,
+    /// 缓存容量上限，达到上限时整体清空而不是逐个淘汰。
     capacity: usize,
 }
 
 impl ProxyClients {
+    /// 用给定的探测超时与连接超时创建缓存，初始容量为 512。
     pub fn new(check_timeout: Duration, connect_timeout: Duration) -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
@@ -53,24 +56,28 @@ impl ProxyClients {
         }
     }
 
+    /// 设置缓存容量上限，至少为 1。
     pub fn with_capacity(mut self, capacity: usize) -> Self {
         self.capacity = capacity.max(1);
         self
     }
 
+    /// 当前缓存的客户端数量。
     pub fn len(&self) -> usize {
         self.lock().len()
     }
 
+    /// 缓存是否为空。
     pub fn is_empty(&self) -> bool {
         self.lock().is_empty()
     }
 
+    /// 清空缓存。
     pub fn clear(&self) {
         self.lock().clear();
     }
 
-    /// Returns a client that routes every request through `proxy`.
+    /// 返回一个会把所有请求都经由 `proxy` 路由的客户端。
     pub fn get(&self, proxy: &Proxy, mode: ClientMode) -> Result<Client> {
         let key = (mode, proxy.id.clone());
         if let Some(client) = self.lock().get(&key) {
@@ -86,6 +93,7 @@ impl ProxyClients {
         Ok(client)
     }
 
+    /// 为一个代理按指定用途构建上游客户端。
     fn build(&self, proxy: &Proxy, mode: ClientMode) -> Result<Client> {
         let builder = Client::builder()
             // This client must use exactly this upstream: never fall back to
@@ -108,6 +116,7 @@ impl ProxyClients {
         builder.build().map_err(Error::Http)
     }
 
+    /// 获取缓存锁，并忽略锁中毒。
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(ClientMode, ProxyId), Client>> {
         self.clients
             .lock()
@@ -115,52 +124,64 @@ impl ProxyClients {
     }
 }
 
-/// Result of probing one target through one proxy.
+/// 通过单个代理探测单个目标的结果。
 #[derive(Debug, Clone)]
 pub struct TargetResult {
+    /// 探测目标的完整 URL。
     pub target: Arc<str>,
+    /// 该目标是否成功应答。
     pub ok: bool,
+    /// 该目标的响应耗时；失败时为 `None`。
     pub latency: Option<Duration>,
+    /// 失败原因；成功时为 `None`。
     pub error: Option<String>,
 }
 
 impl TargetResult {
-    /// `https://www.google.com/generate_204` -> `www.google.com/generate_204`.
+    /// 把探测目标缩短为便于阅读的形式，
+    /// 例如 `https://www.google.com/generate_204` -> `www.google.com/generate_204`。
     pub fn label(&self) -> &str {
         short_target(&self.target)
     }
 
+    /// 以毫秒表示的响应耗时。
     pub fn latency_ms(&self) -> Option<u64> {
         self.latency.map(|latency| latency.as_millis() as u64)
     }
 }
 
-/// Result of checking a single proxy against every target.
+/// 单个代理针对所有目标做一次检查的结果。
 #[derive(Debug, Clone)]
 pub struct HealthResult {
+    /// 被检查代理的 ID。
     pub id: ProxyId,
-    /// Whether the proxy satisfied `health.require` across all targets.
+    /// 本次检查中，该代理是否满足 `health.require`（`all` 或 `any`）。
     pub alive: bool,
-    /// Slowest answered target.
+    /// 已应答目标中最慢的耗时。
     pub latency: Option<Duration>,
-    /// Per-target outcome, in configuration order.
+    /// 各目标的探测结果，顺序与配置一致。
     pub targets: Vec<TargetResult>,
-    /// Failure summary, `None` when the proxy is alive.
+    /// 失败摘要；代理存活时为 `None`。
     pub error: Option<String>,
 }
 
-/// Aggregate of one health pass.
+/// 一次健康检查整体的汇总。
 #[derive(Debug, Clone, Default)]
 pub struct CheckReport {
+    /// 本次检查的代理数量。
     pub checked: usize,
+    /// 判定为存活的代理数量。
     pub alive: usize,
+    /// 判定为失效的代理数量。
     pub dead: usize,
+    /// 本次检查的总耗时。
     pub duration: Duration,
+    /// 每个代理的检查结果。
     pub results: Vec<HealthResult>,
 }
 
 impl CheckReport {
-    /// Compact one-line summary for logs.
+    /// 用于日志的紧凑单行摘要。
     pub fn summary(&self) -> String {
         format!(
             "{} checked, {} alive, {} dead in {:.1}s",
@@ -172,21 +193,32 @@ impl CheckReport {
     }
 }
 
-/// Probes every proxy against every configured target.
+/// 用每一个已配置的目标探测每一个代理。
 ///
-/// The targets of one proxy are probed *concurrently* — a proxy either reaches
-/// all of them within one timeout window or it does not, so adding a target does
-/// not multiply the wall clock time of a health pass.
+/// 同一个代理的多个目标是*并发*探测的——
+/// 一个代理要么在一个超时窗口内到达全部目标，要么一个也到达不了，
+/// 因此增加目标不会让一次健康检查的墙钟时间成倍增长。
+///
+/// `health.require` 取 `all` 或 `any`（默认 `any`），
+/// 它决定多少个目标通过才算存活。
+/// 至于失败容错，`max_failures` 只宽容那些曾经工作过、
+/// 偶尔探测失败的代理；从未成功过的代理会在第一次失败时立即失效。
 #[derive(Debug, Clone)]
 pub struct HealthChecker {
+    /// 已配置的探测目标。
     targets: Vec<Arc<str>>,
+    /// 判定存活所需满足的条件（`all` 或 `any`）。
     require: HealthRequirement,
+    /// 同时在途的检查数量上限。
     concurrency: usize,
+    /// 连续失败多少次后判定为失效。
     max_failures: u32,
+    /// 与网关共享的上游客户端缓存。
     clients: Arc<ProxyClients>,
 }
 
 impl HealthChecker {
+    /// 根据健康检查配置与客户端缓存创建检查器。
     pub fn new(config: &HealthConfig, clients: Arc<ProxyClients>) -> Self {
         Self {
             targets: config
@@ -201,12 +233,12 @@ impl HealthChecker {
         }
     }
 
-    /// The configured probe targets.
+    /// 已配置的探测目标。
     pub fn targets(&self) -> Vec<&str> {
         self.targets.iter().map(|target| target.as_ref()).collect()
     }
 
-    /// Human readable target list, e.g. `google.com/generate_204 + cn.bing.com/`.
+    /// 便于人读的目标列表，例如 `google.com/generate_204 + cn.bing.com/`。
     pub fn targets_label(&self) -> String {
         self.targets
             .iter()
@@ -215,19 +247,22 @@ impl HealthChecker {
             .join(" + ")
     }
 
+    /// 判定存活所需满足的条件。
     pub fn require(&self) -> HealthRequirement {
         self.require
     }
 
+    /// 同时在途的检查数量上限。
     pub fn concurrency(&self) -> usize {
         self.concurrency
     }
 
+    /// 连续失败多少次后判定为失效。
     pub fn max_failures(&self) -> u32 {
         self.max_failures
     }
 
-    /// Checks every proxy with at most `concurrency` requests in flight.
+    /// 检查所有代理，同时在途的请求不超过 `concurrency` 个。
     pub async fn check_all(&self, proxies: &[Proxy]) -> CheckReport {
         let started = Instant::now();
         let semaphore = Arc::new(Semaphore::new(self.concurrency));
@@ -273,7 +308,10 @@ impl HealthChecker {
         }
     }
 
-    /// Checks all proxies and writes the outcome into the pool.
+    /// 检查所有代理，并把结果写回代理池。
+    ///
+    /// 写回时沿用代理池的失败规则：从未成功过的代理立即失效，
+    /// `max_failures` 只宽容曾经可用、偶发失败的代理。
     pub async fn check_and_apply(&self, pool: &ProxyPool, proxies: &[Proxy]) -> CheckReport {
         let report = self.check_all(proxies).await;
         let now = SystemTime::now();
@@ -304,7 +342,7 @@ impl HealthChecker {
         report
     }
 
-    /// Checks one proxy against every target, concurrently.
+    /// 并发地对所有目标检查单个代理。
     pub async fn check_one(&self, proxy: &Proxy) -> HealthResult {
         let client = match self.clients.get(proxy, ClientMode::Check) {
             Ok(client) => client,
@@ -364,7 +402,7 @@ impl HealthChecker {
     }
 }
 
-/// Probes a single target through an already-configured client.
+/// 通过一个已经配置好的客户端探测单个目标。
 async fn probe(client: &Client, target: Arc<str>) -> TargetResult {
     let started = Instant::now();
     match client.get(target.as_ref()).send().await {
@@ -390,7 +428,8 @@ async fn probe(client: &Client, target: Arc<str>) -> TargetResult {
     }
 }
 
-/// `google.com/generate_204: timeout; cn.bing.com/: ok`, failing targets first.
+/// 汇总失败的目标，例如
+/// `google.com/generate_204: timeout; cn.bing.com/: ok`，失败的目标排在前面。
 fn failure_summary(results: &[TargetResult]) -> String {
     let mut parts: Vec<String> = results
         .iter()
@@ -409,7 +448,7 @@ fn failure_summary(results: &[TargetResult]) -> String {
     parts.join("; ")
 }
 
-/// `https://cn.bing.com/` -> `cn.bing.com/`.
+/// 去掉 scheme，把 `https://cn.bing.com/` 变成 `cn.bing.com/`。
 fn short_target(target: &str) -> &str {
     target
         .split_once("://")

@@ -1,13 +1,14 @@
-//! Core data model: the normalized [`Proxy`], its stable id, and URL
-//! normalization.
+//! 核心数据模型：归一化后的 [`Proxy`]、其稳定标识符，
+//! 以及 URL 归一化。
 //!
-//! Everything in ProxyGate is expressed as a `url::Url`. The URL already carries
-//! protocol, host, port, username and password, so the model does not duplicate
-//! them as separate fields — they are read out on demand.
+//! ProxyGate 中的一切都用 `url::Url` 表示。
+//! URL 本身就携带协议、主机、端口、用户名和密码，
+//! 因此模型不再把它们复制成独立字段，而是在需要时按需读取。
 //!
-//! Every proxy that enters the system goes through [`normalize`], which is the
-//! single place that decides what a "valid proxy" looks like. Subscribers only
-//! have to produce lines; the normalizer turns them into canonical URLs.
+//! 每个进入系统的代理都要经过 [`normalize`]，
+//! 它单独决定了“合法代理”应该是什么样子。
+//! 订阅源只需产出文本行，
+//! 归一化会把这些文本行转换成规范 URL。
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -18,28 +19,32 @@ use url::Url;
 
 use crate::error::{Error, Result};
 
-/// Stable, content-derived identifier of a proxy (16 hex chars).
+/// 代理的稳定标识符，由内容派生（16 个十六进制字符）。
 pub type ProxyId = String;
 
-/// Wire scheme of an upstream proxy.
+/// 上游代理的线路协议。
 ///
-/// v0.1 deliberately supports only what the gateway can actually tunnel
-/// through. `https://` (TLS to the upstream proxy itself) is rejected by
-/// [`normalize`] instead of silently entering the pool as a proxy that cannot
-/// serve CONNECT requests.
+/// v0.1 只支持网关真正能隧穿的协议。
+/// `https://`（到上游代理本身的 TLS）
+/// 会被 [`normalize`] 拒绝，而不是悄悄进入代理池、
+/// 变成一个无法处理 CONNECT 请求的代理。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyScheme {
+    /// 明文 HTTP 代理。
     Http,
+    /// 在本地（客户端侧）解析 DNS 的 SOCKS5。
     Socks5,
-    /// SOCKS5 with remote (proxy side) DNS resolution.
+    /// 在远端（代理侧）解析 DNS 的 SOCKS5。
     Socks5h,
 }
 
 impl ProxyScheme {
+    /// 所有支持的代理协议。
     pub const ALL: [ProxyScheme; 3] =
         [ProxyScheme::Http, ProxyScheme::Socks5, ProxyScheme::Socks5h];
 
+    /// 协议的规范小写名称。
     pub const fn as_str(self) -> &'static str {
         match self {
             ProxyScheme::Http => "http",
@@ -48,6 +53,7 @@ impl ProxyScheme {
         }
     }
 
+    /// URL 省略端口时使用的协议默认端口。
     pub const fn default_port(self) -> u16 {
         match self {
             ProxyScheme::Http => 80,
@@ -55,11 +61,12 @@ impl ProxyScheme {
         }
     }
 
+    /// 该协议是否属于 SOCKS5 家族。
     pub const fn is_socks(self) -> bool {
         matches!(self, ProxyScheme::Socks5 | ProxyScheme::Socks5h)
     }
 
-    /// Parses a URL scheme, accepting the common aliases.
+    /// 解析 URL 协议名，并接受常见别名。
     pub fn parse(scheme: &str) -> Option<Self> {
         match scheme.to_ascii_lowercase().as_str() {
             "http" => Some(ProxyScheme::Http),
@@ -70,19 +77,22 @@ impl ProxyScheme {
     }
 }
 
-/// Outcome of probing one health target through one proxy.
+/// 通过一个代理探测一个健康检查目标的结果。
 ///
-/// The target is shared between every proxy (`Arc<str>`), so keeping the full
-/// per-target result on each proxy stays cheap to clone.
+/// 目标在所有代理之间共享（`Arc<str>`），
+/// 因此在每个代理上保留完整的逐目标结果仍然可以廉价地克隆。
 #[derive(Debug, Clone)]
 pub struct ProbeOutcome {
+    /// 被探测的目标 URL。
     pub target: Arc<str>,
+    /// 该目标是否探测成功。
     pub ok: bool,
+    /// 本次探测的耗时，未测量时为 `None`。
     pub latency: Option<Duration>,
 }
 
 impl ProbeOutcome {
-    /// The target without its scheme, for compact one-line output.
+    /// 去掉协议前缀的目标，用于紧凑的单行输出。
     pub fn label(&self) -> &str {
         self.target
             .split_once("://")
@@ -91,30 +101,38 @@ impl ProbeOutcome {
     }
 }
 
-/// A single upstream proxy and what we currently know about it.
+/// 单个上游代理，以及当前已知的相关信息。
 ///
-/// `alive`, `latency`, `failures` and `probes` are runtime facts and are never
-/// persisted; `generation` and `last_used_at` are usage facts and *are*
-/// persisted so that repeated CLI invocations keep rotating through the pool.
+/// `alive`、`latency`、`failures` 和 `probes` 是运行时事实，
+/// 永不持久化；`generation` 和 `last_used_at` 是使用事实，
+/// 会被持久化，好让多次 CLI 调用之间继续轮换整个代理池。
 #[derive(Debug, Clone)]
 pub struct Proxy {
+    /// 由规范化 URL 派生的稳定标识符。
     pub id: ProxyId,
+    /// 归一化后的代理 URL，其中可能包含凭据。
     pub url: Url,
 
+    /// 最近一次健康检查是否成功。
     pub alive: bool,
+    /// 最近一次测量到的延迟。
     pub latency: Option<Duration>,
+    /// 连续失败次数。
     pub failures: u32,
 
-    /// Result of the last health pass, one entry per configured target.
+    /// 最近一轮健康检查的结果，每个已配置目标一个条目。
     pub probes: Vec<ProbeOutcome>,
 
+    /// 最近一次健康检查的时间；从未检查时为 `None`。
     pub last_checked_at: Option<SystemTime>,
+    /// 最近一次被选中的时间；从未使用时为 `None`。
     pub last_used_at: Option<SystemTime>,
+    /// 该代理最后一次被使用的轮次。
     pub generation: u64,
 }
 
 impl Proxy {
-    /// Builds a proxy from an already-normalized URL.
+    /// 基于已经归一化的 URL 构造一个代理。
     pub fn new(url: Url) -> Self {
         let id = Self::id_of(&url);
         Self {
@@ -130,33 +148,35 @@ impl Proxy {
         }
     }
 
-    /// Stable id derived from the canonical rendering of the URL.
+    /// 由 URL 的规范渲染形式派生的稳定标识符。
     pub fn id_of(url: &Url) -> ProxyId {
         format!("{:016x}", fnv1a64(render_url(url, true).as_bytes()))
     }
 
+    /// 该代理的协议。
     pub fn scheme(&self) -> ProxyScheme {
         ProxyScheme::parse(self.url.scheme()).unwrap_or(ProxyScheme::Http)
     }
 
+    /// 该代理的主机名（不含端口）。
     pub fn host(&self) -> &str {
         self.url.host_str().unwrap_or_default()
     }
 
-    /// Explicit port, or the scheme default when the URL omits it.
+    /// 显式端口；URL 省略端口时使用协议默认端口。
     pub fn port(&self) -> u16 {
         self.url
             .port()
             .unwrap_or_else(|| self.scheme().default_port())
     }
 
-    /// `host:port`, the form the gateway needs for CONNECT and for connecting
-    /// to the upstream itself.
+    /// `host:port` 形式，
+    /// 网关处理 CONNECT 以及连接上游本身时都需要它。
     pub fn authority(&self) -> String {
         format!("{}:{}", self.host(), self.port())
     }
 
-    /// Percent-decoded username, if the URL carries one.
+    /// 百分号解码后的用户名；URL 未携带时为 `None`。
     pub fn username(&self) -> Option<String> {
         if self.url.username().is_empty() {
             None
@@ -165,25 +185,27 @@ impl Proxy {
         }
     }
 
-    /// Percent-decoded password, if the URL carries one.
+    /// 百分号解码后的密码；URL 未携带时为 `None`。
     pub fn password(&self) -> Option<String> {
         self.url.password().map(percent_decode)
     }
 
+    /// URL 是否携带用户名或密码。
     pub fn has_auth(&self) -> bool {
         !self.url.username().is_empty() || self.url.password().is_some()
     }
 
+    /// 延迟的毫秒数；未测量时为 `None`。
     pub fn latency_ms(&self) -> Option<u64> {
         self.latency.map(|d| d.as_millis() as u64)
     }
 
-    /// How many of the probed targets answered for this proxy.
+    /// 该代理成功响应的探测目标数量。
     pub fn targets_passed(&self) -> usize {
         self.probes.iter().filter(|probe| probe.ok).count()
     }
 
-    /// Compact `passed/total` summary, or `-` when the proxy was never probed.
+    /// 紧凑的 `passed/total` 摘要；从未探测过时返回 `-`。
     pub fn targets_summary(&self) -> String {
         if self.probes.is_empty() {
             "-".to_string()
@@ -192,7 +214,7 @@ impl Proxy {
         }
     }
 
-    /// Targets that failed the last pass, for diagnostics.
+    /// 最近一轮探测失败的目标，用于诊断。
     pub fn failed_targets(&self) -> Vec<&str> {
         self.probes
             .iter()
@@ -201,28 +223,29 @@ impl Proxy {
             .collect()
     }
 
-    /// Full URL including credentials — this is what `proxygate get` prints.
+    /// 包含凭据的完整 URL，即 `proxygate get` 打印的内容。
     pub fn to_full_string(&self) -> String {
         render_url(&self.url, true)
     }
 
-    /// URL with credentials replaced by `***:***`.
+    /// 脱敏后的 URL，凭据被替换为 `***:***`。
     pub fn to_masked_string(&self) -> String {
         render_url(&self.url, false)
     }
 
+    /// 按 `show_auth` 决定是否显示凭据来渲染 URL。
     pub fn render(&self, show_auth: bool) -> String {
         render_url(&self.url, show_auth)
     }
 
-    /// Human readable status used by `proxygate list`.
+    /// `proxygate list` 使用的人类可读状态。
     pub fn status(&self) -> &'static str {
         if self.alive { "alive" } else { "dead" }
     }
 }
 
-/// Canonical rendering of a proxy URL: always explicit port, no path/query,
-/// IPv6 hosts bracketed.
+/// 代理 URL 的规范渲染形式：总是显式端口、不带路径和查询、
+/// IPv6 主机加方括号。
 pub fn render_url(url: &Url, show_auth: bool) -> String {
     let scheme = ProxyScheme::parse(url.scheme()).unwrap_or(ProxyScheme::Http);
     let host = url.host_str().unwrap_or_default();
@@ -246,9 +269,9 @@ pub fn render_url(url: &Url, show_auth: bool) -> String {
     out
 }
 
-/// Turns one raw subscriber line into a canonical proxy URL.
+/// 把订阅源的一行原始文本转换成规范的代理 URL。
 ///
-/// Accepted inputs:
+/// 可接受的输入：
 ///
 /// ```text
 /// 1.2.3.4:8080
@@ -259,8 +282,9 @@ pub fn render_url(url: &Url, show_auth: bool) -> String {
 /// socks5h://user:pass@[2001:db8::1]:1080
 /// ```
 ///
-/// Anything else is rejected with a reason. `https://`, `socks4://` and other
-/// schemes are rejected on purpose: the gateway cannot tunnel through them.
+/// 其他输入都会被拒绝并给出原因。
+/// `https://`、`socks4://` 以及其他协议被有意拒绝：
+/// 网关无法通过它们建立隧道。
 pub fn normalize(input: &str) -> Result<Url> {
     let cleaned = clean_line(input);
     if cleaned.is_empty() {
@@ -306,20 +330,20 @@ pub fn normalize(input: &str) -> Result<Url> {
     Ok(parsed)
 }
 
-/// Trims a raw line: surrounding whitespace, a UTF-8 BOM and a trailing CR.
+/// 清理一行原始文本：首尾空白、UTF-8 BOM 和结尾的 CR。
 pub fn clean_line(input: &str) -> &str {
     input.trim().trim_start_matches('\u{feff}').trim()
 }
 
-/// True for lines that a plaintext list uses as comments or padding.
+/// 判断一行是否属于纯文本列表中的注释或填充行。
 pub fn is_ignorable_line(line: &str) -> bool {
     let cleaned = clean_line(line);
     cleaned.is_empty() || cleaned.starts_with('#') || cleaned.starts_with("//")
 }
 
-/// Strips an inline `# comment` when it is preceded by whitespace.
+/// 去掉前面带空白的行内 `# 注释`。
 ///
-/// A `#` inside credentials or a host is left alone.
+/// 凭据或主机名内部的 `#` 保持原样。
 pub fn strip_inline_comment(line: &str) -> &str {
     let cleaned = clean_line(line);
     for (idx, ch) in cleaned.char_indices() {
@@ -330,7 +354,7 @@ pub fn strip_inline_comment(line: &str) -> &str {
     cleaned
 }
 
-/// FNV-1a 64 bit — small, stable and dependency free.
+/// FNV-1a 64 位哈希：体积小、结果稳定且无外部依赖。
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
@@ -340,6 +364,7 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// 把单个十六进制字符转换为对应的数值。
 fn hex_value(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
@@ -349,7 +374,7 @@ fn hex_value(c: u8) -> Option<u8> {
     }
 }
 
-/// Percent-decodes a URL component (invalid escapes are passed through).
+/// 对 URL 组件做百分号解码（非法转义按原样保留）。
 pub fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -368,12 +393,13 @@ pub fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// 标准 base64 字母表。
 const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// Standard base64 with padding.
+/// 带填充的标准 base64。
 ///
-/// Implemented here rather than pulled in as a dependency: the gateway needs it
-/// for exactly one thing (the `Proxy-Authorization: Basic` header).
+/// 在这里自行实现而不引入依赖：
+/// 网关只在一处需要它，即 `Proxy-Authorization: Basic` 请求头。
 pub fn base64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -397,7 +423,7 @@ pub fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// Decodes standard base64; whitespace is ignored, bad input yields `None`.
+/// 解码标准 base64；空白会被忽略，输入非法时返回 `None`。
 pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len() * 3 / 4);
     let mut accumulator: u32 = 0;

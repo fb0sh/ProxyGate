@@ -77,6 +77,14 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      # The API reference is published to docs.rs and is written in Chinese, so
+      # a broken intra-doc link or an undocumented public item fails the build
+      # here rather than showing up as a warning nobody reads.
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --locked
+
       - name: Smoke test
         run: ./target/${{ matrix.target }}/release/proxygate --version
 

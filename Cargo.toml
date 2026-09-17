@@ -6,8 +6,17 @@ rust-version = "1.85"
 description = "Turn any proxy source into a uniform, always-ready proxy pool with a CLI, REST API and HTTP gateway."
 license = "MIT"
 readme = "README.md"
+documentation = "https://docs.rs/proxygate"
+homepage = "https://github.com/fb0sh/ProxyGate"
+repository = "https://github.com/fb0sh/ProxyGate"
 keywords = ["proxy", "socks5", "http-proxy", "gateway"]
 categories = ["command-line-utilities", "network-programming"]
+
+# The API docs are the crate's reference and are written in Chinese; docs.rs
+# builds every target so the library is what visitors land on.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 name = "proxygate"
@@ -37,6 +46,9 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 axum = "0.8"
+# Only to call the axum router from the gateway's hyper service when the REST
+# API shares the proxy port. Tower is already in the tree through axum.
+tower = { version = "0.5", default-features = false, features = ["util"] }
 tokio-socks = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

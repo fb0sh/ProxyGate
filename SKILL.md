@@ -91,6 +91,12 @@ shelling out. Default port is `127.0.0.1:8081`.
 `/api/v1/get` answers `503` when the pool has nothing healthy — same meaning as
 exit code `3`.
 
+The API can share the gateway port (`serve --api same`, or `server.api: same`):
+`CONNECT` and absolute-form requests go to the proxy, origin-form paths such as
+`/api/v1/get` go to the API. On a shared port `--auth` still protects **proxy
+requests only** — the API itself stays open, so only do this on a trusted
+interface.
+
 ## Built-in sources
 
 `proxygate providers` lists the curated catalog of public endpoints shipped in
@@ -161,7 +167,8 @@ curl -x http://admin:secret@127.0.0.1:8080 https://example.com
 Clients speak plain HTTP proxy (CONNECT and absolute-form GET/HEAD) and never
 learn the upstream address or its credentials. Client auth (`--auth`) and
 upstream auth are independent. `serve` runs four things: subscriber refresh,
-health checking, the REST API and the gateway.
+health checking, the REST API and the gateway. Pass `--api same` to put the API
+on the proxy port instead of `127.0.0.1:8081`.
 
 ## Things to know before trusting the output
 
@@ -178,6 +185,9 @@ health checking, the REST API and the gateway.
   task needs to reach a specific kind of destination.
 * **The pool is shared state.** Every `get` marks the proxy used for this round,
   and that state is persisted to disk, so consecutive calls rotate.
+* **`--auth` does not cover the REST API when the port is shared.** The API has
+  no authentication of its own; keep the shared port on `127.0.0.1` or put a
+  firewall in front of it.
 * **`proxygate serve` needs a writable cache directory** (`~/.cache/proxygate`,
   or `state.dir` / `$PROXYGATE_CACHE_DIR`). If it cannot write, it keeps serving
   but stops persisting rotation state.

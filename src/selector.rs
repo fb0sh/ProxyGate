@@ -1,12 +1,12 @@
-//! Candidate filtering and selection strategies.
+//! 候选过滤与选择策略。
 //!
-//! The rotation rules live in [`plan`]:
+//! 轮换规则位于 [`plan`]：
 //!
-//! * only healthy proxies are ever handed out;
-//! * a proxy that was already used in the current round is skipped;
-//! * among the remaining ones, proxies unused within `reuse_after` win;
-//! * when the whole healthy pool has been used, the round is incremented
-//!   immediately instead of waiting for `reuse_after` to expire.
+//! * 只会分发健康的代理；
+//! * 在当前轮次中已经使用过的代理会被跳过；
+//! * 在剩下的代理中，`reuse_after` 时间内未被使用的优先；
+//! * 当所有健康代理都已用过时，立即递增轮次，
+//!   而不是等待 `reuse_after` 到期。
 
 use std::time::{Duration, SystemTime};
 
@@ -16,20 +16,22 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::model::Proxy;
 
-/// How a proxy is chosen from the candidate set.
+/// 从候选集合中挑选代理的方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Strategy {
-    /// Uniform pick — spreads load across the pool.
+    /// 均匀随机挑选，把负载分散到整个代理池。
     #[default]
     Random,
-    /// Lowest measured latency.
+    /// 选择测量延迟最低的代理。
     Latency,
 }
 
 impl Strategy {
+    /// 所有可用的选择策略。
     pub const ALL: [Strategy; 2] = [Strategy::Random, Strategy::Latency];
 
+    /// 策略的规范小写名称。
     pub const fn as_str(self) -> &'static str {
         match self {
             Strategy::Random => "random",
@@ -41,6 +43,7 @@ impl Strategy {
 impl std::str::FromStr for Strategy {
     type Err = Error;
 
+    /// 从字符串解析选择策略，接受 `fastest` 作为 `latency` 的别名。
     fn from_str(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
             "random" => Ok(Strategy::Random),
@@ -58,22 +61,22 @@ impl std::fmt::Display for Strategy {
     }
 }
 
-/// The result of applying the rotation rules to a pool snapshot.
+/// 对代理池快照应用轮换规则的结果。
 #[derive(Debug)]
 pub struct Plan<'a> {
-    /// Proxies that may be handed out, best tier first.
+    /// 可以被分发的代理，优先级最高的在最前。
     pub candidates: Vec<&'a Proxy>,
-    /// Round the selection belongs to (may be the current round plus one).
+    /// 该选择所属的轮次（可能是当前轮次加一）。
     pub generation: u64,
-    /// True when the caller must advance the pool generation.
+    /// 调用方是否必须推进代理池的轮次。
     pub reset_round: bool,
-    /// Healthy proxies seen in the snapshot.
+    /// 快照中的健康代理数量。
     pub healthy: usize,
-    /// Healthy proxies that were already used in the current round.
+    /// 当前轮次中已经使用过的健康代理数量。
     pub used_this_round: usize,
 }
 
-/// Applies the rotation rules. Pure function: no locking, no clock reads.
+/// 应用轮换规则。纯函数：不加锁，也不读取时钟。
 pub fn plan<'a>(
     proxies: &'a [Proxy],
     generation: u64,
@@ -121,7 +124,7 @@ pub fn plan<'a>(
     }
 }
 
-/// True when the proxy was handed out within the reuse window.
+/// 代理是否在复用时间窗内被分发过。
 pub fn used_recently(proxy: &Proxy, reuse_after: Duration, now: SystemTime) -> bool {
     proxy
         .last_used_at
@@ -129,11 +132,12 @@ pub fn used_recently(proxy: &Proxy, reuse_after: Duration, now: SystemTime) -> b
         .unwrap_or(false)
 }
 
+/// 计算从 `from` 到 `now` 经过的时间，时钟回拨时返回零。
 fn elapsed(from: SystemTime, now: SystemTime) -> Duration {
     now.duration_since(from).unwrap_or(Duration::ZERO)
 }
 
-/// Picks one index out of the candidate set.
+/// 从候选集合中挑选一个下标。
 pub fn pick(candidates: &[&Proxy], strategy: Strategy) -> Option<usize> {
     if candidates.is_empty() {
         return None;
