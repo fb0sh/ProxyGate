@@ -1,0 +1,19 @@
+# 所有文本文件一律以 LF 检出。
+#
+# 这不是洁癖：`SKILL.md`、`config.example.yaml` 和 `assets/user_agents.txt`
+# 是用 `include_str!` 在编译期编进二进制的，Windows 上 Git 默认的
+# `core.autocrlf=true` 会把它们变成 CRLF，于是同一个 tag 在不同平台编出来的
+# 二进制内容不一样（`proxygate skill`、`proxygate genconfig` 的输出也跟着变）。
+# 这里显式指定 LF，让检出内容与仓库内容一致。
+* text=auto eol=lf
+
+# Rust 源码与配置文件同上；Cargo.lock 也保持 LF，避免 diff 噪声。
+*.rs   text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.md   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.txt  text eol=lf
+*.py   text eol=lf
+*.sh   text eol=lf

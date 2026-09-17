@@ -101,9 +101,15 @@ mod tests {
     fn the_skill_document_is_usable_on_its_own() {
         // An agent reads this without any other file, so it has to carry the
         // whole contract: frontmatter, the commands, the exit codes, the API.
-        assert!(SKILL.starts_with("---\n"), "missing skill frontmatter");
-        assert!(SKILL.contains("\nname: proxygate"), "missing skill name");
-        assert!(SKILL.contains("description:"), "missing skill description");
+        //
+        // `.gitattributes` pins the checkout to LF, but the assertions still
+        // normalise: a CRLF checkout (a source archive built without that file,
+        // a contributor with `core.autocrlf=true`) should not fail a test about
+        // the document's *content*.
+        let skill = SKILL.replace("\r\n", "\n");
+        assert!(skill.starts_with("---\n"), "missing skill frontmatter");
+        assert!(skill.contains("\nname: proxygate"), "missing skill name");
+        assert!(skill.contains("description:"), "missing skill description");
 
         for needle in [
             "proxygate get",
@@ -117,13 +123,13 @@ mod tests {
             "health:",
             "require:",
         ] {
-            assert!(SKILL.contains(needle), "SKILL.md does not mention {needle}");
+            assert!(skill.contains(needle), "SKILL.md does not mention {needle}");
         }
 
         assert!(
-            SKILL.len() > 2_000 && SKILL.len() < 20_000,
+            skill.len() > 2_000 && skill.len() < 20_000,
             "SKILL.md is {} bytes; too thin or too long for an agent to load",
-            SKILL.len()
+            skill.len()
         );
     }
 }
