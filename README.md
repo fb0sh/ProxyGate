@@ -127,7 +127,33 @@ proxygate genconfig > config.yaml     # 带注释的完整示例，直接重定�
 
 ### Subscriber（代理来源）
 
-只有三种，其余情况用最后一个逃生口：
+四种：`builtin`（内置源）、`http`、`file`、`exec`。
+
+`builtin` 指向代码里维护的**内置源目录**，配置里只写名字，不用抄 URL：
+
+```yaml
+subscribers:
+  - name: scdn
+    type: builtin
+    provider: scdn
+```
+
+`proxygate providers` 列出目录里的全部条目（端点、格式、注意事项、文档地址），也可以
+`--json`。`proxygate genconfig` 生成的配置**默认启用目录里的每一个源**——新装一台机器，
+`genconfig` 之后直接 `refresh` 就有池子。
+
+每个条目本质上就是一次 HTTP 拉取，所以 `builtin` 支持与 `http` 相同的覆盖项：
+
+```yaml
+  - name: scdn-cn
+    type: builtin
+    provider: scdn
+    url: https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20&country_code=CN
+    format: json      # 默认取目录里的格式
+    timeout: 20s
+```
+
+另外三种是通用的，其余情况用最后一个逃生口：
 
 ```yaml
 subscribers:
@@ -166,11 +192,10 @@ user:pass@1.2.3.4:3128       socks5h://user:pass@[2001:db8::1]:1080
 1.2.3.4:8080                 # 协议和端口都会补默认值
 ```
 
-[`config.example.yaml`](config.example.yaml) 里的第一个 subscriber 接的是一个真实接口：
-[proxy.scdn.io](https://proxy.scdn.io/api_docs.php)。它返回 JSON 包装、里面是裸
-`host:port`，内置 `json` 格式可以直接读。因为返回体不带协议，这类条目一律按 HTTP 代理
-处理（所以示例请求 `protocol=http`）；想用它家的 `socks4`/`socks5` 端点得用 `exec` 包一层
-补上 `socks5://` 前缀。
+内置目录里的第一个源是 [proxy.scdn.io](https://proxy.scdn.io/api_docs.php)：它返回 JSON
+包装、里面是裸 `host:port`，内置 `json` 格式可以直接读。因为返回体不带协议，这类条目一律
+按 HTTP 代理处理（所以目录里请求 `protocol=http`）；想用它家的 `socks4`/`socks5` 端点得用
+`exec` 包一层补上 `socks5://` 前缀。
 
 关于这类免费池要有心理准备，下面两点正是健康探测存在的意义：**大部分条目是死的**，并且
 相当一部分「支持 HTTPS」的其实在中间人劫持 TLS、拿自己的证书签发。ProxyGate 会拒绝这类
@@ -188,6 +213,7 @@ proxygate serve     [--listen ADDR] [--api ADDR] [--auth USER:PASS] [--no-refres
 proxygate genconfig                             # 带注释的示例配置，输出到 stdout
 proxygate getua     [--format text|json]        # 一个随机 User-Agent
 proxygate skill                                 # 面向 agent 的 SKILL.md，输出到 stdout
+proxygate providers [--json]                    # 内置代理源目录
 ```
 
 全局参数：`-c/--config <path>`、`-v`（info）、`-vv`（debug）、`-vvv`（trace）、
@@ -425,7 +451,8 @@ src/
   cli.rs         clap 定义
   config.rs      config.yaml 模型、默认值、校验
   model.rs       Proxy、稳定 ID、URL 归一化、小工具编解码
-  subscriber.rs  http/file/exec subscriber 与内置解析器
+  subscriber.rs  builtin/http/file/exec subscriber 与内置解析器
+  providers.rs   内置代理源目录（`proxygate providers` 输出它）
   pool.rs        池子：合并、健康写入、选择（轮次）
   checker.rs     健康探测 + 共享上游 client 缓存
   selector.rs    候选过滤与 random/latency 策略
@@ -451,6 +478,8 @@ SKILL.md         面向 AI agent 的说明（`proxygate skill` 输出它）
   说明里只有一个 `target`。默认目标是 Google 加 `cn.bing.com`。
 - **从未成功过的代理一次失败即判死**，`health.max_failures` 只对原本可用的代理生效。
 - `https://` 上游在加载列表时就被拒绝，而不是接受之后在 CONNECT 阶段失败。
+- 多了第四种 subscriber `builtin`：设计说明只写了 http/file/exec，但「内置源目录」让
+  URL 和格式集中维护，配置里只写名字。它做的仍然只是一次 HTTP 拉取。
 
 ## 许可
 

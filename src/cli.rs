@@ -66,6 +66,8 @@ pub enum Command {
     Getua(GetUaArgs),
     /// Print the agent-facing skill document (SKILL.md) to stdout
     Skill,
+    /// List the built-in proxy sources and how to enable them
+    Providers(ProvidersArgs),
 }
 
 #[derive(Debug, Args)]
@@ -138,6 +140,13 @@ pub struct CheckArgs {
     /// Only probe proxies that are currently alive (skip known-dead ones)
     #[arg(long)]
     pub alive_only: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProvidersArgs {
+    /// Machine readable output
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

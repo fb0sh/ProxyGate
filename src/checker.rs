@@ -385,7 +385,7 @@ async fn probe(client: &Client, target: Arc<str>) -> TargetResult {
             target,
             ok: false,
             latency: None,
-            error: Some(describe_error(&error)),
+            error: Some(crate::error::describe_reqwest_error(&error)),
         },
     }
 }
@@ -415,32 +415,6 @@ fn short_target(target: &str) -> &str {
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(target)
-}
-
-/// Compact error description: classification plus the root cause.
-pub fn describe_error(error: &reqwest::Error) -> String {
-    let kind = if error.is_timeout() {
-        "timeout"
-    } else if error.is_connect() {
-        "connect"
-    } else if error.is_redirect() {
-        "redirect"
-    } else if error.is_body() {
-        "body"
-    } else {
-        "request"
-    };
-
-    let mut root: &(dyn std::error::Error + 'static) = error;
-    while let Some(source) = std::error::Error::source(root) {
-        root = source;
-    }
-
-    if root.to_string() == error.to_string() {
-        format!("{kind}: {}", error)
-    } else {
-        format!("{kind}: {} ({})", error, root)
-    }
 }
 
 #[cfg(test)]

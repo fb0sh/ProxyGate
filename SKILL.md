@@ -64,7 +64,8 @@ curl -x "$(proxygate get)" -A "$(proxygate getua)" https://example.com
 | `check [--json] [--concurrency N] [--alive-only]` | re-probe the pool now |
 | `refresh [--json]` | re-fetch the configured sources now |
 | `serve [--listen ADDR] [--api ADDR] [--auth USER:PASS]` | run the gateway + REST API |
-| `genconfig` | print an annotated example config to stdout |
+| `providers [--json]` | list the built-in proxy sources (name, endpoint, format, caveats) |
+| `genconfig` | print an annotated example config that enables every built-in source |
 | `skill` | print this document |
 
 Global flags: `-c/--config <path>`, `-v`/`-vv`/`-vvv` (info/debug/trace), `-q`.
@@ -89,6 +90,24 @@ shelling out. Default port is `127.0.0.1:8081`.
 
 `/api/v1/get` answers `503` when the pool has nothing healthy — same meaning as
 exit code `3`.
+
+## Built-in sources
+
+`proxygate providers` lists the curated catalog of public endpoints shipped in
+the binary. A config enables one by name, without repeating its URL:
+
+```yaml
+subscribers:
+  - name: scdn
+    type: builtin
+    provider: scdn
+```
+
+`proxygate genconfig` enables every catalog entry, so `genconfig > config.yaml`
+followed by a `get` works with no editing. Each entry is an HTTP fetch with the
+catalog's payload format; `url`/`format`/`timeout` can be overridden per entry.
+Treat these sources as best-effort: they are free lists, they rate limit, and
+most of what they return fails the health check.
 
 ## Configuration
 

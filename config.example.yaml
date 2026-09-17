@@ -14,68 +14,58 @@ server:
   # Address of the REST API.
   api: 127.0.0.1:8081
 
-# Where proxies come from. Three kinds: http, file, exec.
+# Where proxies come from: builtin, http, file or exec.
 subscribers:
-  # A real provider: https://proxy.scdn.io/api_docs.php
-  # It answers with a JSON envelope — {"code":200,"data":{"proxies":["1.2.3.4:8080"]}}
-  # — which the built-in `json` format walks for you.
+  # Built-in sources. ProxyGate ships a catalog of public endpoints; this file
+  # enables every entry in it, and `proxygate providers` lists them all with
+  # their endpoints, formats and caveats.
   #
-  # The payload is plain `host:port` with no scheme, so ProxyGate reads each
-  # entry as an HTTP proxy; ask for `protocol=http` to match. `count` is capped
-  # at 20 by the provider, and `&country_code=CN` narrows it down by country.
-  # For socks4/socks5 entries, wrap this in an `exec` subscriber that prefixes
-  # the scheme (see subscribers/README.md) — the API does not tell you which of
-  # its returned endpoints is which protocol.
-  #
-  # Expect most entries to fail the health check: free lists are mostly dead
-  # endpoints, and a good share of the HTTPS-capable ones intercept TLS with a
-  # certificate signed by themselves, which ProxyGate refuses to use. Filtering
-  # exactly that is the checker's job.
-  #
-  # It rate limits: the default `refresh.interval` of 10m is fine, a 30s one is not.
+  # They are free/public lists: expect most of what they return to fail the
+  # health check (dead endpoints, and proxies that intercept TLS with their own
+  # certificate — ProxyGate refuses those), and expect rate limits, so leave
+  # `refresh.interval` at 10m or slower.
   - name: scdn
-    type: http
-    url: https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20
-    format: json
-    timeout: 20s
+    type: builtin
+    provider: scdn
+    # A builtin entry is an HTTP fetch, so it takes the same optional overrides:
+    #   url:    https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20&country_code=CN
+    #   format: json
+    #   timeout: 20s
+
+  # ---------------------------------------------------------------------------
+  # The other three kinds, commented out. Uncomment and adjust what you need.
+  # ---------------------------------------------------------------------------
 
   # A plain URL: one proxy per line, `#` starts a comment.
-  - name: provider-a
-    type: http
-    url: https://example.com/proxies.txt
-
-  # The same endpoint with a different payload format.
-  # `format` is one of plaintext (default), json, clash.
-  - name: provider-b
-    type: http
-    url: https://example.com/sub.yaml
-    format: clash
-    timeout: 20s
-    # Extra request headers, e.g. for an API token.
-    # headers:
-    #   Authorization: Bearer <token>
+  # - name: provider-a
+  #   type: http
+  #   url: https://example.com/proxies.txt
+  #   format: plaintext          # plaintext (default) | json | clash
+  #   timeout: 20s
+  #   headers:                   # for endpoints that need a token
+  #     Authorization: Bearer <token>
 
   # A local file.
-  - name: local
-    type: file
-    path: ./proxies.txt
-    format: plaintext
+  # - name: local
+  #   type: file
+  #   path: ./proxies.txt
+  #   format: plaintext
 
   # The escape hatch: run a command and read proxy URLs from its stdout.
   # Whatever the provider's format is (HTML, base64, protobuf, a signed API),
   # the script does the parsing and ProxyGate stays simple.
   # See subscribers/README.md for the contract.
-  - name: custom
-    type: exec
-    command:
-      - python3
-      - ./subscribers/example.py
-      - --url
-      - https://example.com/weird-api
-    format: plaintext
-    timeout: 30s
-    # env:
-    #   API_TOKEN: "..."
+  # - name: custom
+  #   type: exec
+  #   command:
+  #     - python3
+  #     - ./subscribers/example.py
+  #     - --url
+  #     - https://example.com/weird-api
+  #   format: plaintext
+  #   timeout: 30s
+  #   env:
+  #     API_TOKEN: "..."
 
 refresh:
   # How long a fetched subscriber result is reused before fetching again.

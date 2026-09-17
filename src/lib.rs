@@ -23,6 +23,7 @@ pub mod error;
 pub mod gateway;
 pub mod model;
 pub mod pool;
+pub mod providers;
 pub mod selector;
 pub mod state;
 pub mod subscriber;
@@ -59,6 +60,7 @@ mod tests {
             "proxygate getua",
             "proxygate serve",
             "proxygate genconfig",
+            "proxygate providers",
             "curl -x \"$(proxygate get)\"",
             "exit code",
             "/api/v1/getua",

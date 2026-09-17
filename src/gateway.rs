@@ -392,7 +392,7 @@ impl Gateway {
                     return build_response(response);
                 }
                 Err(error) => {
-                    last_error = crate::checker::describe_error(&error);
+                    last_error = crate::error::describe_reqwest_error(&error);
                     let retry = retryable
                         && (error.is_connect() || error.is_timeout())
                         && attempt + 1 < attempts;

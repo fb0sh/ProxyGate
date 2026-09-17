@@ -15,6 +15,7 @@
 //! the ProxyGate process. It is an intentional escape hatch — treat
 //! `config.yaml` as trusted input.
 
+use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -120,7 +121,12 @@ impl SubscriberSet {
         let payload = match self.read_payload(subscriber).await {
             Ok(payload) => payload,
             Err(error) => {
-                outcome.error = Some(error.to_string());
+                // The outcome already carries the name, so unwrap the variant
+                // that repeats it in its Display.
+                outcome.error = Some(match error {
+                    Error::Subscriber { message, .. } => message,
+                    other => other.to_string(),
+                });
                 outcome.duration = started.elapsed();
                 return outcome;
             }
@@ -150,36 +156,25 @@ impl SubscriberSet {
                 headers,
                 timeout,
                 ..
+            } => self.fetch_http(subscriber, url, headers, *timeout).await,
+            // A builtin is an HTTP subscriber whose endpoint and format come
+            // from the catalog, so it takes the same path.
+            SubscriberConfig::Builtin {
+                provider,
+                url,
+                timeout,
+                ..
             } => {
-                let mut request = self
-                    .client
-                    .get(url)
-                    .timeout(timeout.unwrap_or(self.timeout));
-                if !headers.is_empty() {
-                    let mut map = HeaderMap::new();
-                    for (name, value) in headers {
-                        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
-                            Error::Subscriber {
-                                name: subscriber.name().to_string(),
-                                message: format!("invalid header name `{name}`: {e}"),
-                            }
-                        })?;
-                        let value =
-                            HeaderValue::from_str(value).map_err(|e| Error::Subscriber {
-                                name: subscriber.name().to_string(),
-                                message: format!("invalid header value for `{name}`: {e}"),
-                            })?;
-                        map.insert(name, value);
-                    }
-                    request = request.headers(map);
-                }
-
-                let response = request.send().await?;
-                let status = response.status();
-                if !status.is_success() {
-                    return Err(Error::Other(format!("HTTP {status}")));
-                }
-                Ok(response.text().await?)
+                let entry = crate::providers::find(provider).ok_or_else(|| Error::Subscriber {
+                    name: subscriber.name().to_string(),
+                    message: format!(
+                        "unknown builtin provider `{provider}` (available: {})",
+                        crate::providers::names().join(", ")
+                    ),
+                })?;
+                let url = url.as_deref().unwrap_or(entry.url);
+                self.fetch_http(subscriber, url, &BTreeMap::new(), *timeout)
+                    .await
             }
             SubscriberConfig::File { path, .. } => tokio::fs::read_to_string(path)
                 .await
@@ -191,6 +186,54 @@ impl SubscriberSet {
                 ..
             } => run_command(command, env, timeout.unwrap_or(self.timeout)).await,
         }
+    }
+
+    async fn fetch_http(
+        &self,
+        subscriber: &SubscriberConfig,
+        url: &str,
+        headers: &BTreeMap<String, String>,
+        timeout: Option<Duration>,
+    ) -> Result<String> {
+        let mut request = self
+            .client
+            .get(url)
+            .timeout(timeout.unwrap_or(self.timeout));
+        if !headers.is_empty() {
+            let mut map = HeaderMap::new();
+            for (name, value) in headers {
+                let name =
+                    HeaderName::from_bytes(name.as_bytes()).map_err(|e| Error::Subscriber {
+                        name: subscriber.name().to_string(),
+                        message: format!("invalid header name `{name}`: {e}"),
+                    })?;
+                let value = HeaderValue::from_str(value).map_err(|e| Error::Subscriber {
+                    name: subscriber.name().to_string(),
+                    message: format!("invalid header value for `{name}`: {e}"),
+                })?;
+                map.insert(name, value);
+            }
+            request = request.headers(map);
+        }
+
+        let response = request.send().await.map_err(|error| Error::Subscriber {
+            name: subscriber.name().to_string(),
+            message: crate::error::describe_reqwest_error(&error),
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::Subscriber {
+                name: subscriber.name().to_string(),
+                message: format!("HTTP {status}"),
+            });
+        }
+        response.text().await.map_err(|error| Error::Subscriber {
+            name: subscriber.name().to_string(),
+            message: format!(
+                "cannot read the response body: {}",
+                crate::error::describe_reqwest_error(&error)
+            ),
+        })
     }
 }
 

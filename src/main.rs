@@ -22,7 +22,8 @@ use tracing_subscriber::EnvFilter;
 use proxygate::api::{self, ApiState};
 use proxygate::checker::{CheckReport, HealthChecker, ProxyClients};
 use proxygate::cli::{
-    CheckArgs, Cli, Command, GetArgs, GetUaArgs, ListArgs, OutputFormat, RefreshArgs, ServeArgs,
+    CheckArgs, Cli, Command, GetArgs, GetUaArgs, ListArgs, OutputFormat, ProvidersArgs,
+    RefreshArgs, ServeArgs,
 };
 use proxygate::config::Config;
 use proxygate::error::{Error, Result};
@@ -86,7 +87,80 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Genconfig => cmd_genconfig(),
         Command::Getua(args) => cmd_getua(args),
         Command::Skill => cmd_skill(),
+        Command::Providers(args) => cmd_providers(args),
     }
+}
+
+/// `proxygate providers` — what the built-in catalog contains.
+///
+/// Needs no config file: the point is to discover what you *could* subscribe to.
+fn cmd_providers(args: ProvidersArgs) -> Result<ExitCode> {
+    let providers = proxygate::providers::ALL;
+
+    if args.json {
+        let entries: Vec<serde_json::Value> = providers
+            .iter()
+            .map(|provider| {
+                serde_json::json!({
+                    "name": provider.name,
+                    "url": provider.url,
+                    "format": provider.format.as_str(),
+                    "homepage": provider.homepage,
+                    "notes": provider.notes,
+                })
+            })
+            .collect();
+        print_stdout(&serde_json::to_string_pretty(&entries)?)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let width = providers
+        .iter()
+        .map(|provider| provider.name.len())
+        .max()
+        .unwrap_or(4)
+        .max("NAME".len());
+
+    let mut output = String::new();
+    output.push_str(&format!(
+        "{:<width$}  {:<10}  {}\n",
+        "NAME",
+        "FORMAT",
+        "ENDPOINT",
+        width = width
+    ));
+    for provider in providers {
+        output.push_str(&format!(
+            "{:<width$}  {:<10}  {}\n",
+            provider.name,
+            provider.format.as_str(),
+            provider.url,
+            width = width
+        ));
+        output.push_str(&format!(
+            "{:<width$}  {:<10}  notes: {}\n",
+            "",
+            "",
+            provider.notes,
+            width = width
+        ));
+        output.push_str(&format!(
+            "{:<width$}  {:<10}  docs:  {}\n",
+            "",
+            "",
+            provider.homepage,
+            width = width
+        ));
+    }
+    output.push_str(&format!(
+        "\nEnable one by name (proxygate genconfig already enables all of them):\n\n  \
+         subscribers:\n    - name: {}\n      type: builtin\n      provider: {}\n",
+        providers.first().map(|p| p.name).unwrap_or("provider"),
+        providers.first().map(|p| p.name).unwrap_or("provider")
+    ));
+    print_stdout(output.trim_end())?;
+
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `proxygate skill` — this tool's own documentation for an agent to read.

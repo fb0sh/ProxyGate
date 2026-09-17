@@ -43,6 +43,38 @@ pub enum Error {
     Other(String),
 }
 
+/// Human readable description of a `reqwest` failure: classification plus the
+/// root cause.
+///
+/// `reqwest::Error`'s own `Display` stops at "error sending request for url
+/// (...)", which hides whether a probe or a subscriber failed because of DNS,
+/// a refused connection, a TLS problem or a timeout. Everything that reports an
+/// HTTP failure goes through here.
+pub fn describe_reqwest_error(error: &reqwest::Error) -> String {
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if error.is_body() {
+        "body"
+    } else {
+        "request"
+    };
+
+    let mut root: &(dyn std::error::Error + 'static) = error;
+    while let Some(source) = std::error::Error::source(root) {
+        root = source;
+    }
+
+    if root.to_string() == error.to_string() {
+        format!("{kind}: {error}")
+    } else {
+        format!("{kind}: {error} ({root})")
+    }
+}
+
 impl Error {
     /// Shorthand for `Error::Other` with a formatted message.
     pub fn other(message: impl Into<String>) -> Self {

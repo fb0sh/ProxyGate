@@ -131,7 +131,35 @@ that reaches either one; the `TARGETS` column tells you which.
 
 ### Subscribers
 
-Three kinds, and an escape hatch for everything else:
+Four kinds: `builtin` (a curated source), `http`, `file`, and the `exec` escape
+hatch.
+
+`builtin` refers to the catalog maintained in the code, so a config only names a
+source instead of repeating its URL:
+
+```yaml
+subscribers:
+  - name: scdn
+    type: builtin
+    provider: scdn
+```
+
+`proxygate providers` lists the whole catalog (endpoint, format, caveats, docs)
+and takes `--json`. `proxygate genconfig` **enables every entry by default**, so
+a fresh machine gets a working pool from `genconfig` + `refresh`.
+
+A builtin is an HTTP fetch underneath, so it accepts the same overrides:
+
+```yaml
+  - name: scdn-cn
+    type: builtin
+    provider: scdn
+    url: https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20&country_code=CN
+    format: json      # defaults to the catalog format
+    timeout: 20s
+```
+
+The other three kinds, for everything else:
 
 ```yaml
 subscribers:
@@ -172,8 +200,7 @@ user:pass@1.2.3.4:3128       socks5h://user:pass@[2001:db8::1]:1080
 1.2.3.4:8080                 # scheme and port get sensible defaults
 ```
 
-A real provider wired up as the first subscriber of
-[`config.example.yaml`](config.example.yaml) is
+The first catalog entry is
 [proxy.scdn.io](https://proxy.scdn.io/api_docs.php): it answers with a JSON
 envelope holding bare `host:port` entries, which the `json` format reads
 directly. Since the payload carries no scheme, such entries are treated as HTTP
@@ -198,6 +225,7 @@ proxygate serve   [--listen ADDR] [--api ADDR] [--auth USER:PASS] [--no-refresh]
 proxygate genconfig                       # the annotated example config, to stdout
 proxygate getua   [--format text|json]    # one random user agent
 proxygate skill                           # the agent-facing SKILL.md, to stdout
+proxygate providers [--json]              # the built-in proxy source catalog
 ```
 
 Global flags: `-c/--config <path>`, `-v` (info), `-vv` (debug), `-vvv` (trace),
@@ -454,7 +482,8 @@ src/
   cli.rs         clap definitions
   config.rs      config.yaml model, defaults, validation
   model.rs       Proxy, stable ids, URL normalization, small codecs
-  subscriber.rs  http/file/exec subscribers and the built-in parsers
+  subscriber.rs  builtin/http/file/exec subscribers and the built-in parsers
+  providers.rs   the built-in source catalog (printed by `proxygate providers`)
   pool.rs        the pool: merge, health updates, selection (rounds)
   checker.rs     health checker + shared upstream client cache
   selector.rs    candidate filtering and the random/latency strategies
@@ -491,6 +520,8 @@ Deviations from the v0.1 design notes, each for a reason found while building it
   broken for everything else.
 * `https://` upstream proxies are rejected when a list is loaded rather than
   accepted and then failing at CONNECT time.
+* A fourth subscriber kind, `builtin`, points at the curated catalog so endpoints
+  and formats live in one place; it is still just an HTTP fetch underneath.
 
 ## License
 

@@ -230,6 +230,26 @@ pub enum SubscriberConfig {
         #[serde(default = "default_true")]
         enabled: bool,
     },
+    /// One of the curated sources in [`crate::providers`], referred to by name.
+    ///
+    /// Functionally this is an HTTP subscriber whose endpoint comes from the
+    /// catalog, with optional per-config overrides.
+    Builtin {
+        #[serde(default)]
+        name: String,
+        /// Catalog id, e.g. `scdn`. See `proxygate providers`.
+        provider: String,
+        /// Override the catalog endpoint (e.g. to change its query parameters).
+        #[serde(default)]
+        url: Option<String>,
+        /// Override the catalog payload format.
+        #[serde(default)]
+        format: Option<Format>,
+        #[serde(default, deserialize_with = "de::opt_duration")]
+        timeout: Option<Duration>,
+        #[serde(default = "default_true")]
+        enabled: bool,
+    },
     /// Runs an external command and reads proxy URLs from its stdout.
     ///
     /// This is the escape hatch for any format ProxyGate does not understand:
@@ -253,6 +273,7 @@ impl SubscriberConfig {
     pub fn name(&self) -> &str {
         match self {
             SubscriberConfig::Http { name, .. }
+            | SubscriberConfig::Builtin { name, .. }
             | SubscriberConfig::File { name, .. }
             | SubscriberConfig::Exec { name, .. } => name,
         }
@@ -261,6 +282,7 @@ impl SubscriberConfig {
     pub fn kind(&self) -> &'static str {
         match self {
             SubscriberConfig::Http { .. } => "http",
+            SubscriberConfig::Builtin { .. } => "builtin",
             SubscriberConfig::File { .. } => "file",
             SubscriberConfig::Exec { .. } => "exec",
         }
@@ -269,22 +291,35 @@ impl SubscriberConfig {
     pub fn enabled(&self) -> bool {
         match self {
             SubscriberConfig::Http { enabled, .. }
+            | SubscriberConfig::Builtin { enabled, .. }
             | SubscriberConfig::File { enabled, .. }
             | SubscriberConfig::Exec { enabled, .. } => *enabled,
         }
     }
 
+    /// The payload format, before any catalog resolution.
+    ///
+    /// A `builtin` entry may inherit its format from the provider, which shows
+    /// up as `Plaintext` here; see `SubscriberSet` for the effective value.
     pub fn format(&self) -> Format {
         match self {
             SubscriberConfig::Http { format, .. }
             | SubscriberConfig::File { format, .. }
             | SubscriberConfig::Exec { format, .. } => *format,
+            SubscriberConfig::Builtin {
+                provider, format, ..
+            } => format.unwrap_or_else(|| {
+                crate::providers::find(provider)
+                    .map(|found| found.format)
+                    .unwrap_or_default()
+            }),
         }
     }
 
     fn set_name(&mut self, name: String) {
         match self {
             SubscriberConfig::Http { name: n, .. }
+            | SubscriberConfig::Builtin { name: n, .. }
             | SubscriberConfig::File { name: n, .. }
             | SubscriberConfig::Exec { name: n, .. } => *n = name,
         }
@@ -550,6 +585,15 @@ impl Config {
                         return Err(Error::Config(format!(
                             "subscriber `{}` needs a path",
                             subscriber.name()
+                        )));
+                    }
+                }
+                SubscriberConfig::Builtin { provider, .. } => {
+                    if crate::providers::find(provider).is_none() {
+                        return Err(Error::Config(format!(
+                            "subscriber `{}` asks for unknown builtin provider `{provider}` (available: {})",
+                            subscriber.name(),
+                            crate::providers::names().join(", ")
                         )));
                     }
                 }
@@ -952,6 +996,86 @@ health:
                 "config.example.yaml must not carry an auth directive: {line}"
             );
         }
+    }
+
+    #[test]
+    fn the_example_config_enables_every_builtin_provider() {
+        let mut config: Config = serde_yaml::from_str(EXAMPLE_CONFIG).unwrap();
+        config.normalize().unwrap();
+
+        let enabled: Vec<&str> = config
+            .subscribers
+            .iter()
+            .filter(|subscriber| subscriber.enabled())
+            .map(|subscriber| match subscriber {
+                SubscriberConfig::Builtin { provider, .. } => provider.as_str(),
+                other => panic!(
+                    "the shipped example should only enable builtins, found `{}` ({})",
+                    other.name(),
+                    other.kind()
+                ),
+            })
+            .collect();
+
+        let expected: Vec<&str> = crate::providers::names();
+        assert_eq!(
+            enabled, expected,
+            "config.example.yaml and the provider catalog must list the same sources"
+        );
+    }
+
+    #[test]
+    fn a_builtin_subscriber_resolves_through_the_catalog() {
+        let mut config: Config = serde_yaml::from_str(
+            r#"
+subscribers:
+  - name: mine
+    type: builtin
+    provider: scdn
+"#,
+        )
+        .unwrap();
+        config.normalize().unwrap();
+
+        let subscriber = &config.subscribers[0];
+        assert_eq!(subscriber.kind(), "builtin");
+        assert_eq!(
+            subscriber.name(),
+            "mine",
+            "the config name is not the provider id"
+        );
+        assert_eq!(
+            subscriber.format(),
+            crate::providers::find("scdn").unwrap().format,
+            "a builtin inherits the catalog format"
+        );
+
+        // An explicit format wins over the catalog.
+        let mut config: Config = serde_yaml::from_str(
+            "subscribers:\n  - type: builtin\n    provider: scdn\n    format: plaintext\n",
+        )
+        .unwrap();
+        config.normalize().unwrap();
+        assert_eq!(config.subscribers[0].format(), Format::Plaintext);
+        assert_eq!(
+            config.subscribers[0].name(),
+            "builtin-1",
+            "unnamed subscribers still get a name"
+        );
+    }
+
+    #[test]
+    fn an_unknown_provider_is_rejected_with_the_valid_names() {
+        let mut config: Config =
+            serde_yaml::from_str("subscribers:\n  - type: builtin\n    provider: nope\n").unwrap();
+        let error = config.normalize().unwrap_err().to_string();
+        assert!(error.contains("nope"), "{error}");
+        assert!(
+            crate::providers::names()
+                .iter()
+                .all(|name| error.contains(name)),
+            "the error should list what is available: {error}"
+        );
     }
 
     #[test]
