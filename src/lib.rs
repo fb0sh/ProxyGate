@@ -52,6 +52,7 @@
 //! - [`gateway`]：转发客户端请求的 HTTP 代理网关。
 //! - [`model`]：代理 URL 的解析、归一化与渲染。
 //! - [`pool`]：进程内的代理池与轮换状态。
+//! - [`progress`]：抓取与探测的进度事件（库只发事件，显示由调用方决定）。
 //! - [`providers`]：内置代理来源清单。
 //! - [`selector`]：选择器，决定从代理池中挑选哪一个代理。
 //! - [`state`]：`state.json` 与缓存文件的落盘。
@@ -73,6 +74,7 @@ pub mod error;
 pub mod gateway;
 pub mod model;
 pub mod pool;
+pub mod progress;
 pub mod providers;
 pub mod selector;
 pub mod state;

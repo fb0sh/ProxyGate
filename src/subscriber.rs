@@ -30,6 +30,7 @@ use url::Url;
 use crate::config::{Config, Format, SubscriberConfig};
 use crate::error::{Error, Result};
 use crate::model::{self, ProxyScheme};
+use crate::progress::{FetchEvent, Progress};
 
 /// 一次订阅源拉取的结果。订阅源失败属于数据而非错误：
 /// 一个来源坏掉不能拖停其他来源。
@@ -115,15 +116,61 @@ impl SubscriberSet {
 
     /// 并发拉取所有订阅源。
     pub async fn fetch_all(&self) -> Vec<FetchOutcome> {
-        let futures = self
-            .active()
-            .map(|subscriber| self.fetch_one(subscriber))
-            .collect::<Vec<_>>();
-        futures_util::future::join_all(futures).await
+        self.fetch_all_reporting(&()).await
+    }
+
+    /// 与 [`SubscriberSet::fetch_all`] 相同，但把进度发给 `progress`。
+    ///
+    /// 用 `FuturesUnordered` 而不是 `join_all`：前者在**每个**订阅源完成时
+    /// 立刻返回，调用方因此能立刻看到是哪个来源、拿到了多少，而不是等最慢
+    /// 的那个（`freeproxy-gh` 要四分钟）一起返回。
+    pub async fn fetch_all_reporting(&self, progress: &dyn Progress) -> Vec<FetchOutcome> {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+
+        let mut pending = FuturesUnordered::new();
+        for subscriber in self.active() {
+            pending.push(self.fetch_one_reporting(subscriber, progress));
+        }
+
+        let mut outcomes = Vec::with_capacity(pending.len());
+        while let Some(outcome) = pending.next().await {
+            outcomes.push(outcome);
+        }
+        outcomes
     }
 
     /// 拉取单个订阅源，并把任何失败都转换为 `FetchOutcome::error`。
     pub async fn fetch_one(&self, subscriber: &SubscriberConfig) -> FetchOutcome {
+        self.fetch_one_reporting(subscriber, &()).await
+    }
+
+    /// 与 [`SubscriberSet::fetch_one`] 相同，但把进度发给 `progress`。
+    ///
+    /// 无论成功失败都会发出一个 [`FetchEvent::Finished`]，所以调用方不需要
+    /// 自己在每条返回路径上补事件。
+    pub async fn fetch_one_reporting(
+        &self,
+        subscriber: &SubscriberConfig,
+        progress: &dyn Progress,
+    ) -> FetchOutcome {
+        progress.fetch(FetchEvent::Started {
+            name: subscriber.name(),
+            kind: subscriber.kind(),
+            format: subscriber.format(),
+        });
+
+        let outcome = self.fetch_one_inner(subscriber, progress).await;
+
+        progress.fetch(FetchEvent::Finished(&outcome));
+        outcome
+    }
+
+    /// 真正的拉取：取响应体、解析、归一化、截断。
+    async fn fetch_one_inner(
+        &self,
+        subscriber: &SubscriberConfig,
+        progress: &dyn Progress,
+    ) -> FetchOutcome {
         let started = Instant::now();
         let mut outcome = FetchOutcome {
             name: subscriber.name().to_string(),
@@ -137,7 +184,7 @@ impl SubscriberSet {
             error: None,
         };
 
-        let payload = match self.read_payload(subscriber).await {
+        let payload = match self.read_payload(subscriber, progress).await {
             Ok(payload) => payload,
             Err(error) => {
                 // The outcome already carries the name, so unwrap the variant
@@ -189,14 +236,21 @@ impl SubscriberSet {
     }
 
     /// 按订阅源类型读取响应体。
-    async fn read_payload(&self, subscriber: &SubscriberConfig) -> Result<String> {
+    async fn read_payload(
+        &self,
+        subscriber: &SubscriberConfig,
+        progress: &dyn Progress,
+    ) -> Result<String> {
         match subscriber {
             SubscriberConfig::Http {
                 url,
                 headers,
                 timeout,
                 ..
-            } => self.fetch_http(subscriber, url, headers, *timeout).await,
+            } => {
+                self.fetch_http(subscriber, url, headers, *timeout, progress)
+                    .await
+            }
             // A builtin is an HTTP subscriber whose endpoint and format come
             // from the catalog, so it takes the same path.
             SubscriberConfig::Builtin {
@@ -215,8 +269,14 @@ impl SubscriberSet {
                 let url = url.as_deref().unwrap_or(entry.url);
                 // The catalog may know this endpoint needs longer than the
                 // global `refresh.timeout`; an explicit config value wins.
-                self.fetch_http(subscriber, url, &BTreeMap::new(), timeout.or(entry.timeout))
-                    .await
+                self.fetch_http(
+                    subscriber,
+                    url,
+                    &BTreeMap::new(),
+                    timeout.or(entry.timeout),
+                    progress,
+                )
+                .await
             }
             SubscriberConfig::File { path, .. } => tokio::fs::read_to_string(path)
                 .await
@@ -231,12 +291,17 @@ impl SubscriberSet {
     }
 
     /// 发起一次 HTTP GET 请求并返回响应体文本。
+    ///
+    /// 响应体是流式读的，而且每隔 [`DOWNLOAD_REPORT_INTERVAL`] 发一次
+    /// [`FetchEvent::Download`]：`freeproxy-gh` 的 2.5 MB 在这里要四分钟，
+    /// 不报进度就只像是卡住了。
     async fn fetch_http(
         &self,
         subscriber: &SubscriberConfig,
         url: &str,
         headers: &BTreeMap<String, String>,
         timeout: Option<Duration>,
+        progress: &dyn Progress,
     ) -> Result<String> {
         let mut request = self
             .client
@@ -270,12 +335,37 @@ impl SubscriberSet {
                 message: format!("HTTP {status}"),
             });
         }
-        response.text().await.map_err(|error| Error::Subscriber {
-            name: subscriber.name().to_string(),
-            message: format!(
-                "cannot read the response body: {}",
-                crate::error::describe_reqwest_error(&error)
-            ),
+        use futures_util::StreamExt;
+
+        let name = subscriber.name().to_string();
+        let started = Instant::now();
+        let mut body: Vec<u8> = Vec::new();
+        let mut last_report = Instant::now();
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| Error::Subscriber {
+                name: name.clone(),
+                message: format!(
+                    "cannot read the response body: {}",
+                    crate::error::describe_reqwest_error(&error)
+                ),
+            })?;
+            body.extend_from_slice(&chunk);
+
+            if last_report.elapsed() >= DOWNLOAD_REPORT_INTERVAL {
+                progress.fetch(FetchEvent::Download {
+                    name: subscriber.name(),
+                    bytes: body.len() as u64,
+                    elapsed: started.elapsed(),
+                });
+                last_report = Instant::now();
+            }
+        }
+
+        String::from_utf8(body).map_err(|error| Error::Subscriber {
+            name,
+            message: format!("the response body is not UTF-8: {error}"),
         })
     }
 }
@@ -354,6 +444,9 @@ pub fn apply_limit(proxies: &mut Vec<Url>, limit: Option<usize>) -> usize {
         _ => 0,
     }
 }
+
+/// 下载响应体时，两次进度报告之间的最小间隔。
+const DOWNLOAD_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 把一段响应体交给某个内置格式解析器处理得到的结果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -871,6 +964,71 @@ proxies:
         assert_eq!(outcome.rejected.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 记录收到的事件，用来断言进度真的发出去了。
+    #[derive(Default)]
+    struct Recorder {
+        started: std::sync::Mutex<Vec<String>>,
+        finished: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Progress for Recorder {
+        fn fetch(&self, event: FetchEvent<'_>) {
+            match event {
+                FetchEvent::Started { name, .. } => {
+                    self.started.lock().unwrap().push(name.to_string())
+                }
+                FetchEvent::Finished(outcome) => self.finished.lock().unwrap().push(format!(
+                    "{}={}",
+                    outcome.name,
+                    outcome.count()
+                )),
+                FetchEvent::Download { .. } => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_reports_started_and_finished_for_every_subscriber() {
+        let dir = std::env::temp_dir().join(format!("proxygate-progress-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.txt");
+        std::fs::write(&good, "1.2.3.4:8080\n").unwrap();
+
+        let config = Config {
+            subscribers: vec![
+                SubscriberConfig::File {
+                    name: "good".into(),
+                    path: good,
+                    format: Format::Plaintext,
+                    enabled: true,
+                },
+                SubscriberConfig::Exec {
+                    name: "bad".into(),
+                    command: shell("exit 3"),
+                    env: BTreeMap::new(),
+                    format: Format::Plaintext,
+                    timeout: None,
+                    enabled: true,
+                },
+            ],
+            ..Config::default()
+        };
+
+        let recorder = std::sync::Arc::new(Recorder::default());
+        let set = SubscriberSet::new(&config).unwrap();
+        let outcomes = set.fetch_all_reporting(recorder.as_ref()).await;
+
+        assert_eq!(outcomes.len(), 2);
+        let mut started = recorder.started.lock().unwrap().clone();
+        started.sort();
+        assert_eq!(started, vec!["bad".to_string(), "good".to_string()]);
+
+        // 失败也要有 Finished 事件，否则进度里会永远少一行。
+        let mut finished = recorder.finished.lock().unwrap().clone();
+        finished.sort();
+        assert_eq!(finished, vec!["bad=0".to_string(), "good=1".to_string()]);
     }
 
     /// 用当前平台的 shell 跑一小段脚本，让 exec 订阅源的测试两边都能跑。

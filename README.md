@@ -265,6 +265,34 @@ user:pass@1.2.3.4:3128       socks5h://user:pass@[2001:db8::1]:1080
 
 ## 命令行
 
+抓取和探测都是几分钟量级的活儿（全开内置来源时，`refresh` 大约四分钟，其中
+`freeproxy-gh` 一个就占三分钟），所以进度默认就打在 **stderr** 上：
+
+```console
+$ proxygate refresh
+→ 抓取 scdn（json）
+→ 抓取 rola-ip#1（json）
+✓ scdn  20 个代理，用时 2s，累计 20
+    http://1.2.3.4:8080
+    …
+    …还有 17 个（加 --proxies 全部列出）
+  … freeproxy-gh 已下载 1.2 MB，用时 2m10s
+✓ rola-ip#1  421 个代理（跳过 79），用时 30s，累计 441
+    socks5h://5.6.7.8:1080
+✗ broken-source  失败：connect: … (Connection refused (os error 111))
+  探测 1200/5157，存活 23，用时 1m20s
+```
+
+几件事：
+
+- 每个订阅源单独一行：名字、拿到多少个、跳过/拒绝/截断多少、耗时、**累计**。
+- 下载中的来源每隔 10 秒报一次字节数与耗时（那个 2.5 MB 的 GitHub 列表不会
+  看起来像卡死了）。
+- 健康探测每 5 秒报一次进度与存活数。
+- 默认只列 5 个代理作样例；`--proxies` 把拿到的全部列出来。
+- `-q` 关掉进度（脚本用），`-v` 另外打开日志。**进度走 stderr**，所以
+  `get` 的 stdout 仍然只有一行、`refresh --json` 仍然只有 JSON。
+
 `proxygate --help`（以及每个子命令的 `--help`）的内容是中文——clap 会直接把文档注释当
 帮助文本用。只有 `Usage:` / `Options:` 这类结构性标题和 clap 自动生成的报错信息是英文，
 clap 没有本地化接口。

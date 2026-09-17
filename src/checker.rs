@@ -22,6 +22,7 @@ use crate::config::{HealthConfig, HealthRequirement};
 use crate::error::{Error, Result};
 use crate::model::{ProbeOutcome, Proxy, ProxyId};
 use crate::pool::{HealthUpdate, PoolStats, ProxyPool};
+use crate::progress::{CheckEvent, Progress};
 
 /// 上游客户端用于什么用途；两种用途需要不同的超时与重定向行为。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -217,6 +218,11 @@ pub struct HealthChecker {
     clients: Arc<ProxyClients>,
 }
 
+/// 探测过程中两次进度报告之间的最小间隔。
+///
+/// 一次全池探测在大池子上要几分钟，5 秒一行既不会刷屏又能看出在动。
+const CHECK_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
 impl HealthChecker {
     /// 根据健康检查配置与客户端缓存创建检查器。
     pub fn new(config: &HealthConfig, clients: Arc<ProxyClients>) -> Self {
@@ -264,7 +270,21 @@ impl HealthChecker {
 
     /// 检查所有代理，同时在途的请求不超过 `concurrency` 个。
     pub async fn check_all(&self, proxies: &[Proxy]) -> CheckReport {
+        self.check_all_reporting(proxies, &()).await
+    }
+
+    /// 与 [`HealthChecker::check_all`] 相同，但把「探测了多少、活了多少」
+    /// 按固定间隔发给 `progress`。
+    ///
+    /// 一次全池探测在大池子上要几分钟，中间不报进度就只能干等。
+    pub async fn check_all_reporting(
+        &self,
+        proxies: &[Proxy],
+        progress: &dyn Progress,
+    ) -> CheckReport {
         let started = Instant::now();
+        let total = proxies.len();
+        let mut last_report = Instant::now();
         let semaphore = Arc::new(Semaphore::new(self.concurrency));
         let mut tasks: JoinSet<HealthResult> = JoinSet::new();
         let mut results = Vec::with_capacity(proxies.len());
@@ -290,11 +310,30 @@ impl HealthChecker {
                     results.push(result);
                 }
             }
+
+            if last_report.elapsed() >= CHECK_REPORT_INTERVAL {
+                progress.check(CheckEvent {
+                    done: results.len(),
+                    total,
+                    alive: results.iter().filter(|result| result.alive).count(),
+                    elapsed: started.elapsed(),
+                });
+                last_report = Instant::now();
+            }
         }
 
         while let Some(joined) = tasks.join_next().await {
             if let Ok(result) = joined {
                 results.push(result);
+            }
+            if last_report.elapsed() >= CHECK_REPORT_INTERVAL {
+                progress.check(CheckEvent {
+                    done: results.len(),
+                    total,
+                    alive: results.iter().filter(|result| result.alive).count(),
+                    elapsed: started.elapsed(),
+                });
+                last_report = Instant::now();
             }
         }
 
@@ -313,7 +352,17 @@ impl HealthChecker {
     /// 写回时沿用代理池的失败规则：从未成功过的代理立即失效，
     /// `max_failures` 只宽容曾经可用、偶发失败的代理。
     pub async fn check_and_apply(&self, pool: &ProxyPool, proxies: &[Proxy]) -> CheckReport {
-        let report = self.check_all(proxies).await;
+        self.check_and_apply_reporting(pool, proxies, &()).await
+    }
+
+    /// 与 [`HealthChecker::check_and_apply`] 相同，但把进度发给 `progress`。
+    pub async fn check_and_apply_reporting(
+        &self,
+        pool: &ProxyPool,
+        proxies: &[Proxy],
+        progress: &dyn Progress,
+    ) -> CheckReport {
+        let report = self.check_all_reporting(proxies, progress).await;
         let now = SystemTime::now();
         let updates: Vec<(ProxyId, HealthUpdate)> = report
             .results

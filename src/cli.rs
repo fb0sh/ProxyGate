@@ -49,9 +49,15 @@ pub struct Cli {
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// 只记录错误日志。
+    /// 只记录错误日志，并关闭抓取/探测的进度输出。
     #[arg(short, long, global = true, conflicts_with = "verbose")]
     pub quiet: bool,
+
+    /// 抓取时把每个拿到的代理都打印出来（默认只给几个样例）。
+    ///
+    /// 进度与代理列表都写到 stderr，所以不会污染 stdout。
+    #[arg(long, global = true)]
+    pub proxies: bool,
 }
 
 /// 全部子命令。

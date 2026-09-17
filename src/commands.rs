@@ -19,7 +19,9 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use crate::api::{self, ApiState};
-use crate::app::{App, Bootstrap, Freshness, health_loop, refresh_loop, wait_for_shutdown};
+use crate::app::{
+    App, Bootstrap, Freshness, LogProgress, health_loop, refresh_loop, wait_for_shutdown,
+};
 use crate::cli::{
     CheckArgs, Cli, Command, GetArgs, GetUaArgs, ListArgs, OutputFormat, ProvidersArgs,
     RefreshArgs, ServeArgs,
@@ -28,6 +30,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::gateway::{Gateway, GatewayOptions};
 use crate::model::Proxy;
+use crate::progress::{CheckEvent, FetchEvent, Progress};
 use crate::state;
 
 /// `proxygate providers` — 列出内置代理来源以及如何启用它们。
@@ -151,11 +154,15 @@ pub fn getua(args: GetUaArgs) -> Result<ExitCode> {
 /// 成功时向 STDOUT 精确写入一行：`Text` 格式下就是代理 URL
 /// （`host:port`），JSON 格式下是包含代理、延迟与轮次的 JSON 对象。
 /// 没有可用代理时返回 [`Error::NoProxy`]，对应退出码 `3`。
-pub async fn get(config_path: Option<PathBuf>, args: GetArgs) -> Result<ExitCode> {
+pub async fn get(
+    config_path: Option<PathBuf>,
+    args: GetArgs,
+    progress: Arc<dyn Progress>,
+) -> Result<ExitCode> {
     let (config, path) = Config::load(config_path.as_deref())?;
     let strategy = args.strategy.unwrap_or(config.selection.strategy);
 
-    let app = App::bootstrap(
+    let app = App::bootstrap_with_progress(
         config,
         path,
         Bootstrap {
@@ -170,6 +177,7 @@ pub async fn get(config_path: Option<PathBuf>, args: GetArgs) -> Result<ExitCode
                 Freshness::IfStale
             },
         },
+        progress,
     )
     .await?;
 
@@ -203,9 +211,13 @@ pub async fn get(config_path: Option<PathBuf>, args: GetArgs) -> Result<ExitCode
 ///
 /// `--alive` 只显示健康代理，`--json` 输出与 REST API 同形的机器
 /// 可读结果；两者都只影响输出格式，退出码始终为成功。
-pub async fn list(config_path: Option<PathBuf>, args: ListArgs) -> Result<ExitCode> {
+pub async fn list(
+    config_path: Option<PathBuf>,
+    args: ListArgs,
+    progress: Arc<dyn Progress>,
+) -> Result<ExitCode> {
     let (config, path) = Config::load(config_path.as_deref())?;
-    let app = App::bootstrap(
+    let app = App::bootstrap_with_progress(
         config,
         path,
         Bootstrap {
@@ -220,6 +232,7 @@ pub async fn list(config_path: Option<PathBuf>, args: ListArgs) -> Result<ExitCo
                 Freshness::IfStale
             },
         },
+        progress,
     )
     .await?;
 
@@ -325,15 +338,20 @@ pub async fn list(config_path: Option<PathBuf>, args: ListArgs) -> Result<ExitCo
 /// `proxygate refresh` — 抓取全部订阅源并重建代理池。
 ///
 /// 打印本次刷新的统计结果；单个订阅源失败只会计入统计，不会变成错误返回。
-pub async fn refresh(config_path: Option<PathBuf>, args: RefreshArgs) -> Result<ExitCode> {
+pub async fn refresh(
+    config_path: Option<PathBuf>,
+    args: RefreshArgs,
+    progress: Arc<dyn Progress>,
+) -> Result<ExitCode> {
     let (config, path) = Config::load(config_path.as_deref())?;
-    let app = App::bootstrap(
+    let app = App::bootstrap_with_progress(
         config,
         path,
         Bootstrap {
             refresh: Freshness::Never,
             check: Freshness::Never,
         },
+        progress,
     )
     .await?;
 
@@ -378,19 +396,24 @@ pub async fn refresh(config_path: Option<PathBuf>, args: RefreshArgs) -> Result<
 /// `--concurrency` 覆盖本次运行的并发度，`--alive-only` 跳过已知
 /// 失效的代理；文本模式下还会附带几条失败样例，而不是把成千上万个
 /// id 全部列出。
-pub async fn check(config_path: Option<PathBuf>, args: CheckArgs) -> Result<ExitCode> {
+pub async fn check(
+    config_path: Option<PathBuf>,
+    args: CheckArgs,
+    progress: Arc<dyn Progress>,
+) -> Result<ExitCode> {
     let (mut config, path) = Config::load(config_path.as_deref())?;
     if let Some(concurrency) = args.concurrency {
         config.health.concurrency = concurrency;
     }
 
-    let app = App::bootstrap(
+    let app = App::bootstrap_with_progress(
         config,
         path,
         Bootstrap {
             refresh: Freshness::IfStale,
             check: Freshness::Never,
         },
+        progress,
     )
     .await?;
 
@@ -490,7 +513,7 @@ pub async fn serve(config_path: Option<PathBuf>, args: ServeArgs) -> Result<Exit
         },
         check: Freshness::IfStale,
     };
-    let app = Arc::new(App::new(config, path)?);
+    let app = Arc::new(App::new_with_progress(config, path, Arc::new(LogProgress))?);
 
     let proxy_listener = TcpListener::bind(&proxy_address).await.map_err(|error| {
         Error::Other(format!(
@@ -651,6 +674,180 @@ pub(crate) fn sort_for_display(proxies: &mut [Proxy]) {
 }
 
 /// 往 STDOUT 写入一行；管道断开时返回错误而不是 panic。
+/// 把进度事件渲染成中文输出，写到一个 writer（命令行用 stderr）。
+///
+/// 为什么不走日志：日志默认只显示 `warn`，而这里要的恰恰是默认就看得见。
+/// 写 stderr 还保证了 stdout 的数据契约不变——`get` 仍然只输出一行代理，
+/// `refresh --json` 仍然只有 JSON。
+///
+/// 泛型是为了测试：命令行用 [`ConsoleProgress::stderr`]，测试用
+/// [`ConsoleProgress::buffer`] 拿回渲染结果做断言。
+pub struct ConsoleProgress<W: std::io::Write + Send> {
+    out: std::sync::Mutex<W>,
+    /// `-q`：只留错误。
+    quiet: bool,
+    /// `--proxies`：把每个拿到的代理都列出来，而不是只给几个样例。
+    proxies: bool,
+    /// 已经拿到的代理总数，用来显示「累计」。
+    fetched: std::sync::atomic::AtomicUsize,
+}
+
+impl ConsoleProgress<std::io::Stderr> {
+    /// 写到 stderr 的进度输出。
+    pub fn stderr(quiet: bool, proxies: bool) -> Self {
+        Self::new(std::io::stderr(), quiet, proxies)
+    }
+}
+
+impl ConsoleProgress<Vec<u8>> {
+    /// 测试用：写进内存。
+    pub fn buffer(quiet: bool, proxies: bool) -> Self {
+        Self::new(Vec::new(), quiet, proxies)
+    }
+
+    /// 测试用：取回已经写下的内容。
+    pub fn rendered(&self) -> String {
+        let out = self
+            .out
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        String::from_utf8_lossy(&out).into_owned()
+    }
+}
+
+impl<W: std::io::Write + Send> ConsoleProgress<W> {
+    /// 构造一个渲染器。
+    pub fn new(out: W, quiet: bool, proxies: bool) -> Self {
+        Self {
+            out: std::sync::Mutex::new(out),
+            quiet,
+            proxies,
+            fetched: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// 写一行；写不进去就当作没这回事（进度不该让命令失败）。
+    fn line(&self, text: &str) {
+        let mut out = self
+            .out
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = writeln!(out, "{text}");
+    }
+
+    /// 一个订阅源拉取完成：写统计，再按需要写代理。
+    fn finished(&self, outcome: &crate::subscriber::FetchOutcome) {
+        use std::sync::atomic::Ordering;
+
+        if !outcome.ok() {
+            self.line(&format!(
+                "✗ {}  失败：{}",
+                outcome.name,
+                outcome.error.as_deref().unwrap_or("unknown error")
+            ));
+            return;
+        }
+
+        let total = self.fetched.fetch_add(outcome.count(), Ordering::SeqCst) + outcome.count();
+        let mut detail = Vec::new();
+        if outcome.skipped > 0 {
+            detail.push(format!("跳过 {}", outcome.skipped));
+        }
+        if !outcome.rejected.is_empty() {
+            detail.push(format!("拒绝 {}", outcome.rejected.len()));
+        }
+        if outcome.truncated > 0 {
+            detail.push(format!("截断 {}", outcome.truncated));
+        }
+        let detail = if detail.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", detail.join("，"))
+        };
+
+        self.line(&format!(
+            "✓ {}  {} 个代理{detail}，用时 {}，累计 {total}",
+            outcome.name,
+            outcome.count(),
+            crate::config::humanize_duration(outcome.duration)
+        ));
+
+        if outcome.proxies.is_empty() {
+            return;
+        }
+        if self.proxies {
+            for proxy in &outcome.proxies {
+                self.line(&format!("    {}", crate::model::render_url(proxy, true)));
+            }
+            return;
+        }
+        // 默认只给几个样例：一次刷新几千个代理，全列出来只会把终端刷掉。
+        const SAMPLES: usize = 5;
+        for proxy in outcome.proxies.iter().take(SAMPLES) {
+            self.line(&format!("    {}", crate::model::render_url(proxy, true)));
+        }
+        if outcome.count() > SAMPLES {
+            self.line(&format!(
+                "    …还有 {} 个（加 --proxies 全部列出）",
+                outcome.count() - SAMPLES
+            ));
+        }
+    }
+}
+
+impl<W: std::io::Write + Send> Progress for ConsoleProgress<W> {
+    fn fetch(&self, event: FetchEvent<'_>) {
+        if self.quiet {
+            return;
+        }
+        match event {
+            FetchEvent::Started { name, format, .. } => {
+                self.line(&format!("→ 抓取 {name}（{}）", format.as_str()));
+            }
+            FetchEvent::Download {
+                name,
+                bytes,
+                elapsed,
+            } => {
+                self.line(&format!(
+                    "  … {name} 已下载 {}，用时 {}",
+                    humanize_bytes(bytes),
+                    crate::config::humanize_duration(elapsed)
+                ));
+            }
+            FetchEvent::Finished(outcome) => self.finished(outcome),
+        }
+    }
+
+    fn check(&self, event: CheckEvent) {
+        if self.quiet {
+            return;
+        }
+        self.line(&format!(
+            "  探测 {}/{}，存活 {}，用时 {}",
+            event.done,
+            event.total,
+            event.alive,
+            crate::config::humanize_duration(event.elapsed)
+        ));
+    }
+}
+
+/// 人类可读的字节数：`512 B`、`1.2 MB`。
+fn humanize_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    let value = bytes as f64;
+    if value >= MIB {
+        format!("{:.1} MB", value / MIB)
+    } else if value >= KIB {
+        format!("{:.0} KB", value / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// 往 stdout 写一行；失败映射为一个真正的错误。
 pub(crate) fn print_stdout(text: &str) -> Result<()> {
     use std::io::Write;
     let mut stdout = std::io::stdout().lock();
@@ -661,18 +858,154 @@ pub(crate) fn print_stdout(text: &str) -> Result<()> {
 /// 分发从命令行解析出的命令。
 pub async fn dispatch(cli: Cli) -> Result<ExitCode> {
     let Cli {
-        command, config, ..
+        command,
+        config,
+        quiet,
+        proxies,
+        ..
     } = cli;
 
+    // 进度写到 stderr，所以 stdout 的数据契约（`get` 只有一行、`--json`
+    // 只有 JSON）不受影响。`-q` 关掉它，`--proxies` 让它逐个列出代理。
+    let progress = Arc::new(ConsoleProgress::stderr(quiet, proxies));
+
     match command {
-        Command::Get(args) => get(config, args).await,
-        Command::List(args) => list(config, args).await,
-        Command::Refresh(args) => refresh(config, args).await,
-        Command::Check(args) => check(config, args).await,
+        Command::Get(args) => get(config, args, progress).await,
+        Command::List(args) => list(config, args, progress).await,
+        Command::Refresh(args) => refresh(config, args, progress).await,
+        Command::Check(args) => check(config, args, progress).await,
         Command::Serve(args) => serve(config, args).await,
         Command::Genconfig => genconfig(),
         Command::Getua(args) => getua(args),
         Command::Skill => skill(),
         Command::Providers(args) => providers(args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Format;
+    use crate::model::normalize;
+    use crate::progress::{CheckEvent, FetchEvent, Progress};
+    use crate::subscriber::FetchOutcome;
+    use std::time::Duration;
+
+    /// 造一个成功的结果，用来测渲染。
+    fn outcome(name: &str, proxies: &[&str]) -> FetchOutcome {
+        FetchOutcome {
+            name: name.to_string(),
+            kind: "http",
+            format: Format::Plaintext,
+            proxies: proxies
+                .iter()
+                .map(|raw| normalize(raw).expect("valid proxy"))
+                .collect(),
+            rejected: Vec::new(),
+            skipped: 2,
+            truncated: 0,
+            duration: Duration::from_millis(1500),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn progress_shows_the_source_the_counts_and_a_sample() {
+        let progress = ConsoleProgress::buffer(false, false);
+        progress.fetch(FetchEvent::Started {
+            name: "rola-ip#1",
+            kind: "builtin",
+            format: Format::Json,
+        });
+        let finished = outcome("rola-ip#1", &["http://1.1.1.1:1111", "http://2.2.2.2:2222"]);
+        progress.fetch(FetchEvent::Finished(&finished));
+        let rendered = progress.rendered();
+
+        assert!(rendered.contains("→ 抓取 rola-ip#1（json）"), "{rendered}");
+        assert!(
+            // `humanize_duration` 只精确到秒，和命令行的其它地方一致。
+            rendered.contains("✓ rola-ip#1  2 个代理（跳过 2），用时 1s，累计 2"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("    http://1.1.1.1:1111"), "{rendered}");
+        // 没有超出样例数时不该出现省略号。
+        assert!(!rendered.contains("还有"), "{rendered}");
+    }
+
+    #[test]
+    fn longer_lists_are_capped_unless_proxies_are_requested() {
+        let many: Vec<String> = (1..=9).map(|i| format!("http://10.1.1.{i}:8080")).collect();
+        let raw: Vec<&str> = many.iter().map(String::as_str).collect();
+        let finished = outcome("many", &raw);
+
+        let capped = ConsoleProgress::buffer(false, false);
+        capped.fetch(FetchEvent::Finished(&finished));
+        let rendered = capped.rendered();
+        assert_eq!(rendered.matches("    http://").count(), 5, "{rendered}");
+        assert!(
+            rendered.contains("…还有 4 个（加 --proxies 全部列出）"),
+            "{rendered}"
+        );
+
+        let all = ConsoleProgress::buffer(false, true);
+        all.fetch(FetchEvent::Finished(&finished));
+        let rendered = all.rendered();
+        assert_eq!(rendered.matches("    http://").count(), 9, "{rendered}");
+        assert!(!rendered.contains("还有"), "{rendered}");
+    }
+
+    #[test]
+    fn failures_are_reported_with_their_reason() {
+        let progress = ConsoleProgress::buffer(false, false);
+        let mut broken = outcome("broken", &[]);
+        broken.error = Some("HTTP 404 Not Found".to_string());
+        progress.fetch(FetchEvent::Finished(&broken));
+        let rendered = progress.rendered();
+        assert!(
+            rendered.contains("✗ broken  失败：HTTP 404 Not Found"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn quiet_progress_prints_nothing() {
+        let progress = ConsoleProgress::buffer(true, true);
+        progress.fetch(FetchEvent::Started {
+            name: "scdn",
+            kind: "builtin",
+            format: Format::Json,
+        });
+        progress.check(CheckEvent {
+            done: 5,
+            total: 10,
+            alive: 1,
+            elapsed: Duration::from_secs(4),
+        });
+        assert!(progress.rendered().is_empty(), "{}", progress.rendered());
+    }
+
+    #[test]
+    fn download_and_check_progress_are_readable() {
+        let progress = ConsoleProgress::buffer(false, false);
+        progress.fetch(FetchEvent::Download {
+            name: "freeproxy-gh",
+            bytes: 1_300_000,
+            elapsed: Duration::from_secs(130),
+        });
+        progress.check(CheckEvent {
+            done: 1200,
+            total: 5157,
+            alive: 23,
+            elapsed: Duration::from_secs(80),
+        });
+        let rendered = progress.rendered();
+        assert!(
+            rendered.contains("… freeproxy-gh 已下载 1.2 MB，用时 2m10s"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("探测 1200/5157，存活 23，用时 1m20s"),
+            "{rendered}"
+        );
     }
 }

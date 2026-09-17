@@ -287,6 +287,29 @@ certificates could not use it anyway.
 
 ## CLI
 
+Fetching and probing take minutes (with every built-in enabled a `refresh` is
+about four minutes, three of them the single GitHub list), so progress is
+printed to **stderr** by default:
+
+```console
+$ proxygate refresh
+→ 抓取 scdn（json）
+✓ scdn  20 个代理，用时 2s，累计 20
+    http://1.2.3.4:8080
+    …还有 17 个（加 --proxies 全部列出）
+  … freeproxy-gh 已下载 1.2 MB，用时 2m10s
+✗ broken-source  失败：connect: … (Connection refused (os error 111))
+  探测 1200/5157，存活 23，用时 1m20s
+```
+
+The text is Chinese, like the rest of the CLI output. Per subscriber line: name,
+how many proxies, how many were skipped/rejected/truncated, elapsed time and the
+running total. Downloads report bytes every 10 seconds, health checks report
+progress every 5 seconds, five proxies are shown as a sample unless you pass
+`--proxies` (which lists all of them). `-q` turns progress off; progress goes to
+stderr, so `get` still prints exactly one line on stdout and `refresh --json`
+still prints only JSON.
+
 `proxygate --help` (and every subcommand's `--help`) is printed in Chinese: clap
 uses the doc comments as help text. Only clap's own structural headings
 (`Usage:`, `Options:`) and its generated error messages stay English — clap has

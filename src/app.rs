@@ -18,6 +18,7 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::model::{self, ProbeOutcome, Proxy, ProxyId};
 use crate::pool::{HealthRestore, ProxyPool, Selection};
+use crate::progress::{CheckEvent, FetchEvent, Progress};
 use crate::selector::Strategy;
 use crate::state::{self, CacheFile, HealthFile, StateStore, TargetHealthFile};
 use crate::subscriber::SubscriberSet;
@@ -239,6 +240,8 @@ pub struct App {
     pub busy: tokio::sync::Mutex<()>,
     /// 冷启动的就绪状态：`serve` 未就绪时对外返回 `503`。
     pub readiness: Arc<Readiness>,
+    /// 抓取与探测的进度接收器；命令行渲染成进度，`serve` 转成日志。
+    pub progress: Arc<dyn Progress>,
 }
 
 impl App {
@@ -248,6 +251,15 @@ impl App {
     /// 上一次的健康检查结果。抓取订阅源与探测代理是 [`App::initialize`]
     /// 的事，因为 `serve` 需要先把端口挂上、再在后台慢慢做那件事。
     pub fn new(config: Config, config_path: Option<PathBuf>) -> Result<Self> {
+        Self::new_with_progress(config, config_path, Arc::new(()))
+    }
+
+    /// 与 [`App::new`] 相同，但指定进度接收器。
+    pub fn new_with_progress(
+        config: Config,
+        config_path: Option<PathBuf>,
+        progress: Arc<dyn Progress>,
+    ) -> Result<Self> {
         let store = Arc::new(StateStore::new(config.cache_dir()));
         store.ensure_dir()?;
 
@@ -342,6 +354,7 @@ impl App {
             subscribers,
             busy: tokio::sync::Mutex::new(()),
             readiness: Arc::new(Readiness::default()),
+            progress,
         };
 
         // The cache is the only source of freshness left once `initialize`
@@ -364,7 +377,20 @@ impl App {
         config_path: Option<PathBuf>,
         options: Bootstrap,
     ) -> Result<Self> {
-        let app = Self::new(config, config_path)?;
+        Self::bootstrap_with_progress(config, config_path, options, Arc::new(())).await
+    }
+
+    /// 与 [`App::bootstrap`] 相同，但指定进度接收器。
+    ///
+    /// 命令行走这条路：冷启动可能要几分钟（抓取 + 首次探测），进度要能实时
+    /// 显示，而不是等结束才知道发生了什么。
+    pub async fn bootstrap_with_progress(
+        config: Config,
+        config_path: Option<PathBuf>,
+        options: Bootstrap,
+        progress: Arc<dyn Progress>,
+    ) -> Result<Self> {
+        let app = Self::new_with_progress(config, config_path, progress)?;
         app.initialize(options).await?;
         Ok(app)
     }
@@ -463,7 +489,10 @@ impl App {
             debug!("no subscribers configured; nothing to refresh");
         }
 
-        let outcomes = self.subscribers.fetch_all().await;
+        let outcomes = self
+            .subscribers
+            .fetch_all_reporting(self.progress.as_ref())
+            .await;
         let all_ok = !outcomes.is_empty() && outcomes.iter().all(|outcome| outcome.ok());
 
         let mut urls = Vec::new();
@@ -487,7 +516,10 @@ impl App {
                 );
             } else {
                 failed += 1;
-                warn!(
+                // 只给 `-vv` 看：面向用户的失败报告由进度接收器负责
+                // （命令行的 `✗ 名字 失败：…`、serve 的 LogProgress 警告），
+                // 这里再来一条就重复了。
+                debug!(
                     subscriber = %outcome.name,
                     error = outcome.error.as_deref().unwrap_or("unknown error"),
                     "subscriber failed"
@@ -541,7 +573,10 @@ impl App {
             return Ok(CheckReport::default());
         }
 
-        let report = self.checker.check_and_apply(&self.pool, &proxies).await;
+        let report = self
+            .checker
+            .check_and_apply_reporting(&self.pool, &proxies, self.progress.as_ref())
+            .await;
         self.checked_at.store(
             state::unix_secs(SystemTime::now()).max(0) as u64,
             Ordering::SeqCst,
@@ -657,6 +692,70 @@ impl App {
                 stats.alive, stats.total
             )
         }
+    }
+}
+
+/// 把进度事件转成日志的接收器：`serve` 用它。
+///
+/// 命令行有更好看的终端进度（`commands::ConsoleProgress`），但后台循环没有
+/// 终端，所以这里按 `info` 写日志——`serve` 的日志里因此能看到每个来源拿到
+/// 了多少、慢的还在下多少。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LogProgress;
+
+impl Progress for LogProgress {
+    fn fetch(&self, event: FetchEvent<'_>) {
+        match event {
+            FetchEvent::Started { name, kind, format } => {
+                info!(
+                    subscriber = name,
+                    kind,
+                    format = format.as_str(),
+                    "fetching subscriber"
+                );
+            }
+            FetchEvent::Download {
+                name,
+                bytes,
+                elapsed,
+            } => {
+                info!(
+                    subscriber = name,
+                    kilobytes = bytes / 1024,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "still downloading"
+                );
+            }
+            FetchEvent::Finished(outcome) => {
+                if outcome.ok() {
+                    info!(
+                        subscriber = %outcome.name,
+                        found = outcome.count(),
+                        rejected = outcome.rejected.len(),
+                        skipped = outcome.skipped,
+                        truncated = outcome.truncated,
+                        elapsed_ms = outcome.duration.as_millis() as u64,
+                        "subscriber fetched"
+                    );
+                } else {
+                    warn!(
+                        subscriber = %outcome.name,
+                        error = outcome.error.as_deref().unwrap_or("unknown error"),
+                        "subscriber failed"
+                    );
+                }
+            }
+        }
+    }
+
+    fn check(&self, event: CheckEvent) {
+        info!(
+            done = event.done,
+            total = event.total,
+            alive = event.alive,
+            elapsed_ms = event.elapsed.as_millis() as u64,
+            "health check progress"
+        );
     }
 }
 

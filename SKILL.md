@@ -70,6 +70,14 @@ curl -x "$(proxygate get)" -A "$(proxygate getua)" https://example.com
 
 Global flags: `-c/--config <path>`, `-v`/`-vv`/`-vvv` (info/debug/trace), `-q`.
 
+Fetching and probing print progress to **stderr** as they go — one line per
+subscriber with its name, how many proxies it produced (skipped/rejected/
+truncated counts included), the elapsed time and the running total, plus a byte
+count every 10 seconds for slow downloads and a `done/total` line every 5
+seconds while probing. Five proxies are shown per source as a sample; `--proxies`
+lists every one that was accepted. `-q` silences all of it. stdout is untouched
+by this, so `get` still prints exactly one line and `refresh --json` only JSON.
+
 `--help` output is in **Chinese** (the project's primary language): clap uses
 the source's doc comments as help text. This table is the English reference.
 
