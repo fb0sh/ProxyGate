@@ -10,7 +10,6 @@
 //! GET  /api/v1/proxies        整个代理池，凭据已脱敏
 //! GET  /api/v1/health         存活状态、就绪状态与代理池计数
 //! GET  /api/v1/providers      内置代理来源清单
-//! GET  /api/v1/config         带注释的示例配置
 //! POST /api/v1/refresh        让后台立刻抓取一轮订阅源
 //! POST /api/v1/check          让后台立刻探测一轮代理池
 //! ```
@@ -77,7 +76,6 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/proxies", get(list_proxies))
         .route("/api/v1/health", get(health))
         .route("/api/v1/providers", get(list_providers))
-        .route("/api/v1/config", get(example_config))
         .route("/api/v1/refresh", post(trigger_refresh))
         .route("/api/v1/check", post(trigger_check))
         .with_state(state)
@@ -439,21 +437,6 @@ async fn list_providers() -> Json<Vec<ProviderEntry>> {
     Json(providers)
 }
 
-/// `GET /api/v1/config` —— 带注释的示例配置。
-///
-/// `GET /api/v1/config > config.yaml` 就是一份可直接用的配置。
-async fn example_config() -> Response {
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "text/yaml; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        crate::config::EXAMPLE_CONFIG,
-    )
-        .into_response()
-}
-
 /// 触发类端点的响应体。
 #[derive(Debug, Serialize)]
 struct TriggerResponse {
@@ -513,7 +496,6 @@ async fn index() -> Json<serde_json::Value> {
             "proxies": "/api/v1/proxies",
             "health": "/api/v1/health",
             "providers": "/api/v1/providers",
-            "config": "/api/v1/config",
             "refresh": "POST /api/v1/refresh",
             "check": "POST /api/v1/check",
         },
@@ -906,7 +888,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn providers_and_config_are_downloadable() {
+    async fn the_provider_catalog_is_downloadable() {
         let response = router(initializing_state())
             .oneshot(
                 Request::builder()
@@ -926,28 +908,6 @@ mod tests {
             .expect("rola-ip is in the catalog");
         assert_eq!(rola["pages"], "1-10");
         assert_eq!(rola["page_count"], 10);
-
-        let response = router(initializing_state())
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/config")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-            Some("text/yaml; charset=utf-8")
-        );
-        assert!(
-            body_string(response).await.contains("builtin-subscribers:"),
-            "the example config should be served verbatim"
-        );
     }
 
     #[tokio::test]

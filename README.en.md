@@ -318,7 +318,6 @@ from the log.
 | `GET /api/v1/getua?format=json` | `{"user_agent": "Mozilla/5.0 ..."}`                          |
 | `GET /api/v1/proxies`           | the pool as JSON, credentials masked                         |
 | `GET /api/v1/providers`         | the built-in source catalog as JSON                          |
-| `GET /api/v1/config`            | the annotated example config as `text/yaml`                  |
 | `POST /api/v1/refresh`          | `202` — fetch every subscriber now                           |
 | `POST /api/v1/check`            | `202` — probe the whole pool now                             |
 | `GET /help`                     | this project's manual (`SKILL.md`), as `text/markdown`       |

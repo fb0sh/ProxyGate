@@ -80,11 +80,15 @@ curl -x "$(curl -sf http://127.0.0.1:8081/api/v1/get)" \
 | `GET /api/v1/proxies` | the pool as JSON, credentials masked as `***:***` |
 | `GET /api/v1/health` | `{"status":"ok","ready":true,"proxies":{"total":2,"alive":2,"dead":0}, ...}` |
 | `GET /api/v1/providers` | the built-in source catalog, as JSON |
-| `GET /api/v1/config` | the annotated example config, as `text/yaml` |
 | `POST /api/v1/refresh` | `202` — fetch every subscriber now |
 | `POST /api/v1/check` | `202` — probe the whole pool now |
 
-`GET /api/v1/config > config.yaml` is a complete starting point.
+To get a starting config you do **not** go through the API (the server needs a
+config to run in the first place):
+
+```bash
+proxygate --example-config > config.yaml
+```
 
 The two `POST`s only wake the background loops (the server owns the work), so
 they return immediately: watch the logs for progress, then poll
@@ -92,6 +96,9 @@ they return immediately: watch the logs for progress, then poll
 minutes.
 
 ## Configuration
+
+`proxygate --example-config` prints an annotated starting point, and the release
+archives ship the same file as `config.example.yaml`.
 
 The server reads `$PROXYGATE_CONFIG`, or `./config.yaml`, or
 `~/.config/proxygate/config.yaml` — nothing else, there are no flags. The keys

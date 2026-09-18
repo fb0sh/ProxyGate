@@ -33,7 +33,7 @@
 //! 或者直接用发出去的二进制（它只做一件事：按配置启动服务）：
 //!
 //! ```console
-//! curl -s http://127.0.0.1:8081/api/v1/config > config.yaml   # 带注释的示例配置
+//! proxygate --example-config > config.yaml                    # 带注释的示例配置
 //! proxygate                                                  # 启动，无参数
 //! curl -sf http://127.0.0.1:8081/api/v1/get                  # 拿一个代理
 //! curl -x "$(curl -sf http://127.0.0.1:8081/api/v1/get)" https://example.com
@@ -118,7 +118,7 @@ mod tests {
             "/api/v1/refresh",
             "/api/v1/check",
             "/api/v1/providers",
-            "/api/v1/config",
+            "--example-config",
             "/help",
             "curl -sf",
             "curl -x \"$(curl -sf",

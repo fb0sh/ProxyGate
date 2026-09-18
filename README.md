@@ -102,11 +102,11 @@ Windows 上缓存目录是 `%LOCALAPPDATA%\proxygate`（可用 `state.dir` 或
 2. `./config.yaml`
 3. `~/.config/proxygate/config.yaml`
 
-压缩包里带了一份 [`config.example.yaml`](config.example.yaml)，直接拿来起步。服务
-已经跑起来时，同一份内容也能从 API 取：
+压缩包里带了一份 [`config.example.yaml`](config.example.yaml)，也可以让二进制直接
+吐一份（不需要服务在跑，这就是它不做成 HTTP 端点的原因）：
 
 ```bash
-curl -s http://127.0.0.1:8081/api/v1/config > config.yaml
+proxygate --example-config > config.yaml
 ```
 
 > 示例配置**不含客户端认证**：它假设网关只在本机可达。要对外开放时在配置里加
@@ -297,7 +297,6 @@ $ proxygate
 | `GET /api/v1/getua?format=json` | `{"user_agent": "Mozilla/5.0 ..."}` |
 | `GET /api/v1/proxies` | 整个池的 JSON，凭据已脱敏 |
 | `GET /api/v1/providers` | 内置来源目录（端点、格式、分页范围、注意事项） |
-| `GET /api/v1/config` | 带注释的示例配置，`text/yaml` |
 | `POST /api/v1/refresh` | `202`：让后台立刻抓一轮订阅源 |
 | `POST /api/v1/check` | `202`：让后台立刻重探一遍代理池 |
 | `GET /help` | 面向 agent 与人的手册（就是 `SKILL.md` 原文，`text/markdown`） |
@@ -309,7 +308,7 @@ $ curl http://127.0.0.1:8081/api/v1/get
 http://user:pass@1.2.3.4:8080
 
 $ curl -s http://127.0.0.1:8081/api/v1/health
-{"status":"ok","version":"0.3.0","uptime_seconds":42,"generation":3,
+{"status":"ok","version":"0.3.1","uptime_seconds":42,"generation":3,
  "strategy":"random","health_targets":["https://www.google.com/generate_204",
  "https://cn.bing.com/"],"health_require":"any",
  "ready":true,"initializing":false,"initialization_attempts":1,
