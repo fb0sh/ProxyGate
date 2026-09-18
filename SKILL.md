@@ -81,8 +81,27 @@ by this, so `get` still prints exactly one line and `refresh --json` only JSON.
 `--help` output is in **Chinese** (the project's primary language): clap uses
 the source's doc comments as help text. This table is the English reference.
 
-`--no-refresh` and `--no-check` mean "use the cache even if it is stale" — the
-right choice when calling `get` in a tight loop or when offline.
+**`get` and `list` do not probe by default.** Health checking connects to every
+proxy in the pool (minutes when thousands are pooled), so it belongs to
+`refresh`, `check` and `serve`:
+
+| command | probing |
+| --- | --- |
+| `refresh` | probes only the proxies it just fetched, right after fetching |
+| `check` | re-probes the whole pool (`--alive-only` for the alive ones) |
+| `get` / `list` | none — cached verdicts; a check runs only if there has never been one |
+| `get --check` / `list --check` | force a full re-probe |
+| `get --no-check` / `list --no-check` | never probe, not even on a first run |
+
+So `get` returns in milliseconds when `refresh` or `serve` has been doing the
+checking; `--no-refresh` / `--no-check` mean "use the cache even if it is stale",
+which is what you want in a tight loop or offline. A proxy that dies between two
+passes can still be handed out until the next `refresh` / `check` — treat a failed
+`curl` as "ask for another one", not as a bug.
+
+`refresh` persists incrementally: each subscriber is merged and written to
+`cache.json` as soon as it finishes, so an interrupted refresh keeps what it
+already fetched.
 
 ## REST API
 

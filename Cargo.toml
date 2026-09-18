@@ -1,6 +1,6 @@
 [package]
 name = "proxygate"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Turn any proxy source into a uniform, always-ready proxy pool with a CLI, REST API and HTTP gateway."

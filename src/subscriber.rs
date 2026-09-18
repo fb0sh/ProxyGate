@@ -125,6 +125,19 @@ impl SubscriberSet {
     /// 立刻返回，调用方因此能立刻看到是哪个来源、拿到了多少，而不是等最慢
     /// 的那个（`freeproxy-gh` 要四分钟）一起返回。
     pub async fn fetch_all_reporting(&self, progress: &dyn Progress) -> Vec<FetchOutcome> {
+        self.fetch_all_streaming(progress, |_| {}).await
+    }
+
+    /// 与 [`SubscriberSet::fetch_all_reporting`] 相同，但每个订阅源一完成就
+    /// 调一次 `on_finished`。
+    ///
+    /// 调用方用它做**增量落盘**：一轮全量刷新可能跑四分钟，中途被 Ctrl-C
+    /// 或断电不该把已经拿到的代理全丢掉。
+    pub async fn fetch_all_streaming(
+        &self,
+        progress: &dyn Progress,
+        mut on_finished: impl FnMut(&FetchOutcome),
+    ) -> Vec<FetchOutcome> {
         use futures_util::stream::{FuturesUnordered, StreamExt};
 
         let mut pending = FuturesUnordered::new();
@@ -134,6 +147,7 @@ impl SubscriberSet {
 
         let mut outcomes = Vec::with_capacity(pending.len());
         while let Some(outcome) = pending.next().await {
+            on_finished(&outcome);
             outcomes.push(outcome);
         }
         outcomes

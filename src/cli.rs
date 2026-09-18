@@ -98,9 +98,13 @@ pub struct GetArgs {
     #[arg(long)]
     pub no_refresh: bool,
 
-    /// 不探测代理，直接信任缓存的健康检查结果。
-    #[arg(long)]
+    /// 不探测代理，连"从来没有探测结果"也不管，直接信任缓存。
+    #[arg(long, conflicts_with = "check")]
     pub no_check: bool,
+
+    /// 先对整个代理池重新探测一遍（默认只在没有任何探测结果时才探）。
+    #[arg(long)]
+    pub check: bool,
 
     /// 打印代理时对凭据脱敏。
     #[arg(long)]
@@ -126,9 +130,13 @@ pub struct ListArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// 不探测代理，直接信任缓存的健康检查结果。
-    #[arg(long)]
+    /// 不探测代理，连"从来没有探测结果"也不管，直接信任缓存。
+    #[arg(long, conflicts_with = "check")]
     pub no_check: bool,
+
+    /// 先对整个代理池重新探测一遍（默认只在没有任何探测结果时才探）。
+    #[arg(long)]
+    pub check: bool,
 
     /// 不抓取订阅源，直接使用缓存的代理池。
     #[arg(long)]

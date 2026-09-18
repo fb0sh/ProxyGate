@@ -450,6 +450,31 @@ Supported upstreams: `http://`, `socks5://` (DNS resolved locally) and
 supported yet — they are rejected when the list is loaded rather than
 silently entering the pool as proxies that cannot serve CONNECT.
 
+### Who runs the health check
+
+Probing connects to every proxy (thousands with all built-ins enabled, minutes
+per pass), so it is deliberately **not** something every `get`/`list` does:
+
+| Command | Probing behaviour |
+| --- | --- |
+| `refresh` | only the proxies it just fetched (the others still have a valid verdict) |
+| `check` | the whole pool (`--alive-only` limits it to the currently alive ones) |
+| `get` / `list` | **none by default** — cached verdicts are used; a check happens only when there has never been one (cold start) |
+| `get --check` / `list --check` | force a full re-probe |
+| `get --no-check` / `list --no-check` | never probe, not even on a cold start |
+| `serve` | probes in the background every `health.interval` and feeds both the REST API and the gateway |
+
+The usual split is therefore: `refresh` or `serve` does the physical, `get` and
+`list` just read the results and return in milliseconds. The cost is that a proxy
+that died between two passes can still be handed out until the next `refresh` /
+`check` — normal for free proxies.
+
+`refresh` also persists **as it goes**: every subscriber is merged into the pool
+and written to `cache.json` the moment it finishes instead of waiting for the
+slowest one (`freeproxy-gh` takes four minutes). A Ctrl-C or a power cut keeps
+whatever was already fetched; because the pass never completed, `fetched_at` is
+not updated and the next run fetches again to fill in the rest.
+
 ## How selection works
 
 The rule users actually feel:

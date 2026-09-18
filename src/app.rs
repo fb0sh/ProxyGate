@@ -182,6 +182,12 @@ pub enum Freshness {
     Force,
     /// 无论缓存多旧都直接使用。
     Never,
+    /// 只有完全没有结果时才做实际工作。
+    ///
+    /// 健康检查用它：`get` / `list` 这类"顺手问一句"的命令不该因为上次探测
+    /// 过了 30 秒就对整个代理池重探一遍——几千个代理要几分钟，那就不叫
+    /// `get` 了。探测归 `refresh`、`check` 和 `serve` 的后台循环。
+    IfMissing,
 }
 
 /// 冷启动时对刷新与健康检查各自采用的缓存策略。
@@ -445,14 +451,16 @@ impl App {
             );
         }
 
-        if options.check == Freshness::Force
-            || (options.check == Freshness::IfStale
-                && !self.fresh(
-                    self.checked_at.load(Ordering::SeqCst),
-                    self.config.health.interval,
-                    now,
-                ))
-        {
+        let checked_at = self.checked_at.load(Ordering::SeqCst);
+        let should_check = match options.check {
+            Freshness::Force => true,
+            Freshness::Never => false,
+            Freshness::IfStale => !self.fresh(checked_at, self.config.health.interval, now),
+            // 一次都没探过才算"缺"。`check` 即使池子是空的也会写
+            // `checked_at`，所以空池不会让这里反复探测。
+            Freshness::IfMissing => checked_at == 0,
+        };
+        if should_check {
             let report = self.check(false).await?;
             if report.checked > 0 {
                 info!(report = %report.summary(), "initial health check complete");
@@ -489,47 +497,58 @@ impl App {
             debug!("no subscribers configured; nothing to refresh");
         }
 
-        let outcomes = self
-            .subscribers
-            .fetch_all_reporting(self.progress.as_ref())
-            .await;
-        let all_ok = !outcomes.is_empty() && outcomes.iter().all(|outcome| outcome.ok());
-
-        let mut urls = Vec::new();
+        // 每个订阅源一完成就合并进池子并落盘，而不是等最慢的那个：
+        // `freeproxy-gh` 要四分钟，那期间已经拿到的代理不该只存在内存里。
         let mut fetched = 0;
-        let mut failed = 0;
         let mut rejected = 0;
         let mut truncated = 0;
-        for outcome in &outcomes {
-            if outcome.ok() {
+        let mut added = 0;
+        let mut existing = 0;
+        let mut fresh_ids: HashSet<ProxyId> = HashSet::new();
+
+        let outcomes = self
+            .subscribers
+            .fetch_all_streaming(self.progress.as_ref(), |outcome| {
+                if !outcome.ok() {
+                    // 面向用户的失败报告由进度接收器负责（命令行的
+                    // `✗ 名字 失败：…`、serve 的 LogProgress 警告）。
+                    debug!(
+                        subscriber = %outcome.name,
+                        error = outcome.error.as_deref().unwrap_or("unknown error"),
+                        "subscriber failed"
+                    );
+                    return;
+                }
+
                 fetched += outcome.count();
                 rejected += outcome.rejected.len();
                 truncated += outcome.truncated;
+                for proxy in &outcome.proxies {
+                    fresh_ids.insert(Proxy::id_of(proxy));
+                }
+
+                // 这一批有"有用的东西"就立刻落盘。
+                let merged = self.pool.merge(outcome.proxies.clone());
+                added += merged.added;
+                existing += merged.existing;
+                if merged.added > 0 {
+                    self.save_cache();
+                }
+
                 debug!(
                     subscriber = %outcome.name,
                     found = outcome.count(),
                     rejected = outcome.rejected.len(),
                     skipped = outcome.skipped,
-                    truncated = outcome.truncated,
+                    added = merged.added,
                     elapsed_ms = outcome.duration.as_millis() as u64,
                     "subscriber fetched"
                 );
-            } else {
-                failed += 1;
-                // 只给 `-vv` 看：面向用户的失败报告由进度接收器负责
-                // （命令行的 `✗ 名字 失败：…`、serve 的 LogProgress 警告），
-                // 这里再来一条就重复了。
-                debug!(
-                    subscriber = %outcome.name,
-                    error = outcome.error.as_deref().unwrap_or("unknown error"),
-                    "subscriber failed"
-                );
-            }
-            urls.extend(outcome.proxies.iter().cloned());
-        }
+            })
+            .await;
 
-        let fresh_ids: HashSet<ProxyId> = urls.iter().map(Proxy::id_of).collect();
-        let merged = self.pool.merge(urls);
+        let all_ok = !outcomes.is_empty() && outcomes.iter().all(|outcome| outcome.ok());
+        let failed = outcomes.iter().filter(|outcome| !outcome.ok()).count();
 
         // Only a completely successful refresh may evict proxies: a subscriber
         // that failed could otherwise delete all of its proxies.
@@ -551,8 +570,8 @@ impl App {
             subscribers: outcomes.len(),
             failed,
             fetched,
-            added: merged.added,
-            existing: merged.existing,
+            added,
+            existing,
             removed,
             rejected,
             truncated,
@@ -562,12 +581,28 @@ impl App {
 
     /// 探测全部（或仅存活的）代理，并把结果写回代理池。
     pub async fn check(&self, alive_only: bool) -> Result<CheckReport> {
+        if alive_only {
+            self.check_where(|proxy| proxy.alive).await
+        } else {
+            self.check_where(|_| true).await
+        }
+    }
+
+    /// 只探测还没有任何判定结果的代理——`refresh` 新抓到的那批。
+    ///
+    /// 刷新后再把整个池子重探一遍是浪费：老代理的结果还在有效期内，只有新
+    /// 来的没有判定，而没判定就不能被发放。
+    pub async fn check_pending(&self) -> Result<CheckReport> {
+        self.check_where(|proxy| proxy.last_checked_at.is_none())
+            .await
+    }
+
+    /// 探测满足 `keep` 的代理，并把结果写回代理池。
+    async fn check_where(&self, keep: impl Fn(&Proxy) -> bool) -> Result<CheckReport> {
         let _guard = self.busy.lock().await;
 
         let mut proxies = self.pool.snapshot();
-        if alive_only {
-            proxies.retain(|proxy| proxy.alive);
-        }
+        proxies.retain(|proxy| keep(proxy));
         if proxies.is_empty() {
             debug!("nothing to check");
             return Ok(CheckReport::default());
@@ -856,5 +891,246 @@ pub(crate) async fn health_loop(app: Arc<App>, shutdown: watch::Receiver<bool>) 
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::net::SocketAddr;
+    use std::sync::atomic::AtomicUsize;
+
+    use crate::config::SubscriberConfig;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// 一个假的"上游代理"：只接受连接并立刻关掉，但会数一共接受了几次。
+    ///
+    /// 健康探测无论如何都要先连上游，所以探测次数就等于这里的连接数——比去
+    /// 数探测目标可靠得多（探测目标在单元测试里根本连不到）。
+    async fn counting_proxy() -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        (address, hits)
+    }
+
+    /// 一个慢速 HTTP 服务器：`delay` 之后才回响应体。
+    async fn slow_http_server(body: &'static str, delay: Duration) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    tokio::time::sleep(delay).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        address
+    }
+
+    /// 每个测试一个独立的、干净的缓存目录。
+    ///
+    /// 同一个测试名在多次运行之间会复用路径，所以要先删掉：残留的
+    /// `cache.json` 会让"冷启动"不再冷。
+    fn scratch_config(name: &str) -> Config {
+        let dir = std::env::temp_dir().join(format!("proxygate-app-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut config = Config::default();
+        config.state.dir = Some(dir);
+        config
+    }
+
+    fn file_subscriber(name: &str, path: std::path::PathBuf) -> SubscriberConfig {
+        SubscriberConfig::File {
+            name: name.to_string(),
+            path,
+            format: crate::config::Format::Plaintext,
+            enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn health_is_not_probed_again_once_there_are_results() {
+        let (proxy, hits) = counting_proxy().await;
+
+        let dir =
+            std::env::temp_dir().join(format!("proxygate-app-pending-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let list = dir.join("list.txt");
+        std::fs::write(&list, format!("{proxy}\n")).expect("write list");
+
+        // 每次"命令行调用"都是一个新进程：这里就是新的 App，共用同一个缓存
+        // 目录，所以下一次能从 `cache.json` 里拿到上一次的判定结果。
+        // 目录只清一次——`scratch_config` 会删目录，不能每次调用都建。
+        let mut base = scratch_config("missing");
+        base.subscribers = vec![file_subscriber("local", list.clone())];
+        base.health.target = Some("http://example.test/".to_string());
+        base.health.targets = None;
+        base.health.timeout = Duration::from_millis(500);
+        base.health.concurrency = 1;
+        let config = || base.clone();
+
+        // 1. 冷启动：池子是空的、也没有任何判定结果，所以既抓又探。
+        let first = App::new(config(), None).expect("app");
+        first
+            .initialize(Bootstrap {
+                refresh: Freshness::Force,
+                check: Freshness::IfMissing,
+            })
+            .await
+            .expect("initialize");
+        let after_cold = hits.load(Ordering::SeqCst);
+        assert!(after_cold > 0, "冷启动应该探过一次");
+
+        // 2. 第二次调用（新进程，缓存里有结果）：不该再探整个池子。
+        //    这正是 `get` / `list` 之前的行为——过了 health.interval 就重探
+        //    一遍全池，几千个代理要几分钟。
+        let second = App::new(config(), None).expect("app");
+        second
+            .initialize(Bootstrap {
+                refresh: Freshness::Never,
+                check: Freshness::IfMissing,
+            })
+            .await
+            .expect("initialize");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            after_cold,
+            "有判定结果之后，`get` / `list` 不该重探"
+        );
+
+        // 3. 显式 `--check` / `check`：必须真的重探。
+        let third = App::new(config(), None).expect("app");
+        assert_eq!(
+            third.pool.len(),
+            1,
+            "上一次的代理应该从 cache.json 恢复出来"
+        );
+        third
+            .initialize(Bootstrap {
+                refresh: Freshness::Never,
+                check: Freshness::Force,
+            })
+            .await
+            .expect("initialize");
+        assert!(
+            hits.load(Ordering::SeqCst) > after_cold,
+            "--check 必须真的重探"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_probes_only_the_proxies_it_has_no_verdict_for() {
+        let (proxy, _hits) = counting_proxy().await;
+
+        let mut config = scratch_config("pending");
+        config.health.target = Some("http://example.test/".to_string());
+        config.health.targets = None;
+        config.health.timeout = Duration::from_millis(500);
+        config.health.concurrency = 1;
+        let app = App::new(config, None).expect("app");
+
+        // 一个已经探过（有判定结果），一个还没有。
+        let (known, _) = app
+            .pool
+            .insert(model::normalize(&format!("http://{proxy}")).expect("proxy url"));
+        app.pool.update_health(&[(
+            known.clone(),
+            crate::pool::HealthUpdate {
+                alive: true,
+                latency: Some(Duration::from_millis(10)),
+                checked_at: SystemTime::now(),
+                probes: vec![ProbeOutcome {
+                    target: Arc::from("http://example.test/"),
+                    ok: true,
+                    latency: Some(Duration::from_millis(10)),
+                }],
+            },
+        )]);
+        let _ = app
+            .pool
+            .insert(model::normalize("http://127.0.0.1:9").expect("proxy url"));
+
+        // 只探"没有判定"的那一个：`refresh` 之后补探的就是这些。
+        let report = app.check_pending().await.expect("check_pending");
+        assert_eq!(report.checked, 1, "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn refresh_persists_each_subscriber_as_it_arrives() {
+        let address = slow_http_server("9.9.9.9:9999\n", Duration::from_millis(1200)).await;
+
+        let dir =
+            std::env::temp_dir().join(format!("proxygate-app-incremental-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let list = dir.join("fast.txt");
+        std::fs::write(&list, "1.1.1.1:1111\n").expect("write list");
+
+        let mut config = scratch_config("incremental");
+        config.subscribers = vec![
+            file_subscriber("fast", list),
+            SubscriberConfig::Http {
+                name: "slow".to_string(),
+                url: format!("http://{address}/list.txt"),
+                format: crate::config::Format::Plaintext,
+                headers: BTreeMap::new(),
+                timeout: Some(Duration::from_secs(10)),
+                enabled: true,
+            },
+        ];
+        let cache = config.cache_dir().join("cache.json");
+
+        let app = Arc::new(App::new(config, None).expect("app"));
+        let refreshing = tokio::spawn({
+            let app = app.clone();
+            async move { app.refresh().await }
+        });
+
+        // 快源已经落地了，慢源（1.2 秒）还挂着——这正是"有用的先写盘"。
+        let deadline = Instant::now() + Duration::from_millis(1000);
+        let mut found = false;
+        while Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(&cache) {
+                if text.contains("1.1.1.1:1111") {
+                    found = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(found, "快源拿到的代理应该在慢源完成之前就已经落盘");
+        assert!(
+            !std::fs::read_to_string(&cache)
+                .unwrap_or_default()
+                .contains("9.9.9.9:9999"),
+            "慢源此刻还没完成，不该已经写进去了"
+        );
+
+        let summary = refreshing.await.expect("refresh task").expect("refresh");
+        assert_eq!(summary.added, 2);
+        let text = std::fs::read_to_string(&cache).expect("cache");
+        assert!(text.contains("9.9.9.9:9999"), "{text}");
     }
 }

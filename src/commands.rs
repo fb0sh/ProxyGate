@@ -171,10 +171,15 @@ pub async fn get(
             } else {
                 Freshness::IfStale
             },
+            // 健康探测归 `refresh` / `check` / `serve`：`get` 与 `list` 默认
+            // 直接用缓存里的判定，只有从来没有探测过（冷启动）才探一次。
+            // 想强制重探就加 `--check`。
             check: if args.no_check {
                 Freshness::Never
+            } else if args.check {
+                Freshness::Force
             } else {
-                Freshness::IfStale
+                Freshness::IfMissing
             },
         },
         progress,
@@ -226,10 +231,15 @@ pub async fn list(
             } else {
                 Freshness::IfStale
             },
+            // 健康探测归 `refresh` / `check` / `serve`：`get` 与 `list` 默认
+            // 直接用缓存里的判定，只有从来没有探测过（冷启动）才探一次。
+            // 想强制重探就加 `--check`。
             check: if args.no_check {
                 Freshness::Never
+            } else if args.check {
+                Freshness::Force
             } else {
-                Freshness::IfStale
+                Freshness::IfMissing
             },
         },
         progress,
@@ -357,6 +367,13 @@ pub async fn refresh(
 
     let summary = app.refresh().await?;
 
+    // 新抓到的代理还没有判定结果，而没判定就不能发放；老代理的结果仍在
+    // 有效期里，不必重探，所以这里只探"待判定"的那批。
+    let report = app.check_pending().await?;
+    if report.checked > 0 {
+        info!(report = %report.summary(), "checked the newly fetched proxies");
+    }
+
     if args.json {
         let value = serde_json::json!({
             "subscribers": summary.subscribers,
@@ -368,6 +385,8 @@ pub async fn refresh(
             "rejected": summary.rejected,
             "truncated": summary.truncated,
             "pool_total": app.pool.len(),
+            "checked": report.checked,
+            "alive": report.alive,
             "duration_ms": summary.duration.as_millis() as u64,
         });
         print_stdout(&serde_json::to_string_pretty(&value)?)?;
@@ -375,7 +394,7 @@ pub async fn refresh(
     }
 
     print_stdout(&format!(
-        "subscribers   {} ({} failed)\nfetched       {}\nadded         {}\nexisting      {}\nremoved       {}\nrejected      {}\ntruncated     {}\npool total    {}\nduration      {:.2}s",
+        "subscribers   {} ({} failed)\nfetched       {}\nadded         {}\nexisting      {}\nremoved       {}\nrejected      {}\ntruncated     {}\npool total    {}\nchecked new   {}\nalive         {}\nduration      {:.2}s",
         summary.subscribers,
         summary.failed,
         summary.fetched,
@@ -385,6 +404,8 @@ pub async fn refresh(
         summary.rejected,
         summary.truncated,
         app.pool.len(),
+        report.checked,
+        report.alive,
         summary.duration.as_secs_f64()
     ))?;
 

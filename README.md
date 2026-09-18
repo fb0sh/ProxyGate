@@ -366,7 +366,7 @@ $ curl http://127.0.0.1:8081/api/v1/get
 http://user:pass@1.2.3.4:8080
 
 $ curl -s http://127.0.0.1:8081/api/v1/health
-{"status":"ok","version":"0.2.1","uptime_seconds":42,"generation":3,
+{"status":"ok","version":"0.2.2","uptime_seconds":42,"generation":3,
  "strategy":"random","health_targets":["https://www.google.com/generate_204",
  "https://cn.bing.com/"],"health_require":"any",
  "ready":true,"initializing":false,"initialization_attempts":1,
@@ -419,6 +419,28 @@ REST API、HTTP 网关。
 支持的上游：`http://`、`socks5://`（DNS 本地解析）、`socks5h://`（DNS 交给代理解析）。
 `https://` 上游 **目前不支持**——它在加载列表时就被拒绝，而不是进池之后在 CONNECT 阶段
 才失败。
+
+### 谁负责探测
+
+健康探测要连每一个代理（全开内置来源时几千个，一遍几分钟），所以它**不是**
+每次 `get` / `list` 都会做的事：
+
+| 命令 | 探测行为 |
+| --- | --- |
+| `refresh` | 抓完之后**只探新抓到的**那些代理（老代理的判定还在有效期里） |
+| `check` | 重探整个池（`--alive-only` 只探当前存活的） |
+| `get` / `list` | **默认不探**，直接用缓存里的判定；只有从来没有过任何判定结果（冷启动）才探一次 |
+| `get --check` / `list --check` | 强制重探整个池 |
+| `get --no-check` / `list --no-check` | 连冷启动都不探，完全信任缓存 |
+| `serve` | 后台按 `health.interval` 周期探测，同时给 REST API 与网关提供判定 |
+
+所以典型用法是：`refresh` 或 `serve` 负责"体检"，`get` / `list` 只负责"读结果"，
+毫秒级返回。代价是如果代理在两次探测之间死了，`get` 仍可能把它发出去，直到下一
+次 `refresh` / `check`（这也是免费代理的常态）。
+
+`refresh` 是**边抓边落盘**的：每个订阅源一完成就立刻合并进池并写 `cache.json`，
+不等最慢的那个（`freeproxy-gh` 要四分钟）。中途 Ctrl-C 或断电，已经拿到的代理仍
+然在磁盘上；因为整轮没有跑完，`fetched_at` 不会被更新，所以下次还会重新抓一遍补全。
 
 ## 选择与轮换规则
 
