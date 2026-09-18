@@ -30,6 +30,7 @@ fn file_subscriber(name: &str, path: &Path, format: Format) -> SubscriberConfig 
         name: name.to_string(),
         path: path.to_path_buf(),
         format,
+        limit: None,
         enabled: true,
     }
 }
@@ -172,6 +173,7 @@ async fn http_subscriber_fetches_over_the_network() {
             format: Format::Plaintext,
             headers: BTreeMap::new(),
             timeout: None,
+            limit: None,
             enabled: true,
         }],
         ..Config::default()
@@ -195,6 +197,7 @@ async fn http_subscriber_reports_a_broken_endpoint() {
             format: Format::Plaintext,
             headers: BTreeMap::new(),
             timeout: Some(std::time::Duration::from_secs(2)),
+            limit: None,
             enabled: true,
         }],
         ..Config::default()
@@ -247,6 +250,7 @@ async fn exec_subscriber_handles_a_custom_format() {
             env,
             format: Format::Plaintext,
             timeout: Some(std::time::Duration::from_secs(10)),
+            limit: None,
             enabled: true,
         }],
         ..Config::default()
@@ -287,6 +291,7 @@ async fn exec_subscriber_can_emit_json() {
             env: BTreeMap::new(),
             format: Format::Json,
             timeout: None,
+            limit: None,
             enabled: true,
         }],
         ..Config::default()
@@ -318,12 +323,14 @@ async fn subscribers_are_fetched_concurrently_and_failures_are_isolated() {
                 format: Format::Plaintext,
                 headers: BTreeMap::new(),
                 timeout: Some(std::time::Duration::from_secs(2)),
+                limit: None,
                 enabled: true,
             },
             SubscriberConfig::File {
                 name: "disabled".to_string(),
                 path: dir.join("missing.txt"),
                 format: Format::Plaintext,
+                limit: None,
                 enabled: false,
             },
         ],

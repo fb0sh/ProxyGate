@@ -5,7 +5,7 @@
 //! 没有命令行客户端（`GET /help` 返回本 crate 里的 `SKILL.md`）。
 //!
 //! ```text
-//! Subscribers (http / file / exec)
+//! Subscribers (http / file / exec / lua)
 //!         |
 //!         v
 //!     Normalizer  ->  Pool  ->  Checker
@@ -19,8 +19,11 @@
 //!
 //! 订阅源 → 归一化 → 代理池 → 健康检查 → 选择器 → REST API / 网关
 //!
-//! 设计的重点在于：代理一旦进入代理池，就没有代码再关心它来自哪个订阅源
-//! 或内置来源；后续的检查、选择与分发都只面对这一个统一的代理池。
+//! 设计的重点在于：代理一旦进入代理池，就没有代码再关心它来自哪个订阅源；
+//! 后续的检查、选择与分发都只面对这一个统一的代理池。
+//!
+//! 想接一个「要翻页、要签名、要按字段拼串」的来源，不必改这个 crate：写一段
+//! `lua` 订阅源即可，见 [`subscriber`] 模块文档里的脚本 API 与沙箱说明。
 //!
 //! # 快速开始
 //!
@@ -53,11 +56,10 @@
 //! - [`model`]：代理 URL 的解析、归一化与渲染。
 //! - [`pool`]：进程内的代理池与轮换状态。
 //! - [`progress`]：抓取与探测的进度事件（库只发事件，显示由调用方决定）。
-//! - [`providers`]：内置代理来源清单。
 //! - [`selector`]：选择器，决定从代理池中挑选哪一个代理。
 //! - [`server`]：把网关、REST API 与后台循环跑起来（程序的唯一入口）。
 //! - [`state`]：`state.json` 与缓存文件的落盘。
-//! - [`subscriber`]：订阅源的配置、抓取与结果汇总。
+//! - [`subscriber`]：订阅源的抓取、格式解析，以及 `lua` 脚本沙箱。
 //! - [`useragent`]：内置的 User-Agent 池。
 
 // 文档注释是这个 crate 的正式参考（docs.rs 上展示的就是它），所以公开
@@ -74,7 +76,6 @@ pub mod gateway;
 pub mod model;
 pub mod pool;
 pub mod progress;
-pub mod providers;
 pub mod selector;
 pub mod server;
 pub mod state;
@@ -117,7 +118,8 @@ mod tests {
             "/api/v1/getua",
             "/api/v1/refresh",
             "/api/v1/check",
-            "/api/v1/providers",
+            "type: lua",
+            "lua_code:",
             "--example-config",
             "/help",
             "curl -sf",

@@ -1,27 +1,62 @@
 //! 订阅源：代理从哪里来。
 //!
-//! 只有三种类型：
+//! 只有四种类型：
 //!
 //! * `http` —— 拉取一个 URL（`proxies.txt`、API 或订阅）；
 //! * `file` —— 读取本地文件；
-//! * `exec` —— 运行一条命令并读取其 stdout。
+//! * `exec` —— 运行一条命令并读取其 stdout；
+//! * `lua` —— 运行一段 Lua 脚本，脚本 `print` 出来的每一行就是一条代理。
 //!
-//! 无论载荷长什么样，订阅源唯一的职责就是产出代理 URL。内置解析器覆盖
-//! `plaintext`、`json` 和 `clash` 三种格式；其余格式都该交给 `exec` 脚本，
-//! 这让本模块（乃至整个核心）保持小巧。
+//! 无论载荷长什么样，订阅源唯一的职责就是产出代理 URL。`plaintext`、
+//! `json` 和 `clash` 三种格式由内置解析器覆盖；剩下的（要签名、要翻页、
+//! 要按字段拼串的 API）都交给 `lua`——它既能发请求又能写逻辑，而且不用
+//! 为了一个来源去改 ProxyGate 本身。真正需要外部程序的时候才用 `exec`。
+//!
+//! # Lua 脚本
+//!
+//! ```yaml
+//! subscribers:
+//!   - name: my_scraper
+//!     type: lua
+//!     target_url: https://api.example.com/data.json   # 额外键 -> 全局变量
+//!     limit: 500
+//!     lua_code: |
+//!       for page = 1, 10 do
+//!         local data = fetch_json(target_url .. "?page=" .. page)
+//!         for _, item in ipairs(data.proxies or {}) do
+//!           print(item.ip .. ":" .. item.port)
+//!         end
+//!       end
+//! ```
+//!
+//! 脚本里可用的全局变量与函数：
+//!
+//! | 名称 | 说明 |
+//! | --- | --- |
+//! | 配置里的额外键 | 原样变成全局变量（`target_url`、`token`……），数字、布尔、字符串和表都支持 |
+//! | `print(...)` | 每个参数用 tab 连接输出一行；**这些行就是候选代理** |
+//! | `fetch(url)` | 同步发一次 GET，返回响应体字符串；非 2xx 会抛错 |
+//! | `fetch_json(url)` | 同上，但把响应体解析成 Lua 表 |
+//! | `json_encode(v)` / `json_decode(s)` | Lua 值与 JSON 字符串互转 |
+//! | `log(...)` | 以 `info` 级别写进 ProxyGate 日志，不影响输出 |
+//!
+//! 这是一个**沙箱**：不加载 `io`、`os`、`package`、`debug`，`dofile`、
+//! `loadfile`、`load`、`require` 也都被摘掉了，脚本只能通过 `fetch` 接触
+//! 外部世界。整段脚本受订阅源的 `timeout`（缺省用 `refresh.timeout`）限制，
+//! 连 `while true do end` 这种死循环也会被指令钩子掐断。
+//!
+//! 输出有上限：最多收集 100,000 行，`print` 的单个参数超过 4 KiB 会被截断
+//! （末尾加省略号）。超过行数上限的部分会被丢弃，不会让进程吃掉所有内存。
 //!
 //! 注意：`exec` 会以 ProxyGate 进程的权限运行配置文件里的命令。这是一条
 //! 有意留出的逃生通道——请把 `config.yaml` 当作可信输入。
-//!
-//! 分页来源（目录里声明了页数的内置来源）在这里表现为**多条订阅源**：
-//! [`crate::config::Config::normalize`] 已经把 `{page}` 展开成具体页码，
-//! 所以本模块不需要知道分页的存在，每一页都是一次普通的 HTTP 拉取，各自
-//! 计数、各自失败。
 
 use std::collections::BTreeMap;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib, Value as LuaValue, Variadic};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value as JsonValue;
 use tokio::process::Command;
@@ -227,26 +262,10 @@ impl SubscriberSet {
 
         // Keep the cap last, so it applies to usable proxies rather than to
         // whatever the source happened to list first.
-        outcome.truncated = apply_limit(&mut outcome.proxies, self.limit_for(subscriber));
+        outcome.truncated = apply_limit(&mut outcome.proxies, effective_limit(subscriber));
 
         outcome.duration = started.elapsed();
         outcome
-    }
-
-    /// 每个来源的生效条数上限：配置值优先，`0` 表示不限，
-    /// 否则采用目录自带的上限。
-    fn limit_for(&self, subscriber: &SubscriberConfig) -> Option<usize> {
-        let SubscriberConfig::Builtin {
-            provider, limit, ..
-        } = subscriber
-        else {
-            return None;
-        };
-        match limit {
-            Some(0) => None,
-            Some(explicit) => Some(*explicit),
-            None => crate::providers::find(provider).and_then(|entry| entry.limit),
-        }
     }
 
     /// 按订阅源类型读取响应体。
@@ -265,30 +284,36 @@ impl SubscriberSet {
                 self.fetch_http(subscriber, url, headers, *timeout, progress)
                     .await
             }
-            // A builtin is an HTTP subscriber whose endpoint and format come
-            // from the catalog, so it takes the same path.
-            SubscriberConfig::Builtin {
-                provider,
-                url,
+            SubscriberConfig::Lua {
+                lua_code,
+                lua_file,
+                params,
                 timeout,
                 ..
             } => {
-                let entry = crate::providers::find(provider).ok_or_else(|| Error::Subscriber {
-                    name: subscriber.name().to_string(),
-                    message: format!(
-                        "unknown builtin provider `{provider}` (available: {})",
-                        crate::providers::names().join(", ")
-                    ),
-                })?;
-                let url = url.as_deref().unwrap_or(entry.url);
-                // The catalog may know this endpoint needs longer than the
-                // global `refresh.timeout`; an explicit config value wins.
-                self.fetch_http(
+                let code = match (lua_code.as_deref(), lua_file.as_deref()) {
+                    (Some(code), _) => code.to_string(),
+                    (None, Some(path)) => {
+                        tokio::fs::read_to_string(path)
+                            .await
+                            .map_err(|e| Error::Subscriber {
+                                name: subscriber.name().to_string(),
+                                message: format!("cannot read {}: {e}", path.display()),
+                            })?
+                    }
+                    (None, None) => {
+                        return Err(Error::Subscriber {
+                            name: subscriber.name().to_string(),
+                            message: "needs `lua_code` or `lua_file`".into(),
+                        });
+                    }
+                };
+                run_lua(
                     subscriber,
-                    url,
-                    &BTreeMap::new(),
-                    timeout.or(entry.timeout),
-                    progress,
+                    params,
+                    &code,
+                    timeout.unwrap_or(self.timeout),
+                    &self.client,
                 )
                 .await
             }
@@ -431,20 +456,233 @@ async fn run_command(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// 每个来源的生效条数上限：配置值优先，`0` 表示不限，
-/// 否则采用目录自带的上限。只有 `builtin` 条目才有上限。
-pub fn effective_limit(subscriber: &SubscriberConfig) -> Option<usize> {
-    let SubscriberConfig::Builtin {
-        provider, limit, ..
-    } = subscriber
-    else {
-        return None;
+/// Lua 沙箱里每执行这么多条 VM 指令调一次钩子，用来检查脚本是否超时。
+///
+/// 只有钩子能掐断 `while true do end`：`tokio::time::timeout` 需要脚本先
+/// 让出执行权，而纯计算的死循环永远不会让出。
+const LUA_HOOK_INTERVAL: u32 = 10_000;
+
+/// `print` 最多收集多少行，防止脚本把内存写爆。
+const LUA_MAX_LINES: usize = 100_000;
+
+/// `print` 的单个参数最长保留多少字节，超出部分截断。
+const LUA_MAX_ARG: usize = 4 * 1024;
+
+/// 运行一段 Lua 订阅源脚本，返回它 `print` 出来的全部内容（换行连接）。
+///
+/// 脚本可用的全局变量与函数见本模块的文档。这里是**一次性**沙箱：每次刷新
+/// 都新建一个 Lua 状态，脚本之间不共享任何东西——一个来源的脚本改坏了全
+/// 局变量，不会影响另一个来源。
+async fn run_lua(
+    subscriber: &SubscriberConfig,
+    params: &BTreeMap<String, serde_yaml::Value>,
+    code: &str,
+    timeout: Duration,
+    client: &reqwest::Client,
+) -> Result<String> {
+    let name = subscriber.name().to_string();
+    let fail = |message: String| Error::Subscriber {
+        name: name.clone(),
+        message,
     };
-    match limit {
-        Some(0) => None,
-        Some(explicit) => Some(*explicit),
-        None => crate::providers::find(provider).and_then(|entry| entry.limit),
+
+    // 不加载 `io`、`os`、`package`、`debug`：脚本的唯一出口是 `fetch`。
+    // 注意 base 库没有开关，所以下面还要把 `dofile` 之类逐个摘掉。
+    let lua = Lua::new_with(
+        StdLib::STRING | StdLib::TABLE | StdLib::MATH | StdLib::COROUTINE,
+        LuaOptions::default(),
+    )
+    .map_err(|e| fail(format!("cannot start a Lua state: {e}")))?;
+
+    for (key, value) in params {
+        // `key:` with nothing after it means "no value", i.e. leave the global
+        // unset rather than handing the script a null sentinel.
+        if value.is_null() {
+            continue;
+        }
+        let json = serde_json::to_value(value)
+            .map_err(|e| fail(format!("cannot pass `{key}` to Lua: {e}")))?;
+        let value = lua
+            .to_value(&json)
+            .map_err(|e| fail(format!("cannot pass `{key}` to Lua: {e}")))?;
+        lua.globals()
+            .set(key.as_str(), value)
+            .map_err(|e| fail(format!("cannot set `{key}` in Lua: {e}")))?;
     }
+
+    // base 库里会读写文件或再加载代码的函数一律摘掉。
+    for forbidden in ["dofile", "loadfile", "load", "require"] {
+        lua.globals()
+            .set(forbidden, LuaValue::Nil)
+            .map_err(|e| fail(format!("cannot harden the Lua sandbox: {e}")))?;
+    }
+
+    // `print` 是唯一的输出通道：每次调用收集一行。
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&lines);
+    let print = lua
+        .create_function(move |_, args: Variadic<LuaValue>| {
+            let mut parts = Vec::with_capacity(args.len());
+            for arg in args {
+                parts.push(truncate_text(arg.to_string()?, LUA_MAX_ARG));
+            }
+            let mut sink = sink.lock().unwrap_or_else(|e| e.into_inner());
+            if sink.len() < LUA_MAX_LINES {
+                sink.push(parts.join("\t"));
+            }
+            Ok(())
+        })
+        .map_err(|e| fail(format!("cannot define `print` for Lua: {e}")))?;
+    lua.globals()
+        .set("print", print)
+        .map_err(|e| fail(format!("cannot define `print` for Lua: {e}")))?;
+
+    // `fetch` / `fetch_json`：脚本访问外部世界的唯一方式，共用订阅源的
+    // HTTP 客户端（同一份 UA、连接池与 TLS 配置）。
+    let fetch_client = client.clone();
+    let fetch = lua
+        .create_async_function(move |_, url: String| {
+            let client = fetch_client.clone();
+            async move {
+                http_get(&client, &url, timeout)
+                    .await
+                    .map_err(mlua::Error::runtime)
+            }
+        })
+        .map_err(|e| fail(format!("cannot define `fetch` for Lua: {e}")))?;
+    lua.globals()
+        .set("fetch", fetch)
+        .map_err(|e| fail(format!("cannot define `fetch` for Lua: {e}")))?;
+
+    let fetch_json_client = client.clone();
+    let fetch_json = lua
+        .create_async_function(move |lua, url: String| {
+            let client = fetch_json_client.clone();
+            async move {
+                let body = http_get(&client, &url, timeout)
+                    .await
+                    .map_err(mlua::Error::runtime)?;
+                let value: JsonValue = serde_json::from_str(&body).map_err(|e| {
+                    mlua::Error::runtime(format!("`{url}` did not return JSON: {e}"))
+                })?;
+                lua.to_value(&value)
+            }
+        })
+        .map_err(|e| fail(format!("cannot define `fetch_json` for Lua: {e}")))?;
+    lua.globals()
+        .set("fetch_json", fetch_json)
+        .map_err(|e| fail(format!("cannot define `fetch_json` for Lua: {e}")))?;
+
+    let encode = lua
+        .create_function(|lua, value: LuaValue| {
+            let json: JsonValue = lua.from_value(value)?;
+            serde_json::to_string(&json).map_err(mlua::Error::runtime)
+        })
+        .map_err(|e| fail(format!("cannot define `json_encode` for Lua: {e}")))?;
+    lua.globals()
+        .set("json_encode", encode)
+        .map_err(|e| fail(format!("cannot define `json_encode` for Lua: {e}")))?;
+
+    let decode = lua
+        .create_function(|lua, text: String| {
+            let json: JsonValue = serde_json::from_str(&text).map_err(mlua::Error::runtime)?;
+            lua.to_value(&json)
+        })
+        .map_err(|e| fail(format!("cannot define `json_decode` for Lua: {e}")))?;
+    lua.globals()
+        .set("json_decode", decode)
+        .map_err(|e| fail(format!("cannot define `json_decode` for Lua: {e}")))?;
+
+    let log_name = name.clone();
+    let log = lua
+        .create_function(move |_, args: Variadic<LuaValue>| {
+            let mut parts = Vec::with_capacity(args.len());
+            for arg in args {
+                parts.push(truncate_text(arg.to_string()?, LUA_MAX_ARG));
+            }
+            tracing::info!(subscriber = %log_name, "{}", parts.join(" "));
+            Ok(())
+        })
+        .map_err(|e| fail(format!("cannot define `log` for Lua: {e}")))?;
+    lua.globals()
+        .set("log", log)
+        .map_err(|e| fail(format!("cannot define `log` for Lua: {e}")))?;
+
+    // 指令钩子：纯计算的死循环只有它能掐断。
+    //
+    // 必须用 `set_global_hook`：`exec_async` 会把脚本放进一条新协程执行，
+    // 而 `set_hook` 只管当前线程。
+    let deadline = Instant::now() + timeout;
+    let expired = format!("script timed out after {timeout:?}");
+    let hook_expired = expired.clone();
+    lua.set_global_hook(
+        mlua::HookTriggers::new().every_nth_instruction(LUA_HOOK_INTERVAL),
+        move |_, _| {
+            if Instant::now() >= deadline {
+                Err(mlua::Error::runtime(hook_expired.clone()))
+            } else {
+                Ok(mlua::VmState::Continue)
+            }
+        },
+    )
+    .map_err(|e| fail(format!("cannot arm the Lua watchdog: {e}")))?;
+
+    let chunk = lua.load(code).set_name(format!("subscriber `{name}`"));
+    match tokio::time::timeout(timeout, chunk.exec_async()).await {
+        Err(_) => Err(fail(expired)),
+        Ok(Err(error)) => {
+            if Instant::now() >= deadline {
+                Err(fail(expired))
+            } else {
+                Err(fail(format!("Lua error: {error}")))
+            }
+        }
+        Ok(Ok(())) => {
+            let lines = lines.lock().unwrap_or_else(|e| e.into_inner());
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
+/// 一次同步 GET（对 Lua 而言是同步的），返回响应体文本。
+async fn http_get(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+) -> std::result::Result<String, String> {
+    let response = client
+        .get(url)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| format!("{url}: {}", crate::error::describe_reqwest_error(&e)))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("{url}: HTTP {status}"));
+    }
+    response
+        .text()
+        .await
+        .map_err(|e| format!("{url}: {}", crate::error::describe_reqwest_error(&e)))
+}
+
+/// 截断一段文本到 `max` 字节，按字符边界切，末尾加省略号。
+fn truncate_text(text: String, max: usize) -> String {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = text[..end].to_string();
+    truncated.push('…');
+    truncated
+}
+
+/// 来源的生效条数上限，见 [`SubscriberConfig::limit`]。
+pub fn effective_limit(subscriber: &SubscriberConfig) -> Option<usize> {
+    subscriber.limit()
 }
 
 /// 把代理列表截断到 `limit`，并返回被丢弃的条数。
@@ -845,43 +1083,32 @@ mod tests {
     }
 
     #[test]
-    fn limits_are_resolved_from_config_then_catalog() {
+    fn limits_come_from_the_lua_subscriber_config() {
         use crate::config::SubscriberConfig;
 
-        let builtin = |limit| SubscriberConfig::Builtin {
+        let lua = |limit| SubscriberConfig::Lua {
             name: "x".into(),
-            provider: "freeproxy-gh".into(),
-            url: None,
-            format: None,
+            lua_code: Some("print('1.1.1.1:8080')".into()),
+            lua_file: None,
+            format: Format::Plaintext,
             timeout: None,
             limit,
             enabled: true,
+            params: Default::default(),
         };
 
-        // No config value: the catalog's cap applies.
-        assert_eq!(effective_limit(&builtin(None)), Some(1000));
-        // A config value wins.
-        assert_eq!(effective_limit(&builtin(Some(25))), Some(25));
-        // `0` means "no cap".
-        assert_eq!(effective_limit(&builtin(Some(0))), None);
+        // 只有脚本声明了 `limit` 才有上限。
+        assert_eq!(effective_limit(&lua(None)), None);
+        assert_eq!(effective_limit(&lua(Some(25))), Some(25));
+        // `0` 表示不限。
+        assert_eq!(effective_limit(&lua(Some(0))), None);
 
-        // A provider without a catalog cap stays uncapped.
-        let uncapped = SubscriberConfig::Builtin {
-            name: "x".into(),
-            provider: "scdn".into(),
-            url: None,
-            format: None,
-            timeout: None,
-            limit: None,
-            enabled: true,
-        };
-        assert_eq!(effective_limit(&uncapped), None);
-
-        // Other kinds never have a cap.
+        // 其他种类没有 `limit` 字段，永远不限。
         let file = SubscriberConfig::File {
             name: "f".into(),
             path: "x".into(),
             format: Format::Plaintext,
+            limit: None,
             enabled: true,
         };
         assert_eq!(effective_limit(&file), None);
@@ -963,6 +1190,7 @@ proxies:
                 name: "local".into(),
                 path: path.clone(),
                 format: Format::Plaintext,
+                limit: None,
                 enabled: true,
             }],
             ..Config::default()
@@ -1016,6 +1244,7 @@ proxies:
                     name: "good".into(),
                     path: good,
                     format: Format::Plaintext,
+                    limit: None,
                     enabled: true,
                 },
                 SubscriberConfig::Exec {
@@ -1024,6 +1253,7 @@ proxies:
                     env: BTreeMap::new(),
                     format: Format::Plaintext,
                     timeout: None,
+                    limit: None,
                     enabled: true,
                 },
             ],
@@ -1065,6 +1295,7 @@ proxies:
                 env: BTreeMap::new(),
                 format: Format::Plaintext,
                 timeout: None,
+                limit: None,
                 enabled: true,
             }],
             ..Config::default()
@@ -1085,6 +1316,7 @@ proxies:
                     env: BTreeMap::new(),
                     format: Format::Plaintext,
                     timeout: None,
+                    limit: None,
                     enabled: true,
                 },
                 SubscriberConfig::Exec {
@@ -1093,6 +1325,7 @@ proxies:
                     env: BTreeMap::new(),
                     format: Format::Plaintext,
                     timeout: None,
+                    limit: None,
                     enabled: true,
                 },
             ],
@@ -1113,6 +1346,7 @@ proxies:
                 env: BTreeMap::new(),
                 format: Format::Plaintext,
                 timeout: None,
+                limit: None,
                 enabled: false,
             }],
             ..Config::default()
@@ -1120,5 +1354,248 @@ proxies:
         let set = SubscriberSet::new(&config).unwrap();
         assert!(set.is_empty());
         assert!(set.fetch_all().await.is_empty());
+    }
+
+    /// 构造一个 `lua` 订阅源，超时给 5 秒，参数留空。
+    fn lua_subscriber(code: &str) -> SubscriberConfig {
+        SubscriberConfig::Lua {
+            name: "lua".into(),
+            lua_code: Some(code.into()),
+            lua_file: None,
+            format: Format::Plaintext,
+            timeout: Some(Duration::from_secs(5)),
+            limit: None,
+            enabled: true,
+            params: BTreeMap::new(),
+        }
+    }
+
+    /// 用一个只含该订阅源的配置跑一次拉取。
+    async fn run_one(subscriber: SubscriberConfig) -> FetchOutcome {
+        let config = Config {
+            subscribers: vec![subscriber],
+            ..Config::default()
+        };
+        let mut outcomes = SubscriberSet::new(&config).unwrap().fetch_all().await;
+        outcomes.remove(0)
+    }
+
+    /// 把归一化后的代理渲染成规范的 `scheme://host:port` 形式，便于比较。
+    fn rendered(outcome: &FetchOutcome) -> Vec<String> {
+        outcome
+            .proxies
+            .iter()
+            .map(|proxy| model::render_url(proxy, true))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn lua_prints_become_proxies() {
+        let outcome = run_one(lua_subscriber(
+            r#"
+            for i = 1, 3 do
+              print("10.0.0." .. i .. ":8080")
+            end
+            print("socks5://1.2.3.4:1080")
+            "#,
+        ))
+        .await;
+
+        assert!(outcome.ok(), "{:?}", outcome.error);
+        assert_eq!(outcome.kind, "lua");
+        assert_eq!(
+            rendered(&outcome),
+            vec![
+                "http://10.0.0.1:8080".to_string(),
+                "http://10.0.0.2:8080".to_string(),
+                "http://10.0.0.3:8080".to_string(),
+                "socks5://1.2.3.4:1080".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn lua_output_is_parsed_with_the_configured_format() {
+        let mut subscriber =
+            lua_subscriber(r#"print('{"data":{"proxies":["10.1.1.1:8080","10.1.1.2:8080"]}}')"#);
+        if let SubscriberConfig::Lua { format, .. } = &mut subscriber {
+            *format = Format::Json;
+        }
+        let outcome = run_one(subscriber).await;
+        assert!(outcome.ok(), "{:?}", outcome.error);
+        assert_eq!(outcome.count(), 2);
+    }
+
+    /// 直接运行一段脚本，返回它 `print` 出来的原始内容。
+    ///
+    /// 需要看清脚本到底输出了什么（而不是它被归一化成哪些代理）时用它。
+    async fn lua_payload(code: &str, params: &[(&str, serde_yaml::Value)]) -> String {
+        let subscriber = lua_subscriber(code);
+        let SubscriberConfig::Lua { timeout, .. } = &subscriber else {
+            unreachable!("`lua_subscriber` builds a Lua subscriber");
+        };
+        let mut merged: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
+        for (key, value) in params {
+            merged.insert((*key).to_string(), value.clone());
+        }
+        run_lua(
+            &subscriber,
+            &merged,
+            code,
+            timeout.unwrap(),
+            &reqwest::Client::new(),
+        )
+        .await
+        .expect("the script should run")
+    }
+
+    #[tokio::test]
+    async fn lua_sees_extra_config_keys_as_globals() {
+        // 额外键变成全局变量：字符串、数字、以及整个表都能用。
+        let payload = lua_payload(
+            r#"
+            print(target_url)
+            print(host .. ":" .. tostring(port))
+            print("flag=" .. tostring(deep.flag))
+            "#,
+            &[
+                ("target_url", serde_yaml::Value::from("hello")),
+                ("host", serde_yaml::Value::from("10.1.2.3")),
+                (
+                    "port",
+                    serde_yaml::Value::Number(serde_yaml::Number::from(8080)),
+                ),
+                ("deep", serde_yaml::from_str("flag: true").unwrap()),
+            ],
+        )
+        .await;
+
+        assert_eq!(payload, "hello\n10.1.2.3:8080\nflag=true");
+    }
+
+    #[tokio::test]
+    async fn the_lua_sandbox_has_no_file_or_process_access() {
+        let payload = lua_payload(
+            r#"
+            local missing = 0
+            local names = {"io", "os", "package", "debug", "dofile", "loadfile", "load", "require"}
+            for _, name in ipairs(names) do
+              if _G[name] == nil then missing = missing + 1 end
+            end
+            print("missing=" .. missing)
+            "#,
+            &[],
+        )
+        .await;
+
+        assert_eq!(payload, "missing=8");
+    }
+
+    #[tokio::test]
+    async fn lua_can_fetch_json_from_an_endpoint() {
+        let app = axum::Router::new().route(
+            "/list",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "data": {"proxies": ["10.9.8.7:3128", "10.9.8.6:3128"]}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let outcome = run_one(lua_subscriber(&format!(
+            r#"
+            local data = fetch_json("http://{address}/list")
+            for _, item in ipairs(data.data.proxies) do
+              print(item)
+            end
+            print("encoded=" .. json_encode({{1, 2}}))
+            "#,
+        )))
+        .await;
+        server.abort();
+
+        assert!(outcome.ok(), "{:?}", outcome.error);
+        assert_eq!(
+            rendered(&outcome),
+            vec![
+                "http://10.9.8.7:3128".to_string(),
+                "http://10.9.8.6:3128".to_string()
+            ]
+        );
+        // 非代理行被拒绝，错误信息里带上原始那一行。
+        assert_eq!(outcome.rejected.len(), 1);
+        assert!(
+            outcome.rejected[0].contains("encoded=[1,2]"),
+            "{}",
+            outcome.rejected[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn lua_errors_are_reported_not_fatal() {
+        let outcome = run_one(lua_subscriber("error('boom')")).await;
+        assert!(!outcome.ok());
+        let error = outcome.error.unwrap();
+        assert!(error.contains("boom"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_fetch_surfaces_as_a_subscriber_error() {
+        // 端口 1 上没有任何东西在监听：脚本该失败，异常要带上 URL。
+        let outcome = run_one(lua_subscriber(r#"print(fetch("http://127.0.0.1:1/nope"))"#)).await;
+        assert!(!outcome.ok());
+        let error = outcome.error.unwrap();
+        assert!(error.contains("127.0.0.1:1"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_runaway_lua_script_is_stopped() {
+        let mut subscriber = lua_subscriber("while true do end");
+        if let SubscriberConfig::Lua { timeout, .. } = &mut subscriber {
+            *timeout = Some(Duration::from_millis(300));
+        }
+
+        let started = Instant::now();
+        let outcome = run_one(subscriber).await;
+        let error = outcome.error.expect("a runaway script must fail");
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the watchdog took {:?} to fire",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lua_limit_truncates_the_output() {
+        let mut subscriber =
+            lua_subscriber("for i = 1, 10 do print('10.0.0.' .. i .. ':8080') end");
+        if let SubscriberConfig::Lua { limit, .. } = &mut subscriber {
+            *limit = Some(3);
+        }
+        let outcome = run_one(subscriber).await;
+        assert!(outcome.ok(), "{:?}", outcome.error);
+        assert_eq!(outcome.count(), 3);
+        assert_eq!(outcome.truncated, 7);
+    }
+
+    #[tokio::test]
+    async fn lua_output_is_collected_line_by_line() {
+        // 一行的各个参数用 tab 连接；超长参数按字符边界截断后加省略号；
+        // `print()` 打印空行。
+        let long = "x".repeat(LUA_MAX_ARG * 2);
+        let payload = lua_payload(&format!("print('a', 'b')\nprint('{long}')\nprint()"), &[]).await;
+
+        let lines: Vec<&str> = payload.split('\n').collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "a\tb");
+        assert_eq!(lines[1].chars().count(), LUA_MAX_ARG + 1);
+        assert!(lines[1].ends_with('…'), "the long line should be elided");
+        assert_eq!(lines[2], "");
     }
 }

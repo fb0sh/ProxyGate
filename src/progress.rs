@@ -18,9 +18,9 @@ use crate::subscriber::FetchOutcome;
 pub enum FetchEvent<'a> {
     /// 开始拉取一个订阅源。
     Started {
-        /// 订阅源名称（内置来源是目录里的 id，分页来源带 `#页码`）。
+        /// 订阅源名称，与配置里写的 `name` 一致。
         name: &'a str,
-        /// 订阅源类型：`http`、`file`、`exec` 或 `builtin`。
+        /// 订阅源类型：`http`、`file`、`exec` 或 `lua`。
         kind: &'static str,
         /// 这次拉取使用的解析格式。
         format: Format,

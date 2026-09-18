@@ -79,7 +79,6 @@ curl -x "$(curl -sf http://127.0.0.1:8081/api/v1/get)" \
 | `GET /api/v1/getua?format=json` | `{"user_agent":"Mozilla/5.0 ..."}` |
 | `GET /api/v1/proxies` | the pool as JSON, credentials masked as `***:***` |
 | `GET /api/v1/health` | `{"status":"ok","ready":true,"proxies":{"total":2,"alive":2,"dead":0}, ...}` |
-| `GET /api/v1/providers` | the built-in source catalog, as JSON |
 | `POST /api/v1/refresh` | `202` — fetch every subscriber now |
 | `POST /api/v1/check` | `202` — probe the whole pool now |
 
@@ -107,9 +106,10 @@ that matter most:
 ```yaml
 subscribers:                 # where proxies come from
   - name: provider
-    type: http               # http | file | exec | builtin
+    type: http               # http | file | exec | lua
     url: https://example.com/proxies.txt
     format: plaintext        # plaintext | json | clash
+    limit: 200               # keep at most this many (0 = no cap)
 
 health:
   targets:                   # each is fetched *through* the proxy
@@ -134,17 +134,59 @@ server:
   api: 127.0.0.1:8081        # the REST API; `same` shares the proxy port
 ```
 
-- `builtin-subscribers: enabled` subscribes to every source in the catalog that
-  ProxyGate ships (`GET /api/v1/providers` lists them, with endpoints, formats,
-  page ranges and caveats); `genconfig` writes `enabled`, and the switch defaults
-  to `disabled` so nothing reaches the network unless a config says so.
 - Proxies already handed out in the current round are skipped; when every
   healthy proxy has been used the round resets immediately.
-- `type: exec` runs a command and reads proxy URLs from its stdout — the escape
-  hatch for any format the built-in parsers do not understand. It runs with the
-  same privileges as the server, so treat the config file as trusted input.
+- `type: lua` runs a Lua script; every line it `print`s is a candidate proxy,
+  parsed with `format`. It is the way to scrape an API that needs paging, a
+  signature, or field reshaping: `proxygate --example-config` ships a working
+  ten-page scraper. `exec` remains the escape hatch for running an external
+  program.
+- `type: exec` runs a command and reads proxy URLs from its stdout. It runs with
+  the same privileges as the server, so treat the config file as trusted input.
 - `https://` upstream proxies are not supported; they are rejected when a list is
   loaded.
+
+### Writing a Lua subscriber
+
+```yaml
+subscribers:
+  - name: my_scraper
+    type: lua
+    target_url: https://api.example.com/data.json   # extra keys -> globals
+    limit: 500
+    timeout: 30s
+    lua_code: |
+      local page = 1
+      while true do
+        local data = fetch_json(target_url .. "?page=" .. page)
+        for _, item in ipairs(data.items or {}) do
+          print(item.ip .. ":" .. item.port)
+        end
+        if not data.next or page >= 10 then break end
+        page = page + 1
+      end
+```
+
+Every key that is not a ProxyGate key (`name`/`script_name`, `lua_code`,
+`lua_file`, `format`, `timeout`, `limit`, `enabled`, `type`) becomes a global in
+the script, which is how a script gets its parameters. Available inside the
+script:
+
+| name | meaning |
+| ---- | ------- |
+| `print(...)` | one output line per call, arguments joined by a tab; **these lines are the payload** |
+| `fetch(url)` | one GET, returns the body as a string; raises on a non-2xx status |
+| `fetch_json(url)` | same, but decodes the body into a Lua table |
+| `json_encode(v)` / `json_decode(s)` | Lua value <-> JSON string |
+| `log(...)` | writes to ProxyGate's log at `info`; does not affect the output |
+
+The script is sandboxed: `io`, `os`, `package` and `debug` are not loaded, and
+`dofile`, `loadfile`, `load` and `require` are removed. The only way out is
+`fetch`. Output is capped at 100,000 lines, and a single `print` argument is
+truncated past 4 KiB. `timeout` (or `refresh.timeout`) bounds the whole script, including
+`while true do end`. Each refresh builds a fresh Lua state, so scripts cannot
+see each other. `limit` caps how many usable proxies the source contributes
+after parsing, not how many lines it may print.
 
 ## Gateway mode
 
@@ -163,9 +205,9 @@ itself stays open, so only do that on a trusted interface.
 
 ## Things to know before trusting the output
 
-* **Free proxy lists are mostly dead.** In a full live run of the four built-in
-  sources, 5,361 entries were fetched and 66 of the 5,157 pooled proxies passed
-  the health check. Always request a new one for a new task instead of caching it.
+* **Free proxy lists are mostly dead.** In a measured full run of the four
+  sources in the example config, 5,361 entries were fetched and 66 of the 5,157
+  pooled proxies passed the health check. Always request a new one for a new task instead of caching it.
 * **Hand-out verification is a snapshot.** A proxy can die seconds after it was
   verified, and it was verified against *ProxyGate's* targets (Google and
   `cn.bing.com` by default), not against the site you are about to fetch. With

@@ -9,7 +9,6 @@
 //! GET  /api/v1/getua          一个内置 User-Agent（纯文本，或 ?format=json）
 //! GET  /api/v1/proxies        整个代理池，凭据已脱敏
 //! GET  /api/v1/health         存活状态、就绪状态与代理池计数
-//! GET  /api/v1/providers      内置代理来源清单
 //! POST /api/v1/refresh        让后台立刻抓取一轮订阅源
 //! POST /api/v1/check          让后台立刻探测一轮代理池
 //! ```
@@ -75,7 +74,6 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/getua", get(get_user_agent))
         .route("/api/v1/proxies", get(list_proxies))
         .route("/api/v1/health", get(health))
-        .route("/api/v1/providers", get(list_providers))
         .route("/api/v1/refresh", post(trigger_refresh))
         .route("/api/v1/check", post(trigger_check))
         .with_state(state)
@@ -398,45 +396,6 @@ async fn help() -> Response {
         .into_response()
 }
 
-/// `/api/v1/providers` 的一个条目。
-#[derive(Debug, Serialize)]
-struct ProviderEntry {
-    /// 目录里的 id，配置里用 `provider:` 引用它。
-    name: &'static str,
-    /// 端点（分页来源带 `{page}` 占位符）。
-    url: &'static str,
-    /// 响应内容的解析格式。
-    format: &'static str,
-    /// 分页范围，如 `1-10`；不分页时是 `-`。
-    pages: String,
-    /// 页数。
-    page_count: u32,
-    /// 每个来源最多保留多少条（`null` 表示不限）。
-    limit: Option<usize>,
-    /// 文档或落地页。
-    homepage: &'static str,
-    /// 使用注意事项。
-    notes: &'static str,
-}
-
-/// `GET /api/v1/providers` —— 内置代理来源清单。
-async fn list_providers() -> Json<Vec<ProviderEntry>> {
-    let providers = crate::providers::ALL
-        .iter()
-        .map(|provider| ProviderEntry {
-            name: provider.name,
-            url: provider.url,
-            format: provider.format.as_str(),
-            pages: provider.pages_label(),
-            page_count: provider.page_count(),
-            limit: provider.limit,
-            homepage: provider.homepage,
-            notes: provider.notes,
-        })
-        .collect();
-    Json(providers)
-}
-
 /// 触发类端点的响应体。
 #[derive(Debug, Serialize)]
 struct TriggerResponse {
@@ -495,7 +454,6 @@ async fn index() -> Json<serde_json::Value> {
             "getua_json": "/api/v1/getua?format=json",
             "proxies": "/api/v1/proxies",
             "health": "/api/v1/health",
-            "providers": "/api/v1/providers",
             "refresh": "POST /api/v1/refresh",
             "check": "POST /api/v1/check",
         },
@@ -885,29 +843,6 @@ mod tests {
         let body = body_string(response).await;
         assert!(body.starts_with("---\n"), "frontmatter missing");
         assert!(body.contains("/api/v1/get"), "endpoints missing");
-    }
-
-    #[tokio::test]
-    async fn the_provider_catalog_is_downloadable() {
-        let response = router(initializing_state())
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/providers")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let providers: serde_json::Value =
-            serde_json::from_str(&body_string(response).await).unwrap();
-        let rola = providers
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|entry| entry["name"] == "rola-ip")
-            .expect("rola-ip is in the catalog");
-        assert_eq!(rola["pages"], "1-10");
-        assert_eq!(rola["page_count"], 10);
     }
 
     #[tokio::test]

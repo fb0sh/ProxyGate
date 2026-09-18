@@ -148,12 +148,13 @@ proxy really has international connectivity, and `cn.bing.com` proves the tunnel
 is not broken for everything else. By default `require: any` accepts a proxy
 that reaches either one; the `TARGETS` column tells you which.
 
-> **Enabling every built-in grows the pool a lot.** A cold start of all 13
-> subscribers (rola-ip's 10 pages plus three others) fetches ~5,200 proxies, and
-> one health pass over them takes minutes (5,157 checked in ~3.5 minutes with 66
-> alive, measured). With the default `health.interval` of 30s the checker is then
-> busy almost continuously — raise it to `10m`, or cap a source with `limit`, if
-> you want it to rest.
+> **The example config grows the pool a lot.** A cold start of its four
+> subscribers fetches 5,000+ proxies (measured: `scdn` 20, `freeproxy-cn` 117,
+> `rola-ip` 4,439 in ~28s — its ten pages are now one loop inside the script, and
+> `freeproxy-gh` capped at 1000 by `limit`), and one health pass over them takes
+> minutes (5,157 checked in ~3.5 minutes with 66 alive, measured). With the default `health.interval` of
+> 30s the checker is then busy almost continuously — raise it to `10m`, or cap a
+> source with `limit`, if you want it to rest.
 
 ### Sharing one port with the API
 
@@ -186,49 +187,18 @@ separable while debugging.
 
 ### Subscribers
 
-Four kinds: `builtin` (a curated source), `http`, `file`, and the `exec` escape
-hatch.
-
-`builtin` refers to the catalog maintained in the code. One switch subscribes to
-all of it:
-
-```yaml
-builtin-subscribers: enabled      # subscribe to every catalog entry
-# disabled                        # use only the subscribers you write
-```
-
-`GET /api/v1/providers` lists the whole catalog (endpoint, format, caveats, docs)
-and takes `--json`. The switch defaults to `disabled` — nothing reaches the
-network unless a config says so — and the example config enables it.
-
-A single source can also be picked by name and tuned. A builtin is an HTTP fetch
-underneath, so it takes the same overrides plus `limit`:
+Four kinds: `http`, `file`, `exec`, and `lua`. The first three only carry a
+payload around; `lua` writes down what to fetch, how to page through it and how
+to turn it into proxy URLs:
 
 ```yaml
 subscribers:
-  - name: scdn-cn
-    type: builtin
-    provider: scdn
-    url: https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20&country_code=CN
-    format: json      # defaults to the catalog format
-    timeout: 20s      # the catalog can give a source a longer one
-    limit: 200        # keep at most this many usable proxies (0 = no cap)
-```
-
-`limit` exists because the health checker probes every proxy it is given: 16,000
-of them is a twelve minute pass at the default concurrency. The catalog caps the
-one huge source at 1000, taking entries in the order returned (big lists are
-ordered fastest-first).
-
-The other three kinds, for everything else:
-
-```yaml
-subscribers:
-  - name: provider-a
+  - name: scdn
     type: http
-    url: https://example.com/proxies.txt
-    format: plaintext        # plaintext (default) | json | clash
+    url: https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20
+    format: json             # plaintext (default) | json | clash
     timeout: 20s
+    limit: 200               # keep at most this many usable proxies (0 = no cap)
     headers:
       Authorization: Bearer <token>
 
@@ -242,16 +212,73 @@ subscribers:
     command: [python3, ./subscribers/example.py, --url, https://example.com/weird-api]
     env:
       API_TOKEN: "..."
+
+  - name: rola-ip
+    type: lua
+    url: https://rola-ip.co/proxy-api/api/v1/proxies   # not a ProxyGate key -> script global
+    page_size: 500
+    timeout: 60s
+    lua_code: |
+      local page, pages = 1, 1
+      repeat
+        local body = fetch_json(url .. "?page=" .. page .. "&pageSize=" .. page_size)
+        pages = (body.pagination and body.pagination.totalPages) or 1
+        for _, item in ipairs(body.data or {}) do
+          local scheme = nil
+          for _, protocol in ipairs(item.protocols or {}) do
+            local name = string.lower(protocol)
+            if name == "http" or name == "https" then
+              scheme = "http"
+              break
+            elseif name == "socks5" then
+              scheme = "socks5h"
+            end
+          end
+          if scheme then
+            print(scheme .. "://" .. item.ip .. ":" .. item.port)
+          end
+        end
+        page = page + 1
+      until page > pages
 ```
 
-A subscriber only has to produce proxy URLs — one per line on stdout for `exec`.
-The built-in parsers cover plaintext lists, JSON APIs (arrays, bare
-`host:port` strings, objects with `ip`/`host`/`server` + `port` + credentials,
-and arbitrarily nested envelopes such as
+`limit` exists because the health checker probes every proxy it is given: 16,000
+of them is a twelve minute pass at the default concurrency. The example config
+caps the one huge source (a 2.5 MB GitHub list) at 1000, taking entries in the
+order returned (big lists are ordered fastest-first).
+
+A subscriber only has to produce proxy URLs — one per line on stdout for `exec`
+and one per `print` for `lua`. The built-in parsers cover plaintext lists, JSON
+APIs (arrays, bare `host:port` strings, objects with `ip`/`host`/`server` +
+`port` + credentials, and arbitrarily nested envelopes such as
 `{"code":200,"data":{"proxies":["1.2.3.4:8080"]}}`) and Clash/Clash.Meta
 `proxies:` lists. Anything else belongs in a script; see
 [`subscribers/README.md`](subscribers/README.md) and
 [`subscribers/example.py`](subscribers/example.py).
+
+#### Writing a Lua subscriber
+
+Every key ProxyGate does not recognise (`name`/`script_name`, `lua_code`,
+`lua_file`, `format`, `timeout`, `limit`, `enabled`, `type`) becomes a global in
+the script — that is how a script gets its parameters. What the script can use:
+
+| Name | Meaning |
+| ---- | ------- |
+| `print(...)` | one output line per call, arguments joined by a tab; **these lines are the payload**, parsed with `format` |
+| `fetch(url)` | one GET, returns the body as a string; raises on a non-2xx status |
+| `fetch_json(url)` | same, but decodes the body into a Lua table |
+| `json_encode(v)` / `json_decode(s)` | Lua value <-> JSON string |
+| `log(...)` | writes to ProxyGate's log at `info`; does not affect the output |
+
+The script runs in a **sandbox**: `io`, `os`, `package` and `debug` are not
+loaded, and `dofile`, `loadfile`, `load` and `require` are removed, so `fetch` is
+the only way out. `timeout` (or `refresh.timeout`) bounds the whole script,
+including `while true do end`. Every refresh builds a fresh Lua state, so scripts
+cannot see each other. `lua_code` and `lua_file` are mutually exclusive.
+
+This replaced the built-in source catalog and its `builtin` kind: paging,
+signing and field reshaping were always a script's job, and keeping them in the
+config means adding a source no longer needs a ProxyGate release.
 
 Protocol fields in payloads are understood in the shapes lists actually use:
 `protocol` as a string, `protocols` as an array, and joined strings like
@@ -273,12 +300,13 @@ user:pass@1.2.3.4:3128       socks5h://user:pass@[2001:db8::1]:1080
 1.2.3.4:8080                 # scheme and port get sensible defaults
 ```
 
-The first catalog entry is
+The first source in the example config is
 [proxy.scdn.io](https://proxy.scdn.io/api_docs.php): it answers with a JSON
 envelope holding bare `host:port` entries, which the `json` format reads
 directly. Since the payload carries no scheme, such entries are treated as HTTP
-proxies — ask for `protocol=http`, and use an `exec` wrapper if you want its
-`socks4`/`socks5` endpoints.
+proxies — ask for `protocol=http`, or switch the entry to `type: lua` and
+`print("socks5h://" .. item)` if you want its `socks4`/`socks5` endpoints (the
+`rola-ip` script above does exactly that).
 
 Two things to expect from free lists like that one, both of which the health
 check is designed to surface: most entries are simply dead, and a fair share of
@@ -296,7 +324,7 @@ There is no stdout contract to protect, so progress and results go to the
 $ proxygate
 INFO proxygate is listening proxy=127.0.0.1:8080 api=127.0.0.1:8081 shared_port=false ...
 INFO API documentation help=http://127.0.0.1:8081/help
-INFO fetching subscriber subscriber=scdn kind=builtin format=json
+INFO fetching subscriber subscriber=scdn kind=http format=json
 INFO subscriber fetched subscriber=scdn found=20 rejected=0 skipped=0 elapsed_ms=2423
 INFO still downloading subscriber=freeproxy-gh kilobytes=1300 elapsed_ms=130000
 INFO proxygate is ready proxies=5157 alive=66
@@ -317,7 +345,6 @@ from the log.
 | `GET /api/v1/getua`             | one random user agent as `text/plain`                         |
 | `GET /api/v1/getua?format=json` | `{"user_agent": "Mozilla/5.0 ..."}`                          |
 | `GET /api/v1/proxies`           | the pool as JSON, credentials masked                         |
-| `GET /api/v1/providers`         | the built-in source catalog as JSON                          |
 | `POST /api/v1/refresh`          | `202` — fetch every subscriber now                           |
 | `POST /api/v1/check`            | `202` — probe the whole pool now                             |
 | `GET /help`                     | this project's manual (`SKILL.md`), as `text/markdown`       |
@@ -554,6 +581,7 @@ binaries:
 | `tests/pool.rs`            | dedupe, usage persistence, health thresholds, state round trip |
 | `tests/selector.rs`        | the rotation contract, reuse window, restart behaviour         |
 | `tests/subscriber.rs`      | file/http/exec, the three formats, failure isolation           |
+| `tests/lua_subscriber.rs`  | Lua: print output, parameter globals, fetch_json, sandbox      |
 | `tests/gateway.rs`         | CONNECT, plain HTTP, auth, retries, SOCKS5 and SOCKS5 auth     |
 
 ## Project layout
@@ -573,8 +601,7 @@ src/
   progress.rs    progress events for fetching, probing and verification
   config.rs      config.yaml model, defaults, validation
   model.rs       Proxy, stable ids, URL normalization, small codecs
-  subscriber.rs  builtin/http/file/exec subscribers and the built-in parsers
-  providers.rs   the built-in source catalog (`GET /api/v1/providers`)
+  subscriber.rs  http/file/exec/lua subscribers, the parsers, the Lua sandbox
   pool.rs        the pool: merge, health updates, selection (rounds)
   checker.rs     health checker + shared upstream client cache
   selector.rs    candidate filtering and the random/latency strategies
@@ -620,14 +647,15 @@ Deviations from the v0.1 design notes, each for a reason found while building it
   broken for everything else.
 * `https://` upstream proxies are rejected when a list is loaded rather than
   accepted and then failing at CONNECT time.
-* A fourth subscriber kind, `builtin`, plus a `builtin-subscribers` switch, point
-  at the curated catalog so endpoints, formats and rate-limit notes live in one
-  place; it is still just an HTTP fetch underneath.
+* A fourth subscriber kind, `lua`: the design doc only listed http/file/exec, but
+  free-pool APIs routinely need paging or per-field string building, and a Lua
+  script in the config is easier to maintain than a Rust branch per source. It
+  runs in a sandbox whose only exit is `fetch`.
 * Payload protocol fields are normalized per the table above. `socks5` becoming
   `socks5h` is deliberate: with poisoned local DNS, resolving on the client side
   hands the proxy a bogus address.
-* A source can carry a default `limit`, because pulling tens of thousands of
-  proxies makes the health loop unable to keep up with its own interval.
+* Every source can carry a `limit`, because pulling tens of thousands of proxies
+  makes the health loop unable to keep up with its own interval (0 = no cap).
 * Doc comments are written in Chinese (the project's primary audience), so
   docs.rs is readable in Chinese only; this README stays bilingual.
 

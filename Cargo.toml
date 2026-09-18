@@ -1,15 +1,15 @@
 [package]
 name = "proxygate"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Turn any proxy source into a uniform, always-ready proxy pool with a CLI, REST API and HTTP gateway."
+description = "Turn any proxy source into a uniform, always-ready proxy pool behind a REST API and an HTTP gateway, with Lua subscribers for custom scraping."
 license = "MIT"
 readme = "README.md"
 documentation = "https://docs.rs/proxygate"
 homepage = "https://github.com/fb0sh/ProxyGate"
 repository = "https://github.com/fb0sh/ProxyGate"
-keywords = ["proxy", "socks5", "http-proxy", "gateway"]
+keywords = ["proxy", "socks5", "http-proxy", "gateway", "lua"]
 categories = ["command-line-utilities", "network-programming"]
 
 # The API docs are the crate's reference and are written in Chinese; docs.rs
@@ -53,6 +53,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 rand = "0.10"
+# subscribers 用 Lua 写：vendored 自带 Lua 源码（不要求系统装 Lua），
+# async 让脚本里能直接 fetch_json(url) 而不用写 await，send 让 Lua 状态
+# 能待在 tokio 任务里，serialize 用于 JSON <-> Lua 表。
+mlua = { version = "0.12", features = [
+    "lua54",
+    "vendored",
+    "async",
+    "send",
+    "serialize",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

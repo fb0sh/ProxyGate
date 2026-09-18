@@ -13,7 +13,7 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 
 /// 带注释的示例配置，在编译期嵌入，因此已安装的二进制即使旁边没有
-/// 代码检出目录，`proxygate genconfig` 也能正常工作。
+/// 代码检出目录，`proxygate --example-config` 也能打印出来。
 pub const EXAMPLE_CONFIG: &str = include_str!("../config.example.yaml");
 
 /// 指向配置文件的环境变量。
@@ -24,15 +24,10 @@ pub const CACHE_DIR_ENV: &str = "PROXYGATE_CACHE_DIR";
 /// ProxyGate 的完整配置，对应 `config.yaml` 的顶层。
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Config {
-    /// 在 `subscribers` 列出的来源之外，是否额外订阅内置目录
-    /// （[`crate::providers`]）中的每一项。
-    /// `proxygate genconfig` 会写入 `enabled`。
-    #[serde(rename = "builtin-subscribers", default)]
-    pub builtin_subscribers: BuiltinSubscribers,
     /// `server` 段，配置 HTTP 代理网关与 REST API 的监听地址。
     #[serde(default)]
     pub server: ServerConfig,
-    /// `subscribers` 段，列出全部订阅源（http、file、builtin、exec）。
+    /// `subscribers` 段，列出全部订阅源（lua、http、file、exec）。
     #[serde(default)]
     pub subscribers: Vec<SubscriberConfig>,
     /// `refresh` 段，控制订阅源拉取的间隔与超时。
@@ -315,6 +310,12 @@ pub enum SubscriberConfig {
         /// 该订阅源的拉取超时，缺省时使用 `refresh.timeout`。
         #[serde(default, deserialize_with = "de::opt_duration")]
         timeout: Option<Duration>,
+        /// 最多保留多少个可用代理（`0` 表示全部保留），默认不限。
+        ///
+        /// 健康检查必须探测拿到的每一条，所以在默认并发下大型列表要跑很久；
+        /// 这个上限让池子的规模可控。
+        #[serde(default)]
+        limit: Option<usize>,
         /// 是否启用该订阅源，默认 `true`。
         #[serde(default = "default_true")]
         enabled: bool,
@@ -329,40 +330,58 @@ pub enum SubscriberConfig {
         /// 文件内容的解析格式，默认 `plaintext`。
         #[serde(default)]
         format: Format,
-        /// 是否启用该订阅源，默认 `true`。
-        #[serde(default = "default_true")]
-        enabled: bool,
-    },
-    /// [`crate::providers`] 中精选的来源之一，按名称引用。
-    ///
-    /// 功能上等同于一个 HTTP 订阅源，只是端点来自内置目录，并支持
-    /// 可选的逐项覆盖。
-    Builtin {
-        /// 订阅源名称，缺省时自动命名（如 `builtin-1`）。
-        #[serde(default)]
-        name: String,
-        /// 内置目录中的 id，例如 `scdn`。可用 `GET /api/v1/providers` 查看。
-        provider: String,
-        /// 覆盖目录中的端点（例如修改其查询参数）。
-        #[serde(default)]
-        url: Option<String>,
-        /// 覆盖目录中的响应内容格式。
-        #[serde(default)]
-        format: Option<Format>,
-        /// 拉取超时，缺省时依次回退到内置目录自身的超时与
-        /// `refresh.timeout`。
-        #[serde(default, deserialize_with = "de::opt_duration")]
-        timeout: Option<Duration>,
-        /// 最多保留多少个可用代理（0 表示全部保留）。默认沿用内置
-        /// 目录自身的上限（如果有）。
+        /// 最多保留多少个可用代理（`0` 表示全部保留），默认不限。
         ///
-        /// 分页来源会展开成每页一条订阅源，这个上限因此是**按页**生效的：
-        /// `rola-ip` 加 `limit: 200` 表示每页最多 200 条。
+        /// 健康检查必须探测拿到的每一条，所以在默认并发下大型列表要跑很久；
+        /// 这个上限让池子的规模可控。
         #[serde(default)]
         limit: Option<usize>,
         /// 是否启用该订阅源，默认 `true`。
         #[serde(default = "default_true")]
         enabled: bool,
+    },
+    /// 一段 Lua 脚本（`type: lua`）：脚本自己决定去哪里、怎么拿、输出什么。
+    ///
+    /// ```yaml
+    /// subscribers:
+    ///   - name: my_scraper
+    ///     type: lua
+    ///     target_url: https://api.example.com/data.json   # 额外键 -> 脚本全局变量
+    ///     lua_code: |
+    ///       local data = fetch_json(target_url)
+    ///       for _, item in ipairs(data.items) do
+    ///         print(item.ip .. ":" .. item.port)
+    ///       end
+    /// ```
+    ///
+    /// 脚本能用的东西见 [`crate::subscriber`]：`fetch` / `fetch_json`、
+    /// `json_encode` / `json_decode`、`log`，以及 `print`——**print 的每一行
+    /// 就是一条候选代理**，再按 `format` 解析（默认 `plaintext`）。
+    Lua {
+        /// 订阅源名称，缺省时自动命名（如 `lua-1`）。`script_name` 也认。
+        #[serde(default, alias = "script_name")]
+        name: String,
+        /// 内联的 Lua 代码。与 `lua_file` 二选一。
+        #[serde(default)]
+        lua_code: Option<String>,
+        /// 一个 `.lua` 文件的路径。与 `lua_code` 二选一。
+        #[serde(default)]
+        lua_file: Option<PathBuf>,
+        /// `print` 出来的内容按哪种格式解析，默认 `plaintext`。
+        #[serde(default)]
+        format: Format,
+        /// 单次请求的超时；整段脚本也用它作为墙钟上限。
+        #[serde(default, deserialize_with = "de::opt_duration")]
+        timeout: Option<Duration>,
+        /// 最多保留多少个可用代理（`0` 表示全部保留），默认不限。
+        #[serde(default)]
+        limit: Option<usize>,
+        /// 是否启用该订阅源，默认 `true`。
+        #[serde(default = "default_true")]
+        enabled: bool,
+        /// 其余所有键都会成为脚本里的全局变量（数字、布尔、字符串、表）。
+        #[serde(flatten)]
+        params: BTreeMap<String, serde_yaml::Value>,
     },
     /// 运行外部命令，并从其 stdout 读取代理 URL。
     ///
@@ -383,6 +402,12 @@ pub enum SubscriberConfig {
         /// 命令执行的超时，缺省时使用 `refresh.timeout`。
         #[serde(default, deserialize_with = "de::opt_duration")]
         timeout: Option<Duration>,
+        /// 最多保留多少个可用代理（`0` 表示全部保留），默认不限。
+        ///
+        /// 健康检查必须探测拿到的每一条，所以在默认并发下大型列表要跑很久；
+        /// 这个上限让池子的规模可控。
+        #[serde(default)]
+        limit: Option<usize>,
         /// 是否启用该订阅源，默认 `true`。
         #[serde(default = "default_true")]
         enabled: bool,
@@ -394,17 +419,17 @@ impl SubscriberConfig {
     pub fn name(&self) -> &str {
         match self {
             SubscriberConfig::Http { name, .. }
-            | SubscriberConfig::Builtin { name, .. }
+            | SubscriberConfig::Lua { name, .. }
             | SubscriberConfig::File { name, .. }
             | SubscriberConfig::Exec { name, .. } => name,
         }
     }
 
-    /// 订阅源的种类字符串：`http`、`builtin`、`file` 或 `exec`。
+    /// 订阅源的种类字符串：`lua`、`http`、`file` 或 `exec`。
     pub fn kind(&self) -> &'static str {
         match self {
             SubscriberConfig::Http { .. } => "http",
-            SubscriberConfig::Builtin { .. } => "builtin",
+            SubscriberConfig::Lua { .. } => "lua",
             SubscriberConfig::File { .. } => "file",
             SubscriberConfig::Exec { .. } => "exec",
         }
@@ -414,28 +439,35 @@ impl SubscriberConfig {
     pub fn enabled(&self) -> bool {
         match self {
             SubscriberConfig::Http { enabled, .. }
-            | SubscriberConfig::Builtin { enabled, .. }
+            | SubscriberConfig::Lua { enabled, .. }
             | SubscriberConfig::File { enabled, .. }
             | SubscriberConfig::Exec { enabled, .. } => *enabled,
         }
     }
 
-    /// 响应内容的解析格式，尚未经过内置目录解析。
+    /// 响应内容的解析格式。
     ///
-    /// `builtin` 条目可以继承内置来源的格式，在这里表现为 `Plaintext`；
-    /// 实际生效的值见 `SubscriberSet`。
+    /// `lua` 条目解析的是脚本 `print` 出来的内容，默认 `plaintext`。
     pub fn format(&self) -> Format {
         match self {
             SubscriberConfig::Http { format, .. }
             | SubscriberConfig::File { format, .. }
-            | SubscriberConfig::Exec { format, .. } => *format,
-            SubscriberConfig::Builtin {
-                provider, format, ..
-            } => format.unwrap_or_else(|| {
-                crate::providers::find(provider)
-                    .map(|found| found.format)
-                    .unwrap_or_default()
-            }),
+            | SubscriberConfig::Exec { format, .. }
+            | SubscriberConfig::Lua { format, .. } => *format,
+        }
+    }
+
+    /// 生效的条数上限：`0` 表示不限，未设置时也不限。
+    pub fn limit(&self) -> Option<usize> {
+        let limit = match self {
+            SubscriberConfig::Http { limit, .. }
+            | SubscriberConfig::Lua { limit, .. }
+            | SubscriberConfig::File { limit, .. }
+            | SubscriberConfig::Exec { limit, .. } => *limit,
+        };
+        match limit {
+            Some(0) | None => None,
+            Some(explicit) => Some(explicit),
         }
     }
 
@@ -443,19 +475,11 @@ impl SubscriberConfig {
     fn set_name(&mut self, name: String) {
         match self {
             SubscriberConfig::Http { name: n, .. }
-            | SubscriberConfig::Builtin { name: n, .. }
+            | SubscriberConfig::Lua { name: n, .. }
             | SubscriberConfig::File { name: n, .. }
             | SubscriberConfig::Exec { name: n, .. } => *n = name,
         }
     }
-}
-
-/// 分页来源展开后，每一页对应的订阅源名称。
-///
-/// 例如 `rola-ip` 的第 3 页叫 `rola-ip#3`。名字里带页码，一次 refresh
-/// 的输出就能直接指出是哪一页失败或变空。
-pub fn paged_name(base: &str, page: u32) -> String {
-    format!("{base}#{page}")
 }
 
 /// 订阅源响应内容如何转换为代理 URL。
@@ -497,33 +521,6 @@ impl std::str::FromStr for Format {
                 "unknown subscriber format `{other}` (expected one of plaintext, json, clash)"
             ))),
         }
-    }
-}
-
-/// `builtin-subscribers` 开关。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BuiltinSubscribers {
-    /// 加入内置目录中每一项尚未按名称列出的来源。
-    Enabled,
-    /// 只使用配置文件中写出的订阅源。
-    #[default]
-    Disabled,
-}
-
-impl BuiltinSubscribers {
-    /// 开关的小写名称，与 YAML 中使用的值一致。
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            BuiltinSubscribers::Enabled => "enabled",
-            BuiltinSubscribers::Disabled => "disabled",
-        }
-    }
-}
-
-impl std::fmt::Display for BuiltinSubscribers {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -642,40 +639,6 @@ impl Config {
             }
         }
 
-        // `builtin-subscribers: enabled` 会把内置目录展开成普通的 builtin
-        // 订阅源，这样配置可以只是一行，而端点集中在一处。已经列出的
-        // 内置来源（按名称或按 `provider:`）保持不变；手写订阅源已经占用
-        // 的名称也保持不变，而不是因重名而失败。
-        if self.builtin_subscribers == BuiltinSubscribers::Enabled {
-            for provider in crate::providers::ALL {
-                let already = self.subscribers.iter().any(|subscriber| {
-                    subscriber.name() == provider.name
-                        || matches!(
-                            subscriber,
-                            SubscriberConfig::Builtin { provider: id, .. } if id == provider.name
-                        )
-                });
-                if already {
-                    continue;
-                }
-                self.subscribers.push(SubscriberConfig::Builtin {
-                    name: provider.name.to_string(),
-                    provider: provider.name.to_string(),
-                    url: None,
-                    format: None,
-                    timeout: None,
-                    limit: None,
-                    enabled: true,
-                });
-            }
-        }
-
-        // 分页端点（如 rola-ip 的 10 页）在这里展开成每页一条订阅源：每页
-        // 独立拉取、独立计数、独立失败，一次 refresh 因此能指出是哪
-        // 一页出了问题。展开时把页码写进 `url`，展开后的条目不再含占位符，
-        // 所以再调用一次 `normalize` 也不会重复展开。
-        self.expand_paged_builtins();
-
         let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
         for subscriber in &self.subscribers {
             *seen.entry(subscriber.name()).or_default() += 1;
@@ -688,69 +651,6 @@ impl Config {
 
         self.validate()?;
         Ok(())
-    }
-
-    /// 把带分页占位符的内置来源展开成每页一条订阅源。
-    ///
-    /// 手写的 `url` 覆盖优先于目录里的端点；只要生效的 URL 里有
-    /// [`crate::providers::PAGE_PLACEHOLDER`]，就按目录声明的页码范围展开。
-    /// 不属于内置来源、或没有声明分页的条目原样保留。
-    fn expand_paged_builtins(&mut self) {
-        use crate::providers::{self, PAGE_PLACEHOLDER};
-
-        let subscribers = std::mem::take(&mut self.subscribers);
-        let mut expanded: Vec<SubscriberConfig> = Vec::with_capacity(subscribers.len());
-
-        for subscriber in subscribers {
-            let SubscriberConfig::Builtin {
-                name,
-                provider,
-                url,
-                format,
-                timeout,
-                limit,
-                enabled,
-            } = subscriber
-            else {
-                expanded.push(subscriber);
-                continue;
-            };
-
-            // 生效的端点：手写覆盖优先，否则用目录里的。
-            let template = url.clone().unwrap_or_else(|| {
-                providers::find(&provider)
-                    .map(|entry| entry.url.to_string())
-                    .unwrap_or_default()
-            });
-            let pages = providers::find(&provider).and_then(|entry| entry.pages.clone());
-
-            let (Some(pages), true) = (pages, template.contains(PAGE_PLACEHOLDER)) else {
-                expanded.push(SubscriberConfig::Builtin {
-                    name,
-                    provider,
-                    url,
-                    format,
-                    timeout,
-                    limit,
-                    enabled,
-                });
-                continue;
-            };
-
-            for page in pages {
-                expanded.push(SubscriberConfig::Builtin {
-                    name: paged_name(&name, page),
-                    provider: provider.clone(),
-                    url: Some(template.replace(PAGE_PLACEHOLDER, &page.to_string())),
-                    format,
-                    timeout,
-                    limit,
-                    enabled,
-                });
-            }
-        }
-
-        self.subscribers = expanded;
     }
 
     /// 校验各字段的取值范围与地址格式。
@@ -855,15 +755,37 @@ impl Config {
                         )));
                     }
                 }
-                SubscriberConfig::Builtin { provider, .. } => {
-                    if crate::providers::find(provider).is_none() {
+                SubscriberConfig::Lua {
+                    lua_code, lua_file, ..
+                } => match (lua_code.as_deref(), lua_file.as_deref()) {
+                    (Some(code), None) if code.trim().is_empty() => {
                         return Err(Error::Config(format!(
-                            "subscriber `{}` asks for unknown builtin provider `{provider}` (available: {})",
-                            subscriber.name(),
-                            crate::providers::names().join(", ")
+                            "subscriber `{}` has an empty `lua_code`",
+                            subscriber.name()
                         )));
                     }
-                }
+                    (None, Some(path)) if path.as_os_str().is_empty() => {
+                        return Err(Error::Config(format!(
+                            "subscriber `{}` has an empty `lua_file`",
+                            subscriber.name()
+                        )));
+                    }
+                    // 两个都给：`lua_code` 胜出（YAML 里同时写多半是复制粘贴），
+                    // 但这是配置错误，直接说清楚。
+                    (Some(_), Some(_)) => {
+                        return Err(Error::Config(format!(
+                            "subscriber `{}` sets both `lua_code` and `lua_file`; pick one",
+                            subscriber.name()
+                        )));
+                    }
+                    (None, None) => {
+                        return Err(Error::Config(format!(
+                            "subscriber `{}` needs `lua_code` or `lua_file`",
+                            subscriber.name()
+                        )));
+                    }
+                    _ => {}
+                },
                 SubscriberConfig::Exec { command, .. } => {
                     if command.is_empty() || command[0].trim().is_empty() {
                         return Err(Error::Config(format!(
@@ -1267,8 +1189,8 @@ health:
 
     #[test]
     fn the_shipped_example_config_is_valid() {
-        // `config.example.yaml` 会被嵌入并由 `proxygate genconfig` 打印，
-        // 因此它必须始终能解析并通过校验。
+        // `config.example.yaml` 会被嵌入并由 `proxygate --example-config`
+        // 打印，因此它必须始终能解析并通过校验。
         let mut config: Config =
             serde_yaml::from_str(EXAMPLE_CONFIG).expect("config.example.yaml must parse");
         config
@@ -1284,11 +1206,13 @@ health:
             2,
             "the example shows both probes"
         );
-        assert!(EXAMPLE_CONFIG.contains("genconfig") || EXAMPLE_CONFIG.contains("subscribers"));
+        // 示例里必须真的出现一段脚本，否则「怎么用 lua 订阅源」就没地方看。
+        assert!(EXAMPLE_CONFIG.contains("type: lua"));
+        assert!(EXAMPLE_CONFIG.contains("lua_code: |"));
 
-        // 生成的配置不得向客户端索取凭据：它应当可以直接使用在回环地址上，
-        // 而网关认证属于命令行的决定（`--auth`），不应写进签入仓库的文件。
-        // 在这里重新加回一行 `auth:` 会让该测试失败。
+        // 示例配置不得向客户端索取凭据：它应当可以直接用在回环地址上，而
+        // 网关认证是部署时的决定，不该写进签入仓库的文件。在这里重新加回
+        // 一行 `auth:` 会让该测试失败。
         assert!(
             config.gateway.auth.is_none(),
             "config.example.yaml must not configure gateway.auth"
@@ -1299,187 +1223,6 @@ health:
                 "config.example.yaml must not carry an auth directive: {line}"
             );
         }
-    }
-
-    #[test]
-    fn the_example_config_enables_every_builtin_provider() {
-        let mut config: Config = serde_yaml::from_str(EXAMPLE_CONFIG).unwrap();
-        config.normalize().unwrap();
-
-        let mut enabled: Vec<&str> = config
-            .subscribers
-            .iter()
-            .filter(|subscriber| subscriber.enabled())
-            .map(|subscriber| match subscriber {
-                SubscriberConfig::Builtin { provider, .. } => provider.as_str(),
-                other => panic!(
-                    "the shipped example should only enable builtins, found `{}` ({})",
-                    other.name(),
-                    other.kind()
-                ),
-            })
-            .collect();
-
-        // 分页来源会被展开成多页，所以按 provider 去重后再比。
-        enabled.sort_unstable();
-        enabled.dedup();
-        let mut expected: Vec<&str> = crate::providers::names();
-        expected.sort_unstable();
-        assert_eq!(
-            enabled, expected,
-            "config.example.yaml and the provider catalog must list the same sources"
-        );
-
-        // 展开出的订阅源集合要和 `builtin-subscribers: enabled` 完全一致。
-        let names: Vec<String> = config
-            .subscribers
-            .iter()
-            .map(|subscriber| subscriber.name().to_string())
-            .collect();
-        assert_eq!(names, expanded_catalog_names());
-    }
-
-    #[test]
-    fn a_builtin_subscriber_resolves_through_the_catalog() {
-        let mut config: Config = serde_yaml::from_str(
-            r#"
-subscribers:
-  - name: mine
-    type: builtin
-    provider: scdn
-"#,
-        )
-        .unwrap();
-        config.normalize().unwrap();
-
-        let subscriber = &config.subscribers[0];
-        assert_eq!(subscriber.kind(), "builtin");
-        assert_eq!(
-            subscriber.name(),
-            "mine",
-            "the config name is not the provider id"
-        );
-        assert_eq!(
-            subscriber.format(),
-            crate::providers::find("scdn").unwrap().format,
-            "a builtin inherits the catalog format"
-        );
-
-        // 显式给出的格式优先于内置目录。
-        let mut config: Config = serde_yaml::from_str(
-            "subscribers:\n  - type: builtin\n    provider: scdn\n    format: plaintext\n",
-        )
-        .unwrap();
-        config.normalize().unwrap();
-        assert_eq!(config.subscribers[0].format(), Format::Plaintext);
-        assert_eq!(
-            config.subscribers[0].name(),
-            "builtin-1",
-            "unnamed subscribers still get a name"
-        );
-    }
-
-    #[test]
-    fn an_unknown_provider_is_rejected_with_the_valid_names() {
-        let mut config: Config =
-            serde_yaml::from_str("subscribers:\n  - type: builtin\n    provider: nope\n").unwrap();
-        let error = config.normalize().unwrap_err().to_string();
-        assert!(error.contains("nope"), "{error}");
-        assert!(
-            crate::providers::names()
-                .iter()
-                .all(|name| error.contains(name)),
-            "the error should list what is available: {error}"
-        );
-    }
-
-    /// 内置目录（含分页展开）应当得到的订阅源名称。
-    fn expanded_catalog_names() -> Vec<String> {
-        crate::providers::ALL
-            .iter()
-            .flat_map(|provider| match &provider.pages {
-                Some(pages) => pages
-                    .clone()
-                    .map(|page| paged_name(provider.name, page))
-                    .collect::<Vec<String>>(),
-                None => vec![provider.name.to_string()],
-            })
-            .collect()
-    }
-
-    #[test]
-    fn the_builtin_switch_expands_the_catalog() {
-        // 默认关闭：什么都不写的配置不会隐式引入任何来源。
-        let mut config = Config::default();
-        config.normalize().unwrap();
-        assert!(config.subscribers.is_empty());
-        assert_eq!(config.builtin_subscribers, BuiltinSubscribers::Disabled);
-
-        // `enabled` 会加入内置目录的每一项，并以内置来源命名。
-        let mut config: Config = serde_yaml::from_str("builtin-subscribers: enabled\n").unwrap();
-        config.normalize().unwrap();
-        let names: Vec<String> = config
-            .subscribers
-            .iter()
-            .map(|subscriber| subscriber.name().to_string())
-            .collect();
-        assert_eq!(names, expanded_catalog_names());
-        assert!(
-            config
-                .subscribers
-                .iter()
-                .all(|subscriber| subscriber.kind() == "builtin" && subscriber.enabled())
-        );
-
-        // 幂等：归一化两次不会让列表翻倍。
-        let mut twice = config.clone();
-        twice.normalize().unwrap();
-        assert_eq!(twice.subscribers.len(), names.len());
-        let again: Vec<String> = twice
-            .subscribers
-            .iter()
-            .map(|subscriber| subscriber.name().to_string())
-            .collect();
-        assert_eq!(again, names, "second normalize changed the subscriber list");
-    }
-
-    #[test]
-    fn the_switch_leaves_handwritten_subscribers_alone() {
-        // 显式选中的内置来源不会被重复加入，手写订阅源已经占用的名称
-        // 也不会被抢走。
-        let mut config: Config = serde_yaml::from_str(
-            r#"
-builtin-subscribers: enabled
-subscribers:
-  - name: scdn
-    type: http
-    url: https://example.com/mine.txt
-"#,
-        )
-        .unwrap();
-        config.normalize().unwrap();
-
-        let builds: Vec<String> = config
-            .subscribers
-            .iter()
-            .filter(|subscriber| subscriber.kind() == "builtin")
-            .map(|subscriber| subscriber.name().to_string())
-            .collect();
-        // 手写的 `scdn` 占住了这个名字，所以内置目录里的 scdn 不会再加进来；
-        // rola-ip 仍然按页展开。
-        let expected: Vec<String> = expanded_catalog_names()
-            .into_iter()
-            .filter(|name| !name.starts_with("scdn"))
-            .collect();
-        assert_eq!(builds, expected, "`scdn` was taken by a hand-written entry");
-
-        // 而显式列出的那个仍然是 http 订阅源。
-        let mine = config
-            .subscribers
-            .iter()
-            .find(|subscriber| subscriber.name() == "scdn")
-            .unwrap();
-        assert_eq!(mine.kind(), "http");
     }
 
     #[test]
@@ -1589,12 +1332,14 @@ gateway:
                     name: "same".into(),
                     path: "a.txt".into(),
                     format: Format::Plaintext,
+                    limit: None,
                     enabled: true,
                 },
                 SubscriberConfig::File {
                     name: "same".into(),
                     path: "b.txt".into(),
                     format: Format::Plaintext,
+                    limit: None,
                     enabled: true,
                 },
             ],
@@ -1621,5 +1366,85 @@ gateway:
             serde_yaml::from_str("subscribers:\n  - type: file\n    path: ./a.txt\n").unwrap();
         config.normalize().unwrap();
         assert_eq!(config.subscribers[0].name(), "file-1");
+    }
+
+    #[test]
+    fn a_lua_subscriber_takes_its_extra_keys_as_parameters() {
+        let raw = r#"
+subscribers:
+  - script_name: my_scraper
+    type: lua
+    target_url: https://api.example.com/data.json
+    page_size: 500
+    debug: true
+    lua_code: |
+      print("1.2.3.4:8080")
+"#;
+        let mut config: Config = serde_yaml::from_str(raw).unwrap();
+        config.normalize().unwrap();
+
+        let subscriber = &config.subscribers[0];
+        // `script_name` 是 `name` 的别名。
+        assert_eq!(subscriber.name(), "my_scraper");
+        assert_eq!(subscriber.kind(), "lua");
+        assert_eq!(subscriber.format(), Format::Plaintext);
+
+        let SubscriberConfig::Lua { params, limit, .. } = subscriber else {
+            panic!("expected a lua subscriber");
+        };
+        assert_eq!(*limit, None);
+        let keys: Vec<&str> = params.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["debug", "page_size", "target_url"]);
+        assert_eq!(
+            params["target_url"].as_str(),
+            Some("https://api.example.com/data.json")
+        );
+        assert_eq!(params["page_size"].as_u64(), Some(500));
+        assert_eq!(params["debug"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn a_lua_subscriber_needs_exactly_one_source() {
+        // 两种都不给。
+        let mut config: Config = serde_yaml::from_str("subscribers:\n  - type: lua\n").unwrap();
+        let error = config.normalize().unwrap_err().to_string();
+        assert!(error.contains("needs `lua_code` or `lua_file`"), "{error}");
+
+        // 两种都给：说清楚，不猜。
+        let mut config: Config = serde_yaml::from_str(
+            "subscribers:\n  - type: lua\n    lua_code: print(1)\n    lua_file: ./a.lua\n",
+        )
+        .unwrap();
+        let error = config.normalize().unwrap_err().to_string();
+        assert!(error.contains("sets both"), "{error}");
+
+        // `lua_code` 是空白。
+        let mut config: Config =
+            serde_yaml::from_str("subscribers:\n  - type: lua\n    lua_code: \"   \"\n").unwrap();
+        let error = config.normalize().unwrap_err().to_string();
+        assert!(error.contains("empty `lua_code`"), "{error}");
+
+        // 只有 `lua_file` 是合法的。
+        let mut config: Config =
+            serde_yaml::from_str("subscribers:\n  - type: lua\n    lua_file: ./a.lua\n").unwrap();
+        config.normalize().unwrap();
+        assert_eq!(config.subscribers[0].name(), "lua-1");
+    }
+
+    #[test]
+    fn a_limit_of_zero_means_no_limit() {
+        let mut config: Config = serde_yaml::from_str(
+            "subscribers:\n  - type: http\n    url: https://example.com/a.txt\n    limit: 0\n",
+        )
+        .unwrap();
+        config.normalize().unwrap();
+        assert_eq!(config.subscribers[0].limit(), None);
+
+        let mut config: Config = serde_yaml::from_str(
+            "subscribers:\n  - type: http\n    url: https://example.com/a.txt\n    limit: 25\n",
+        )
+        .unwrap();
+        config.normalize().unwrap();
+        assert_eq!(config.subscribers[0].limit(), Some(25));
     }
 }

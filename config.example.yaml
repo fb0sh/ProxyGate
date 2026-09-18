@@ -20,53 +20,99 @@ server:
 
 # Where proxies come from.
 #
-# `builtin-subscribers: enabled` subscribes to every source in the catalog that
-# ProxyGate ships (`GET /api/v1/providers` lists them with their endpoints,
-# formats and caveats). Set it to `disabled` to use only the sources you write
-# yourself below.
+# Four kinds of subscriber:
 #
-# They are free/public lists: expect most of what they return to fail the health
-# check (dead endpoints, and proxies that intercept TLS with their own
+#   http   one URL, the payload parsed by `format`
+#   file   a local file, same formats
+#   exec   run a command, read proxy URLs from its stdout
+#   lua    run a Lua script; every line it `print`s is a candidate proxy
+#
+# `lua` is the general one: it can fetch, page through an API, sign a request
+# and reshape a response, so a source that needs custom logic no longer needs a
+# ProxyGate release. The full script API (`fetch`, `fetch_json`,
+# `json_encode`, `json_decode`, `log`, `print`, and the sandbox rules) is
+# documented in `GET /help` and in README.md.
+#
+# Everything below is free/public: expect most of what these return to fail the
+# health check (dead endpoints, and proxies that intercept TLS with their own
 # certificate — ProxyGate refuses those), and expect rate limits, so leave
 # `refresh.interval` at 10m or slower.
-#
-# A paginated source expands into one subscriber per page (`rola-ip#1` …
-# `rola-ip#10`), so a refresh reports every page separately and a page
-# that fails does not hide the rest. Nothing to configure here: the page range
-# lives in the catalog, and `GET /api/v1/providers` prints it.
-builtin-subscribers: enabled
 
 subscribers:
-  # Your own sources go here: builtin, http, file or exec. Individual catalog
-  # entries can be picked by name, and any of them can be tuned, e.g.
+  # A small, fast JSON API. The built-in JSON reader already understands the
+  # envelope (`{"data":{"proxies":[...]}}`), so a script would add nothing.
+  - name: scdn
+    type: http
+    url: https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20
+    format: json
+
+  # ~120 entries, all HTTP, with country/region/anonymity per entry.
+  - name: freeproxy-cn
+    type: http
+    url: https://www.freeproxy.com.cn/proxy.json
+    format: json
+
+  # ~5,000 entries paginated 500 at a time. Written as Lua so that all ten
+  # pages arrive as one subscriber (the page count is read from the API's own
+  # `pagination.totalPages`), and so socks4-only entries are dropped instead of
+  # being handed out as HTTP proxies that cannot connect.
   #
-  # - name: scdn-cn
-  #   type: builtin
-  #   provider: scdn
-  #   url: https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20&country_code=CN
-  #   format: json
-  #   timeout: 20s
-  #   limit: 200          # keep at most this many (0 = no cap)
+  # `url` and `page_size` are not ProxyGate keys: unknown keys become globals
+  # in the script, which is how a script gets its parameters.
+  - name: rola-ip
+    type: lua
+    url: https://rola-ip.co/proxy-api/api/v1/proxies
+    page_size: 500
+    timeout: 60s
+    lua_code: |
+      local page, pages = 1, 1
+      repeat
+        local body = fetch_json(url .. "?page=" .. page .. "&pageSize=" .. page_size)
+        pages = (body.pagination and body.pagination.totalPages) or 1
+        for _, item in ipairs(body.data or {}) do
+          local scheme = nil
+          for _, protocol in ipairs(item.protocols or {}) do
+            local name = string.lower(protocol)
+            if name == "http" or name == "https" then
+              scheme = "http"
+              break
+            elseif name == "socks5" then
+              scheme = "socks5h"
+            end
+          end
+          if scheme then
+            print(scheme .. "://" .. item.ip .. ":" .. item.port)
+          end
+        end
+        page = page + 1
+      until page > pages
+
+  # ~16k entries, 2.5 MB, ordered fastest-first, so the head of the list is the
+  # useful end. `limit` keeps the pool small enough that a health pass takes
+  # tens of seconds instead of minutes; set it to 0 to keep everything.
+  - name: freeproxy-gh
+    type: http
+    url: https://charlespikachu.github.io/freeproxy/proxies.json
+    format: json
+    timeout: 300s
+    limit: 1000
+
+  # Your own sources, with every key spelled out:
   #
-  # A plain URL: one proxy per line, `#` starts a comment.
   # - name: provider-a
   #   type: http
   #   url: https://example.com/proxies.txt
   #   format: plaintext          # plaintext (default) | json | clash
   #   timeout: 20s
+  #   limit: 200                 # keep at most this many (0 = no cap)
   #   headers:                   # for endpoints that need a token
   #     Authorization: Bearer <token>
   #
-  # A local file.
   # - name: local
   #   type: file
   #   path: ./proxies.txt
   #   format: plaintext
   #
-  # The escape hatch: run a command and read proxy URLs from its stdout.
-  # Whatever the provider's format is (HTML, base64, protobuf, a signed API),
-  # the script does the parsing and ProxyGate stays simple.
-  # See subscribers/README.md for the contract.
   # - name: custom
   #   type: exec
   #   command:
@@ -78,6 +124,16 @@ subscribers:
   #   timeout: 30s
   #   env:
   #     API_TOKEN: "..."
+  #
+  # - name: my_scraper
+  #   type: lua
+  #   target_url: https://api.example.com/data.json   # extra keys -> globals
+  #   limit: 500
+  #   lua_code: |
+  #     local data = fetch_json(target_url)
+  #     for _, item in ipairs(data.items or {}) do
+  #       print(item.ip .. ":" .. item.port)
+  #     end
 
 refresh:
   # How long a fetched subscriber result is reused before fetching again.

@@ -863,9 +863,9 @@ impl Progress for LogProgress {
         match event {
             FetchEvent::Started { name, kind, format } => {
                 info!(
-                    subscriber = name,
-                    kind,
-                    format = format.as_str(),
+                    subscriber = %name,
+                    kind = %kind,
+                    format = %format.as_str(),
                     "fetching subscriber"
                 );
             }
@@ -875,7 +875,7 @@ impl Progress for LogProgress {
                 elapsed,
             } => {
                 info!(
-                    subscriber = name,
+                    subscriber = %name,
                     kilobytes = bytes / 1024,
                     elapsed_ms = elapsed.as_millis() as u64,
                     "still downloading"
@@ -916,7 +916,7 @@ impl Progress for LogProgress {
     fn verify(&self, event: VerifyEvent<'_>) {
         if event.ok {
             info!(
-                proxy = event.proxy,
+                proxy = %event.proxy,
                 attempt = event.attempt,
                 attempts = event.attempts,
                 elapsed_ms = event.latency.map(|l| l.as_millis() as u64).unwrap_or(0),
@@ -924,7 +924,7 @@ impl Progress for LogProgress {
             );
         } else {
             info!(
-                proxy = event.proxy,
+                proxy = %event.proxy,
                 attempt = event.attempt,
                 attempts = event.attempts,
                 error = event.error.unwrap_or("unknown error"),
@@ -1115,6 +1115,7 @@ mod tests {
             name: name.to_string(),
             path,
             format: crate::config::Format::Plaintext,
+            limit: None,
             enabled: true,
         }
     }
@@ -1245,6 +1246,7 @@ mod tests {
                 format: crate::config::Format::Plaintext,
                 headers: BTreeMap::new(),
                 timeout: Some(Duration::from_secs(10)),
+                limit: None,
                 enabled: true,
             },
         ];

@@ -12,23 +12,30 @@
 #     -v proxygate-cache:/home/proxygate/.cache/proxygate \
 #     proxygate
 #
-# The binary takes no arguments: it reads the config and serves. Point it at a
-# config with `-e PROXYGATE_CONFIG=/path/to/config.yaml`.
+# The binary takes no arguments: it reads the config and serves. The image sets
+# PROXYGATE_CONFIG=/home/proxygate/config.yaml, so the mount above is all it
+# takes. That config has to bind `0.0.0.0` (the built-in defaults bind
+# `127.0.0.1`, which is unreachable through a port mapping):
+#
+#   server:
+#     proxy: 0.0.0.0:8080
+#     api: 0.0.0.0:8081
 
 # ---------------------------------------------------------------------------
 # Build stage
 # ---------------------------------------------------------------------------
 FROM rust:1-slim-bookworm AS builder
 
-# `rust:*-slim` already ships gcc, libc headers and perl, so only the build
-# driver is missing: aws-lc-rs (pulled in by rustls) configures with cmake.
-# clang/libclang-dev are only required for FIPS or `ssl` feature builds, which
-# use bindgen instead of the pregenerated bindings.
+# Two C toolchains are needed: mlua compiles the vendored Lua 5.4 sources with
+# `cc` (gcc/libc6-dev), and aws-lc-rs (pulled in by rustls) configures with
+# cmake. clang/libclang-dev are only required for FIPS or `ssl` feature builds,
+# which use bindgen instead of the pregenerated bindings.
 # `ForceIPv4` keeps apt from stalling on hosts that advertise AAAA records but
 # have no working IPv6 route (common in CI and container runtimes).
 RUN echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4 \
     && apt-get update \
-    && apt-get install -y --no-install-recommends make cmake ca-certificates \
+    && apt-get install -y --no-install-recommends \
+        make cmake gcc libc6-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 ARG CARGO_MIRROR=""
@@ -91,7 +98,8 @@ EXPOSE 8080 8081
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8081/api/v1/health || exit 1
 
+# Where the mounted config lives. The binary takes no arguments, so this is the
+# only knob the image sets for it.
+ENV PROXYGATE_CONFIG=/home/proxygate/config.yaml
+
 ENTRYPOINT ["proxygate"]
-# Inside a container the loopback address is not reachable from the host, so
-# bind to all interfaces and let the port mapping be the access control.
-CMD ["proxygate"]
