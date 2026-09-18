@@ -11,7 +11,7 @@
 //! ```
 //!
 //! 目录放在代码里（而不是配置模板里），这样端点、它们的载荷格式和注意事项
-//! 都集中在一处，`proxygate providers` 也无需检出代码就能描述它们。`builtin`
+//! 都集中在一处，`GET /api/v1/providers` 也无需检出代码就能描述它们。`builtin`
 //! 条目所做的一切都是一次 HTTP 拉取——目录只是省去了复制一个会变化的 URL。
 //!
 //! 新增一个内置来源＝一条 [`Provider`] 字面量，再加 `config.example.yaml`
@@ -31,7 +31,7 @@ pub const PAGE_PLACEHOLDER: &str = "{page}";
 /// 一个内置来源。
 #[derive(Debug, Clone)]
 pub struct Provider {
-    /// 在配置中作为 `provider:` 使用、并由 `proxygate providers`
+    /// 在配置中作为 `provider:` 使用、并由 `GET /api/v1/providers`
     /// 打印出来的 id。
     pub name: &'static str,
     /// 要拉取的端点。查询参数也写在这里。
@@ -40,7 +40,7 @@ pub struct Provider {
     pub format: Format,
     /// 文档或落地页。
     pub homepage: &'static str,
-    /// 一行关于实际使用情况的说明，由 `proxygate providers` 展示。
+    /// 一行关于实际使用情况的说明，由 `GET /api/v1/providers` 展示。
     pub notes: &'static str,
     /// 拉取该端点时的超时；当默认的 `refresh.timeout` 不够长时使用。
     /// 可在每个配置条目上覆盖。
@@ -59,7 +59,7 @@ pub struct Provider {
     pub limit: Option<usize>,
 }
 
-/// 所有内置来源，顺序即 `proxygate providers` 的打印顺序。
+/// 所有内置来源，顺序即 `GET /api/v1/providers` 的返回顺序。
 pub const ALL: &[Provider] = &[
     Provider {
         name: "scdn",
@@ -128,7 +128,7 @@ impl Provider {
         self.url.replace(PAGE_PLACEHOLDER, &page.to_string())
     }
 
-    /// 供 `proxygate providers` 展示的分页说明，如 `1-10`；不分页时为 `-`。
+    /// 供 `GET /api/v1/providers` 展示的分页说明，如 `1-10`；不分页时为 `-`。
     pub fn pages_label(&self) -> String {
         match &self.pages {
             Some(pages) => format!("{}-{}", pages.start(), pages.end()),

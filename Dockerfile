@@ -12,9 +12,8 @@
 #     -v proxygate-cache:/home/proxygate/.cache/proxygate \
 #     proxygate
 #
-# `serve` is the default command, so the usual overrides work:
-#   docker run --rm proxygate get
-#   docker run --rm proxygate refresh
+# The binary takes no arguments: it reads the config and serves. Point it at a
+# config with `-e PROXYGATE_CONFIG=/path/to/config.yaml`.
 
 # ---------------------------------------------------------------------------
 # Build stage
@@ -95,4 +94,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 ENTRYPOINT ["proxygate"]
 # Inside a container the loopback address is not reachable from the host, so
 # bind to all interfaces and let the port mapping be the access control.
-CMD ["serve", "--listen", "0.0.0.0:8080", "--api", "0.0.0.0:8081"]
+CMD ["proxygate"]

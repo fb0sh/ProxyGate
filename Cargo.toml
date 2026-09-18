@@ -1,6 +1,6 @@
 [package]
 name = "proxygate"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Turn any proxy source into a uniform, always-ready proxy pool with a CLI, REST API and HTTP gateway."
@@ -28,7 +28,6 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

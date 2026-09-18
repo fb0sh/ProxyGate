@@ -203,6 +203,31 @@ pub struct SelectionConfig {
     /// `selection.reuse_after`，默认 30 分钟。
     #[serde(default = "default_reuse_after", deserialize_with = "de::duration")]
     pub reuse_after: Duration,
+    /// 发放前是否验证选中的代理，YAML 键 `selection.verify`，默认 `true`。
+    ///
+    /// 池子里的判定可能已经很旧（大池子一轮探测要几分钟，只用 CLI 而
+    /// 不跑 `serve` 时甚至可能是几小时前的），所以默认在交出去之前现探一次：
+    /// 「手里这个现在能用」是任何时间间隔都给不了的保证。
+    #[serde(default = "default_true")]
+    pub verify: bool,
+    /// 判定比这个时间新就直接用，不重新探，YAML 键
+    /// `selection.max_age`，默认 60 秒。
+    ///
+    /// 这是发放验证的快路径：`refresh` / `check` 刚跑完时，前面这一段
+    /// 时间的 `get` 依然是毫秒级。设成 `0s` 表示每次都探。
+    #[serde(default = "default_verify_max_age", deserialize_with = "de::duration")]
+    pub max_age: Duration,
+    /// 现探单个候选时的超时，YAML 键 `selection.verify_timeout`，
+    /// 默认 3 秒。
+    ///
+    /// 比 `health.timeout`（5 秒）短：发放路径上宁可快一点换下一个，也不要
+    /// 让调用方等一个大概率没救的代理。
+    #[serde(default = "default_verify_timeout", deserialize_with = "de::duration")]
+    pub verify_timeout: Duration,
+    /// 现探失败后最多再试几个候选，YAML 键 `selection.verify_attempts`，
+    /// 默认 3。
+    #[serde(default = "default_verify_attempts")]
+    pub verify_attempts: usize,
 }
 
 impl Default for SelectionConfig {
@@ -210,8 +235,27 @@ impl Default for SelectionConfig {
         Self {
             strategy: crate::selector::Strategy::default(),
             reuse_after: default_reuse_after(),
+            verify: true,
+            max_age: default_verify_max_age(),
+            verify_timeout: default_verify_timeout(),
+            verify_attempts: default_verify_attempts(),
         }
     }
+}
+
+/// `selection.max_age` 的默认值：判定比这新就直接用。
+fn default_verify_max_age() -> Duration {
+    Duration::from_secs(60)
+}
+
+/// `selection.verify_timeout` 的默认值。
+fn default_verify_timeout() -> Duration {
+    Duration::from_secs(3)
+}
+
+/// `selection.verify_attempts` 的默认值。
+fn default_verify_attempts() -> usize {
+    3
 }
 
 /// `gateway` 段的配置：重试、连接超时与客户端认证。
@@ -297,7 +341,7 @@ pub enum SubscriberConfig {
         /// 订阅源名称，缺省时自动命名（如 `builtin-1`）。
         #[serde(default)]
         name: String,
-        /// 内置目录中的 id，例如 `scdn`。可用 `proxygate providers` 查看。
+        /// 内置目录中的 id，例如 `scdn`。可用 `GET /api/v1/providers` 查看。
         provider: String,
         /// 覆盖目录中的端点（例如修改其查询参数）。
         #[serde(default)]
@@ -408,7 +452,7 @@ impl SubscriberConfig {
 
 /// 分页来源展开后，每一页对应的订阅源名称。
 ///
-/// 例如 `rola-ip` 的第 3 页叫 `rola-ip#3`。名字里带页码，`proxygate refresh`
+/// 例如 `rola-ip` 的第 3 页叫 `rola-ip#3`。名字里带页码，一次 refresh
 /// 的输出就能直接指出是哪一页失败或变空。
 pub fn paged_name(base: &str, page: u32) -> String {
     format!("{base}#{page}")
@@ -495,7 +539,7 @@ pub enum HealthRequirement {
     ///
     /// 这是默认值：保留一个能到达*某些东西*的代理，比什么都不分发更
     /// 有用，而且每目标的结果仍然精确显示每个代理能到达什么、不能到达
-    /// 什么（`proxygate list` 的 TARGETS 列）。
+    /// 什么（`GET /api/v1/proxies` 的 `probes` 字段）。
     #[default]
     Any,
 }
@@ -627,7 +671,7 @@ impl Config {
         }
 
         // 分页端点（如 rola-ip 的 10 页）在这里展开成每页一条订阅源：每页
-        // 独立拉取、独立计数、独立失败，`proxygate refresh` 因此能指出是哪
+        // 独立拉取、独立计数、独立失败，一次 refresh 因此能指出是哪
         // 一页出了问题。展开时把页码写进 `url`，展开后的条目不再含占位符，
         // 所以再调用一次 `normalize` 也不会重复展开。
         self.expand_paged_builtins();

@@ -5,7 +5,7 @@
 把任意代理来源，变成一个统一、随时可用的代理池。
 
 ProxyGate 从 HTTP 接口、本地文件或任意脚本里收集代理，统一归一化成
-`scheme://user:pass@host:port`，探测哪些真的能用，然后通过 CLI、REST API 或一个
+`scheme://user:pass@host:port`，探测哪些真的能用，然后通过 REST API 或一个
 透明 HTTP 代理网关把它们发出去——客户端完全看不到上游地址和上游凭据。
 
 ```text
@@ -24,7 +24,7 @@ ProxyGate 从 HTTP 接口、本地文件或任意脚本里收集代理，统一�
                        ↓
           ┌────────────┼────────────┐
           ↓            ↓            ↓
-     CLI get       REST API      Gateway
+     REST API      Gateway
                                 HTTP Proxy
 ```
 
@@ -35,28 +35,29 @@ ProxyGate 从 HTTP 接口、本地文件或任意脚本里收集代理，统一�
 
 ## 快速开始
 
+**这是个服务端程序，没有命令行客户端**——跑起来之后一切都走 HTTP：
+
 ```bash
-# 1. 拿到一个真实可用的上游代理
-proxygate get
+# 1. 准备配置（压缩包里就有一份带注释的；服务起来后也能拿到）
+cp config.example.yaml config.yaml
+
+# 2. 启动：无参数，读 $PROXYGATE_CONFIG 或 ./config.yaml
+proxygate
+
+# 3. 拿一个（已验证的）代理并用它
+curl -sf http://127.0.0.1:8081/api/v1/get
 http://user:pass@1.2.3.4:8080
+curl -x "$(curl -sf http://127.0.0.1:8081/api/v1/get)" https://example.com
 
-# 2. 直接用它
-curl -x "$(proxygate get)" https://example.com
-
-# 3. 或者起一个常驻网关
-proxygate serve
+# 4. 也可以直接把网关当代理用
 curl -x http://127.0.0.1:8080 https://example.com
 
-# 4. 或者问 REST API
-curl http://127.0.0.1:8081/api/v1/get
+# 5. 手册就是这个端点，agent 和人都能读
+curl -s http://127.0.0.1:8081/help
 ```
 
-网关也可以要求客户端认证：
-
-```bash
-proxygate serve --listen 0.0.0.0:8080 --auth admin:secret
-curl -x http://admin:secret@127.0.0.1:8080 https://example.com
-```
+注意 `curl -sf`：池子空的时候 `/get` 会返回 `503` 和一段说明正文，不加 `-f`
+的话那段正文会被当成代理地址塞进 `-x`。
 
 两层认证完全独立：客户端向 ProxyGate 认证，ProxyGate 向上游认证。
 
@@ -101,16 +102,15 @@ Windows 上缓存目录是 `%LOCALAPPDATA%\proxygate`（可用 `state.dir` 或
 2. `./config.yaml`
 3. `~/.config/proxygate/config.yaml`
 
-完全没有配置文件也能跑（空池子）。最快的起步方式是让程序自己吐一份：
+压缩包里带了一份 [`config.example.yaml`](config.example.yaml)，直接拿来起步。服务
+已经跑起来时，同一份内容也能从 API 取：
 
 ```bash
-proxygate genconfig > config.yaml     # 带注释的完整示例，直接重定向即可
+curl -s http://127.0.0.1:8081/api/v1/config > config.yaml
 ```
 
-也可以参考仓库里的 [`config.example.yaml`](config.example.yaml)。
-
-> `genconfig` 生成的配置**不含客户端认证**：它假设网关只在本机可达。要对外开放时在命令行
-> 加 `--auth user:pass` —— 这样凭据不会落在会被提交的配置文件里。
+> 示例配置**不含客户端认证**：它假设网关只在本机可达。要对外开放时在配置里加
+> `gateway.auth: user:password`（或用 `PROXYGATE_CONFIG` 指向另一份含凭据的配置）。
 
 | 配置项 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -127,6 +127,10 @@ proxygate genconfig > config.yaml     # 带注释的完整示例，直接重定�
 | `health.max_failures` | `3` | 原本可用的代理连续失败多少次后判死 |
 | `selection.strategy` | `random` | `random` 或 `latency` |
 | `selection.reuse_after` | `30m` | 优先避开这段时间内用过的代理 |
+| `selection.verify` | `true` | 发放前现探选中的代理（判定够新则跳过） |
+| `selection.max_age` | `60s` | 判定比这新就直接用；`0s` 表示每次都探 |
+| `selection.verify_timeout` | `3s` | 现探单个候选的超时（比 `health.timeout` 短） |
+| `selection.verify_attempts` | `3` | 现探失败后最多再试几个候选 |
 | `gateway.retries` | `2` | 首个上游失败后的额外重试次数 |
 | `gateway.connect_timeout` | `10s` | 连接上游并完成 CONNECT 握手的超时 |
 | `gateway.auth` | – | 要求客户端提供的 `user:password` |
@@ -162,10 +166,9 @@ server:
 | `GET http://host/path`（绝对形式） | 代理请求 | HTTP 网关 |
 | `GET /api/v1/get`（原始形式） | API 请求 | REST API |
 
-> **认证只覆盖代理请求。** `gateway.auth`（`--auth user:pass`）只拦代理请求，共用端口时
-> API 本身仍然是开放的——谁连上这个端口都能读 `/api/v1/proxies`。所以共用端口只适合
-> 监听在受信任的接口（默认就是 `127.0.0.1`）。`proxygate serve` 在这种情况下会打一条
-> 警告日志。要对外提供服务，就把 API 放回独立端口，或者用防火墙限制来源。
+> **认证只覆盖代理请求。** `gateway.auth` 只拦代理请求，共用端口时 API 本身仍然是
+> 开放的——谁连上这个端口都能读 `/api/v1/proxies`。所以共用端口只适合监听在受信任的
+> 接口（默认就是 `127.0.0.1`）。服务启动时会为此打一条警告日志。要对外提供服务，就把 API 放回独立端口，或者用防火墙限制来源。
 
 分端口和共端口的选择没有功能差别，纯粹看部署习惯：容器里映射一个端口更省事，本地开发
 分开更好排查。
@@ -177,13 +180,12 @@ server:
 `builtin` 指向代码里维护的**内置源目录**。不想逐个挑的话，一个总开关就够：
 
 ```yaml
-builtin-subscribers: enabled      # 订阅目录里的每一个源（genconfig 写的就是这行）
+builtin-subscribers: enabled      # 订阅目录里的每一个源（示例配置写的就是这行）
 # disabled                        # 只用手写的 subscribers
 ```
 
-`proxygate providers` 列出目录里的全部条目（端点、格式、分页范围、注意事项、文档地址），
-也可以 `--json`。总开关默认 `disabled`（不写就不隐式联网），而 `genconfig` 生成的配置里带的是
-`enabled`。
+`GET /api/v1/providers` 列出目录里的全部条目（端点、格式、分页范围、注意事项、文档地址）。
+总开关默认 `disabled`（不写就不隐式联网），而示例配置里带的是 `enabled`。
 
 也可以只挑一个源，或者单独调参——`builtin` 本质上就是一次 HTTP 拉取，所以支持与 `http`
 相同的覆盖项，外加一个 `limit`：
@@ -263,91 +265,27 @@ user:pass@1.2.3.4:3128       socks5h://user:pass@[2001:db8::1]:1080
 代理（`invalid peer certificate`）——会重新签发流量的代理不是你要的代理，而且客户端只要
 校验证书也用不了它。
 
-## 命令行
+## 日志与进度
 
-抓取和探测都是几分钟量级的活儿（全开内置来源时，`refresh` 大约四分钟，其中
-`freeproxy-gh` 一个就占三分钟），所以进度默认就打在 **stderr** 上：
-
-```console
-$ proxygate refresh
-→ 抓取 scdn（json）
-→ 抓取 rola-ip#1（json）
-✓ scdn  20 个代理，用时 2s，累计 20
-    http://1.2.3.4:8080
-    …
-    …还有 17 个（加 --proxies 全部列出）
-  … freeproxy-gh 已下载 1.2 MB，用时 2m10s
-✓ rola-ip#1  421 个代理（跳过 79），用时 30s，累计 441
-    socks5h://5.6.7.8:1080
-✗ broken-source  失败：connect: … (Connection refused (os error 111))
-  探测 1200/5157，存活 23，用时 1m20s
-```
-
-几件事：
-
-- 每个订阅源单独一行：名字、拿到多少个、跳过/拒绝/截断多少、耗时、**累计**。
-- 下载中的来源每隔 10 秒报一次字节数与耗时（那个 2.5 MB 的 GitHub 列表不会
-  看起来像卡死了）。
-- 健康探测每 5 秒报一次进度与存活数。
-- 默认只列 5 个代理作样例；`--proxies` 把拿到的全部列出来。
-- `-q` 关掉进度（脚本用），`-v` 另外打开日志。**进度走 stderr**，所以
-  `get` 的 stdout 仍然只有一行、`refresh --json` 仍然只有 JSON。
-
-`proxygate --help`（以及每个子命令的 `--help`）的内容是中文——clap 会直接把文档注释当
-帮助文本用。只有 `Usage:` / `Options:` 这类结构性标题和 clap 自动生成的报错信息是英文，
-clap 没有本地化接口。
-
-```text
-proxygate get       [--format text|json] [--strategy random|latency] [--no-refresh] [--no-check] [--mask]
-proxygate list      [--alive] [--all] [--show-auth] [--json] [--no-refresh] [--no-check]
-proxygate refresh   [--json]
-proxygate check     [--json] [--concurrency N] [--alive-only]
-proxygate serve     [--listen ADDR] [--api ADDR] [--auth USER:PASS] [--no-refresh]
-proxygate genconfig                             # 带注释的示例配置，输出到 stdout
-proxygate getua     [--format text|json]        # 一个随机 User-Agent
-proxygate skill                                 # 面向 agent 的 SKILL.md，输出到 stdout
-proxygate providers [--json]                    # 内置代理源目录
-```
-
-全局参数：`-c/--config <path>`、`-v`（info）、`-vv`（debug）、`-vvv`（trace）、
-`-q`（只输出错误）。`RUST_LOG` 可覆盖日志级别。
-
-`proxygate get` 的 stdout **严格只有一行**——就是代理 URL；所有日志走 stderr。所以
-`curl -x "$(proxygate get)"` 永远成立。
-
-退出码：`0` 成功，`1` 出错，`3` 池内无可用代理。
+服务端没有 stdout 契约要保护，进度与结果都在 **stderr 日志**里（`RUST_LOG`
+控制级别，默认 `info`）：
 
 ```console
-$ proxygate list
-PROXY                           STATUS   TARGETS  LATENCY
-http://***:***@127.0.0.1:18080  alive    2/2      824ms
-http://127.0.0.1:18083          alive    1/2      817ms    # 只通 cn.bing.com
-http://203.0.113.7:3128         dead     0/2      -
-
-$ proxygate get --format json
-{"proxy":"http://user:pass@127.0.0.1:18080","latency_ms":824,"round":3}
+$ proxygate
+2026-09-18T10:51:02Z  INFO proxygate is listening proxy=127.0.0.1:8080 api=127.0.0.1:8081 ...
+2026-09-18T10:51:02Z  INFO API documentation help=http://127.0.0.1:8081/help
+2026-09-18T10:51:02Z  INFO fetching subscriber subscriber=scdn kind=builtin format=json
+2026-09-18T10:51:05Z  INFO subscriber fetched subscriber=scdn found=20 rejected=0 skipped=0 elapsed_ms=2423
+2026-09-18T10:54:28Z  INFO still downloading subscriber=freeproxy-gh kilobytes=1300 elapsed_ms=130000
+2026-09-18T10:54:50Z  INFO proxygate is ready proxies=5157 alive=66
+2026-09-18T10:55:01Z  INFO hand-out verification passed proxy=http://***:***@1.2.3.4:8080 elapsed_ms=312
 ```
 
-三个辅助命令：
-
-- **`genconfig`** 把带注释的示例配置打印到 stdout（内容编进了二进制，装好的 `proxygate`
-  不需要仓库在旁边就能起一份配置）：`proxygate genconfig > config.yaml`。
-- **`getua`** 从内置的 100 个 User-Agent 里随机取一个，全部是**桌面浏览器**（Chrome /
-  Edge / Firefox / Safari，覆盖 Windows、macOS、Linux），不含移动端。纯随机、无状态：
-  不轮换、不记「用过没用过」，连抽两次可能相同。适合和新拿到的代理配对：
-
-  ```bash
-  curl -x "$(proxygate get)" -A "$(proxygate getua)" https://example.com
-  ```
-
-- **`skill`** 把 [`SKILL.md`](SKILL.md) 打印到 stdout，那是写给 **AI agent** 看的完整
-  使用说明（命令、退出码含义、API、配置要点，以及哪些输出不能轻信）。它只输出内容、
-  不创建文件，落在哪里由调用方决定：
-
-  ```bash
-  proxygate skill > SKILL.md          # 想存就存
-  proxygate skill | pbcopy            # 或者直接喂给 agent
-  ```
+* 每个订阅源一行：名字、拿到多少、跳过/拒绝/截断、耗时；慢下载每 10 秒报一次
+  字节数（那个 2.5 MB 的 GitHub 列表不会看起来像卡死）。
+* 健康探测每 5 秒报一次进度与存活数。
+* 发放验证每次都会记一行（通过或失败+原因），所以"为什么这个代理没发出来"
+  在日志里查得到。
 
 ## REST API
 
@@ -358,6 +296,11 @@ $ proxygate get --format json
 | `GET /api/v1/getua` | 一个 User-Agent，`text/plain` |
 | `GET /api/v1/getua?format=json` | `{"user_agent": "Mozilla/5.0 ..."}` |
 | `GET /api/v1/proxies` | 整个池的 JSON，凭据已脱敏 |
+| `GET /api/v1/providers` | 内置来源目录（端点、格式、分页范围、注意事项） |
+| `GET /api/v1/config` | 带注释的示例配置，`text/yaml` |
+| `POST /api/v1/refresh` | `202`：让后台立刻抓一轮订阅源 |
+| `POST /api/v1/check` | `202`：让后台立刻重探一遍代理池 |
+| `GET /help` | 面向 agent 与人的手册（就是 `SKILL.md` 原文，`text/markdown`） |
 | `GET /api/v1/health` | `{"status": "initializing"\|"ok"\|"degraded"\|"empty", "ready": true, "proxies": {...}}` |
 | `GET /` | 以上端点的索引 |
 
@@ -366,7 +309,7 @@ $ curl http://127.0.0.1:8081/api/v1/get
 http://user:pass@1.2.3.4:8080
 
 $ curl -s http://127.0.0.1:8081/api/v1/health
-{"status":"ok","version":"0.2.2","uptime_seconds":42,"generation":3,
+{"status":"ok","version":"0.3.0","uptime_seconds":42,"generation":3,
  "strategy":"random","health_targets":["https://www.google.com/generate_204",
  "https://cn.bing.com/"],"health_require":"any",
  "ready":true,"initializing":false,"initialization_attempts":1,
@@ -396,13 +339,13 @@ $ curl -s http://127.0.0.1:8081/api/v1/health
 
 ## 网关
 
-`proxygate serve` 在同一个 Tokio runtime 上只跑四件事：subscriber 刷新、健康探测、
+服务进程在同一个 Tokio runtime 上只跑四件事：subscriber 刷新、健康探测、
 REST API、HTTP 网关。
 
 - **CONNECT**（HTTPS）会被变成一条字节隧道。上游是在客户端看到 `200` **之前**就选好、
   连上并完成握手的，所以坏上游可以被透明重试；一条隧道全程固定一个上游。
 - **纯 HTTP** 转发时保留绝对形式请求目标，DNS 和建连交给上游。
-- 客户端凭据（`--auth`）由 ProxyGate 消费，绝不转发；上游凭据由 ProxyGate 补上，绝不
+- 客户端凭据（`gateway.auth`）由 ProxyGate 消费，绝不转发；上游凭据由 ProxyGate 补上，绝不
   暴露。
 
 重试规则保守且安全：
@@ -422,21 +365,18 @@ REST API、HTTP 网关。
 
 ### 谁负责探测
 
-健康探测要连每一个代理（全开内置来源时几千个，一遍几分钟），所以它**不是**
-每次 `get` / `list` 都会做的事：
+健康探测要连每一个代理（全开内置来源时几千个，一遍几分钟），所以它分成两条路：
 
-| 命令 | 探测行为 |
+| 谁 | 探测行为 |
 | --- | --- |
-| `refresh` | 抓完之后**只探新抓到的**那些代理（老代理的判定还在有效期里） |
-| `check` | 重探整个池（`--alive-only` 只探当前存活的） |
-| `get` / `list` | **默认不探**，直接用缓存里的判定；只有从来没有过任何判定结果（冷启动）才探一次 |
-| `get --check` / `list --check` | 强制重探整个池 |
-| `get --no-check` / `list --no-check` | 连冷启动都不探，完全信任缓存 |
-| `serve` | 后台按 `health.interval` 周期探测，同时给 REST API 与网关提供判定 |
+| 后台探测循环 | 按 `health.interval` 周期重探整个池，并给 REST API 与网关提供判定 |
+| `POST /api/v1/refresh` | 抓完之后**只探新抓到的**那些代理（老代理的判定还在有效期里） |
+| `POST /api/v1/check` | 立刻重探整个池 |
+| 发放验证 | `GET /api/v1/get` 选中的那个代理，如果判定比 `selection.max_age` 旧就先探一次（`selection.verify`，默认开） |
 
-所以典型用法是：`refresh` 或 `serve` 负责"体检"，`get` / `list` 只负责"读结果"，
-毫秒级返回。代价是如果代理在两次探测之间死了，`get` 仍可能把它发出去，直到下一
-次 `refresh` / `check`（这也是免费代理的常态）。
+所以典型体验是：**发放时验证保证交出去的这个刚刚通过**（判定够新时毫秒级返回），
+后台循环负责让整个池子的判定不过期。如果你把 `selection.verify` 关掉，就只剩后台
+循环——那时判定可能几分钟旧，发出去死代理的概率会明显上升。
 
 `refresh` 是**边抓边落盘**的：每个订阅源一完成就立刻合并进池并写 `cache.json`，
 不等最慢的那个（`freeproxy-gh` 要四分钟）。中途 Ctrl-C 或断电，已经拿到的代理仍
@@ -460,10 +400,10 @@ REST API、HTTP 网关。
 
 ```text
 池里 A、B、C
-proxygate get   →  A
-proxygate get   →  B
-proxygate get   →  C
-proxygate get   →  进入下一轮，A/B/C 重新可用
+GET /api/v1/get  →  A
+GET /api/v1/get  →  B
+GET /api/v1/get  →  C
+GET /api/v1/get  →  进入下一轮，A/B/C 重新可用
 ```
 
 轮次号和每个代理的最后使用时间会写进 `state.json`，所以跨进程、跨重启都接着轮。后加入的
@@ -480,7 +420,7 @@ proxygate get   →  进入下一轮，A/B/C 重新可用
 | `any`（默认） | 至少一个目标应答 | 池子不至于空；`TARGETS` 列告诉你它通哪边 |
 | `all` | 每个目标都应答 | 只发放「你要的都能通」的代理 |
 
-每个代理都会记住逐目标结果（`list` 里的 `TARGETS` 列显示为 `2/2`，`list --json`、
+每个代理都会记住逐目标结果（`/api/v1/proxies` 的 `probes` 字段、
 `/api/v1/proxies`、`/api/v1/health` 都有完整明细），并写入 `cache.json` 供重启复用，所以
 「半通」的代理是可见的，而不是只能看到它不在池里。
 
@@ -494,9 +434,10 @@ proxygate get   →  进入下一轮，A/B/C 重新可用
   探测或请求都能让它回来。
 
 `alive`、`latency`、`failures` 从不被当作永久事实，但结果**会**按 `health.interval`
-（默认 30s）缓存，这样连续调用 `proxygate get` 不必每次都去重探一万个代理；subscriber
-结果同理按 `refresh.interval` 复用。`--no-check` / `--no-refresh` 表示「即便过期也用
-缓存」，适合紧凑循环或断网环境。
+缓存：判定本身由后台循环按 `health.interval` 刷新，发放时再按
+`selection.max_age` 决定要不要现探一次；subscriber 结果按 `refresh.interval` 复用。
+换句话说，连续调 `/api/v1/get` 不会每次都去重探一万个代理，但也不会把几天前的判定
+当事实发给你。
 
 ## 状态文件
 
@@ -536,7 +477,7 @@ proxygate get   →  进入下一轮，A/B/C 重新可用
 ```
 
 `cache.json` 里的代理 URL **含明文凭据**（要重建池子就必须有），这也是目录权限收紧的原
-因。两个文件删掉即可从零开始；`proxygate refresh` 会重建池子。
+因。两个文件删掉即可从零开始；`POST /api/v1/refresh` 会重建池子。
 
 配置或缓存目录写不进去时，网关会**降级继续服务**（只打警告、不再持久化轮换状态），不会
 因为一个只读卷就起不来。
@@ -547,9 +488,9 @@ proxygate get   →  进入下一轮，A/B/C 重新可用
   脚本执行的配置。
 - **REST API 自身没有认证**，默认只监听 `127.0.0.1`——把它暴露出去，等于把你的可用代理
   公开给所有能访问该端口的人。
-- 把网关绑到公网前先设 `gateway.auth`（或 `--auth`）。凭据用常量时间比较，
+- 把网关绑到公网前先设 `gateway.auth`。凭据用常量时间比较，
   `Proxy-Authorization` 在转发前会被剥掉。
-- 代理凭据在 `proxygate list`、REST API 和所有日志里都脱敏；只有 `proxygate get`（它就
+- 代理凭据在 `/api/v1/proxies`、所有日志与错误信息里都脱敏；只有 `/api/v1/get`（它就
   是干这个的）和私有目录下的 `cache.json` 里会出现明文。
 
 ## 尚未包含
@@ -580,21 +521,22 @@ cargo build --release
 
 ## 目录结构
 
-这是一个**库 crate + 薄二进制**：`src/lib.rs` 装全部逻辑，`src/main.rs` 只有几十行
-（解析参数、初始化日志、分发、打印错误）。想在自己的 Rust 程序里用 `ProxyGate`，加依赖
-后 `use proxygate::...` 即可，CLI 不是必须的。
+这是一个**库 crate + 一个只负责启动服务的二进制**：`src/lib.rs` 装全部逻辑，
+`src/main.rs` 只有几十行（认 `--version`/`--help`、初始化日志、调 `server::run`）。
+没有子命令、没有客户端命令——对外的一切都在 HTTP 上。想在自己的 Rust 程序里用
+`ProxyGate`，加依赖后 `use proxygate::...` 即可。
 
 ```text
 src/
   lib.rs         库入口：模块声明、crate 文档、内置 SKILL.md
-  main.rs        薄壳：解析参数、初始化日志、分发、按错误映射退出码
-  app.rs         共享运行时：池 + 状态存储 + HTTP client + 健康检查器
-  commands.rs    每个子命令对应一个函数
-  cli.rs         clap 定义
+  main.rs        薄壳：--version/--help、初始化日志、启动服务
+  server.rs      服务端：绑端口、起网关/API/后台循环、处理 Ctrl-C
+  app.rs         共享运行时：池 + 状态存储 + HTTP client + 健康检查器 + 发放验证
+  progress.rs    抓取/探测/发放验证的进度事件
   config.rs      config.yaml 模型、默认值、校验
   model.rs       Proxy、稳定 ID、URL 归一化、小工具编解码
   subscriber.rs  builtin/http/file/exec subscriber 与内置解析器
-  providers.rs   内置代理源目录（`proxygate providers` 输出它）
+  providers.rs   内置代理源目录（`GET /api/v1/providers` 输出它）
   pool.rs        池子：合并、健康写入、选择（轮次）
   checker.rs     健康探测 + 共享上游 client 缓存
   selector.rs    候选过滤与 random/latency 策略
@@ -606,7 +548,7 @@ src/
 assets/          编进二进制的数据（User-Agent 池）
 subscribers/     exec subscriber 契约 + example.py
 tests/           集成测试（进程内假上游）
-SKILL.md         面向 AI agent 的说明（`proxygate skill` 输出它）
+SKILL.md         面向 agent 与人的手册（`GET /help` 输出它）
 ```
 
 拆成库之后集成测试能直接驱动真实网关（`tests/common/mod.rs` 放那些假上游），不用起子
@@ -630,8 +572,8 @@ SKILL.md         面向 AI agent 的说明（`proxygate skill` 输出它）
   每页一条订阅源，各自计数、各自失败。rola-ip 因此从 500 条变成全部 10 页 4,724 条。
 - `serve` 先挂端口、再在后台初始化；未就绪时 REST API 返回 `503` + `Retry-After`，
   而不是假装池子是空的。
-- 文档注释一律写成中文，docs.rs 展示的就是它（也正因如此 `proxygate --help`
-  的内容是中文）。`SKILL.md` 保持英文，因为它面向 agent。
+- 文档注释一律写成中文，docs.rs 展示的就是它。`SKILL.md` 保持英文，因为它面向
+  agent，而且它就是 `GET /help` 的正文。
 
 ## 许可
 

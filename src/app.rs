@@ -18,7 +18,7 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::model::{self, ProbeOutcome, Proxy, ProxyId};
 use crate::pool::{HealthRestore, ProxyPool, Selection};
-use crate::progress::{CheckEvent, FetchEvent, Progress};
+use crate::progress::{CheckEvent, FetchEvent, Progress, VerifyEvent};
 use crate::selector::Strategy;
 use crate::state::{self, CacheFile, HealthFile, StateStore, TargetHealthFile};
 use crate::subscriber::SubscriberSet;
@@ -248,6 +248,25 @@ pub struct App {
     pub readiness: Arc<Readiness>,
     /// 抓取与探测的进度接收器；命令行渲染成进度，`serve` 转成日志。
     pub progress: Arc<dyn Progress>,
+    /// 发放前验证用的检查器：超时取 `selection.verify_timeout`，比全池
+    /// 探测用的 `health.timeout` 短。
+    verify_checker: HealthChecker,
+    /// `POST /api/v1/refresh` 用它把刷新循环提前叫醒。
+    refresh_now: Notify,
+    /// `POST /api/v1/check` 用它把探测循环提前叫醒。
+    check_now: Notify,
+}
+
+impl std::fmt::Debug for App {
+    /// 手写 `Debug`：`App` 里装的是池子、客户端与任务状态，没有适合一行打印
+    /// 的东西，列几个有意义的字段就够（`ApiState` 需要 `Debug`）。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("App")
+            .field("config_path", &self.config_path)
+            .field("proxies", &self.pool.len())
+            .field("ready", &self.readiness.is_ready())
+            .finish_non_exhaustive()
+    }
 }
 
 impl App {
@@ -274,6 +293,12 @@ impl App {
             config.gateway.connect_timeout,
         ));
         let checker = HealthChecker::new(&config.health, clients.clone());
+        // 发放验证用的是同一套目标与判定规则，只是超时更短。
+        let verify_clients = Arc::new(ProxyClients::new(
+            config.selection.verify_timeout,
+            config.gateway.connect_timeout,
+        ));
+        let verify_checker = HealthChecker::new(&config.health, verify_clients);
         let subscribers = SubscriberSet::new(&config)?;
         let pool = Arc::new(ProxyPool::new());
 
@@ -361,6 +386,9 @@ impl App {
             busy: tokio::sync::Mutex::new(()),
             readiness: Arc::new(Readiness::default()),
             progress,
+            verify_checker,
+            refresh_now: Notify::new(),
+            check_now: Notify::new(),
         };
 
         // The cache is the only source of freshness left once `initialize`
@@ -642,6 +670,98 @@ impl App {
         Some(selection)
     }
 
+    /// 请求后台立刻抓取一轮订阅源。
+    ///
+    /// 由 `POST /api/v1/refresh` 调用：刷新循环会提前醒来，而不是等到
+    /// 下一个 `refresh.interval`。真正干活的是那个循环，所以这里没有并发
+    /// 问题，也不需要第二份抓取逻辑。
+    pub fn request_refresh(&self) {
+        self.refresh_now.notify_one();
+    }
+
+    /// 请求后台立刻探测一轮代理池（`POST /api/v1/check`）。
+    pub fn request_check(&self) {
+        self.check_now.notify_one();
+    }
+
+    /// 发放一个代理：需要时先现探一次，探通了才交出去。
+    ///
+    /// 与 [`App::select`] 的区别只有一点——**保证交出去的这个刚刚是可用的**：
+    ///
+    /// * 判定比 `selection.max_age` 新（默认 60 秒）→ 直接用，毫秒级返回；
+    /// * 判定旧了（或者从来没探过）→ 探它一次，通过就发；失败就把它标死，
+    ///   再按轮换挑下一个，最多 `selection.verify_attempts` 次。
+    ///
+    /// 顺带一个副作用：每次验证都会把结果写回池子，所以代理池是被"用"干净
+    /// 的，而不是只靠周期性的全量探测。
+    pub async fn select_for_handout(&self, strategy: Strategy) -> Option<Selection> {
+        let attempts = if self.config.selection.verify {
+            self.config.selection.verify_attempts.max(1)
+        } else {
+            1
+        };
+
+        for attempt in 1..=attempts {
+            let selection = self.select(strategy)?;
+
+            if !self.needs_verification(&selection.proxy) {
+                debug!(
+                    proxy = %selection.proxy.to_masked_string(),
+                    "handing out a proxy with a fresh verdict"
+                );
+                return Some(selection);
+            }
+
+            let started = Instant::now();
+            let result = self.verify_checker.check_one(&selection.proxy).await;
+            let now = SystemTime::now();
+
+            if result.alive {
+                self.pool
+                    .record_success(&selection.proxy.id, result.latency, now);
+                self.progress.verify(VerifyEvent {
+                    proxy: &selection.proxy.to_masked_string(),
+                    ok: true,
+                    latency: Some(started.elapsed()),
+                    error: None,
+                    attempt,
+                    attempts,
+                });
+                return Some(selection);
+            }
+
+            let error = result.error.unwrap_or_else(|| "unknown error".to_string());
+            self.pool
+                .record_failure(&selection.proxy.id, self.config.health.max_failures);
+            self.progress.verify(VerifyEvent {
+                proxy: &selection.proxy.to_masked_string(),
+                ok: false,
+                latency: None,
+                error: Some(&error),
+                attempt,
+                attempts,
+            });
+        }
+
+        None
+    }
+
+    /// 该代理是否需要现探一次才能发放。
+    fn needs_verification(&self, proxy: &Proxy) -> bool {
+        if !self.config.selection.verify {
+            return false;
+        }
+        let max_age = self.config.selection.max_age;
+        match proxy.last_checked_at {
+            // 时钟回拨或未来时间戳：当作新鲜，别在这里较劲。
+            Some(checked_at) => SystemTime::now()
+                .duration_since(checked_at)
+                .map(|age| age > max_age)
+                .unwrap_or(false),
+            None => true,
+        }
+    }
+
     /// 写入轮换状态，可选择绕过节流。
     pub fn persist(&self, force: bool) -> Result<bool> {
         let now = SystemTime::now();
@@ -707,10 +827,10 @@ impl App {
         let stats = self.pool.stats();
         if stats.total == 0 {
             if self.subscribers.configured() == 0 {
-                "the pool is empty and no subscribers are configured; add one to config.yaml and run `proxygate refresh`".to_string()
+                "the pool is empty and no subscribers are configured; add one to config.yaml and POST /api/v1/refresh".to_string()
             } else {
                 format!(
-                    "the pool is empty: {} subscriber(s) produced no usable proxy (run `proxygate refresh -v` to see why)",
+                    "the pool is empty: {} subscriber(s) produced no usable proxy (POST /api/v1/refresh and watch the logs to see why)",
                     self.subscribers.configured()
                 )
             }
@@ -792,6 +912,26 @@ impl Progress for LogProgress {
             "health check progress"
         );
     }
+
+    fn verify(&self, event: VerifyEvent<'_>) {
+        if event.ok {
+            info!(
+                proxy = event.proxy,
+                attempt = event.attempt,
+                attempts = event.attempts,
+                elapsed_ms = event.latency.map(|l| l.as_millis() as u64).unwrap_or(0),
+                "hand-out verification passed"
+            );
+        } else {
+            info!(
+                proxy = event.proxy,
+                attempt = event.attempt,
+                attempts = event.attempts,
+                error = event.error.unwrap_or("unknown error"),
+                "hand-out verification failed; trying the next candidate"
+            );
+        }
+    }
 }
 
 /// 关闭标志被置位（或发送端被丢弃）时完成。
@@ -868,6 +1008,10 @@ pub(crate) async fn refresh_loop(
         tokio::select! {
             _ = wait_for_shutdown(shutdown.clone()) => return,
             _ = ticker.tick() => {}
+            // `POST /api/v1/refresh`：客户端要求现在就来一轮。
+            _ = app.refresh_now.notified() => {
+                info!("refresh requested through the API");
+            }
             // 未就绪时，客户端的一次 503 就足以让我们提前醒来重试。
             _ = app.readiness().wait_for_request(INITIALIZE_RETRY_INTERVAL),
                 if !app.readiness().is_ready() => {}
@@ -884,12 +1028,16 @@ pub(crate) async fn health_loop(app: Arc<App>, shutdown: watch::Receiver<bool>) 
     loop {
         tokio::select! {
             _ = wait_for_shutdown(shutdown.clone()) => return,
-            _ = ticker.tick() => {
-                match app.check(false).await {
-                    Ok(report) => info!(report = %report.summary(), "health check complete"),
-                    Err(error) => warn!(error = %error, "health check failed"),
-                }
+            _ = ticker.tick() => {}
+            // `POST /api/v1/check`：客户端要求现在就来一轮。
+            _ = app.check_now.notified() => {
+                info!("health check requested through the API");
             }
+        }
+
+        match app.check(false).await {
+            Ok(report) => info!(report = %report.summary(), "health check complete"),
+            Err(error) => warn!(error = %error, "health check failed"),
         }
     }
 }

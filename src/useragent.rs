@@ -1,6 +1,6 @@
 //! 内置 User-Agent 池。
 //!
-//! `proxygate getua` 与 `GET /api/v1/getua` 会返回下列之一：
+//! `GET /api/v1/getua` 会返回下列之一：
 //! 即内嵌文件 [`assets/user_agents.txt`](../assets/user_agents.txt)：
 //! 共 100 个桌面浏览器（Windows、macOS 和 Linux 上的 Chrome、
 //! Edge、Firefox、Safari）；移动端 User-Agent 被有意排除在外。

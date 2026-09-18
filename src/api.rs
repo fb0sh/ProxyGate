@@ -1,65 +1,52 @@
-//! REST API。
+//! REST API：整个程序的对外面。
 //!
-//! 路由覆盖 CLI 需要的最小端点集，让其他语言也能直接调用：
+//! 没有命令行客户端，所以这里覆盖全部操作：
 //!
 //! ```text
-//! GET /                 端点索引
-//! GET /api/v1/get       一个代理（纯文本，或 ?format=json）
-//! GET /api/v1/getua     一个内置 User-Agent（纯文本，或 ?format=json）
-//! GET /api/v1/proxies   整个代理池，凭据已脱敏
-//! GET /api/v1/health    存活状态与代理池计数
+//! GET  /help                  面向人与 agent 的手册（就是 SKILL.md）
+//! GET  /                      端点索引
+//! GET  /api/v1/get            一个代理（纯文本，或 ?format=json）
+//! GET  /api/v1/getua          一个内置 User-Agent（纯文本，或 ?format=json）
+//! GET  /api/v1/proxies        整个代理池，凭据已脱敏
+//! GET  /api/v1/health         存活状态、就绪状态与代理池计数
+//! GET  /api/v1/providers      内置代理来源清单
+//! GET  /api/v1/config         带注释的示例配置
+//! POST /api/v1/refresh        让后台立刻抓取一轮订阅源
+//! POST /api/v1/check          让后台立刻探测一轮代理池
 //! ```
 //!
-//! 只有 `GET /api/v1/get?format=json` 会返回 JSON；默认情况下该端点只回一行
-//! `host:port`。响应里的凭据一律脱敏（替换成 `***:***`）。网关也可以把这个
-//! 路由挂到代理端口上，二者能区分彼此的请求。
+//! 只有 `?format=json` 或 `/help` 之外的写操作才会返回 JSON；`/api/v1/get`
+//! 默认只回一行 `host:port`。响应里的凭据一律脱敏（替换成 `***:***`）。
+//! 网关也可以把这个路由挂到代理端口上，二者按请求形状区分彼此。
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Instant;
 
 use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::app::{App, Readiness};
-use crate::config::HealthRequirement;
 use crate::error::{Error, Result};
-use crate::pool::ProxyPool;
-use crate::selector::Strategy;
-use crate::state::{self, StateStore};
+use crate::state;
 
 /// 未就绪时 `/api/v1/get` 在 `Retry-After` 里给出的建议重试秒数。
 pub const INITIALIZE_RETRY_SECONDS: u64 = 5;
 
-/// 相邻两次重写 `state.json` 之间的最小间隔。
-const PERSIST_INTERVAL: Duration = Duration::from_secs(2);
-
 /// API 路由背后的共享状态。
+///
+/// 它只持有 [`App`] 与启动时刻：处理器需要的池子、选择参数、状态存储与就绪
+/// 状态都从 `app` 上读，不复制一份，免得和别处（后台循环、发放验证）漂开。
 #[derive(Debug)]
 pub struct ApiState {
-    /// 用来挑选代理的代理池。
-    pub pool: Arc<ProxyPool>,
-    /// 选择代理时使用的选择器策略。
-    pub strategy: Strategy,
-    /// 同一代理在被再次选中前需要等待的时长。
-    pub reuse_after: Duration,
-    /// 轮换状态的状态存储。
-    pub store: Arc<StateStore>,
+    /// 运行时上下文：池子、选择参数、状态存储、就绪状态与发放验证都在里面。
+    pub app: Arc<App>,
     /// 进程启动时刻，用于计算 `uptime_seconds`。
     pub started: Instant,
-    /// 健康检查的探测目标，由 `/health` 返回，便于运维查看。
-    pub health_targets: Vec<String>,
-    /// 是否要求所有探测目标都通过，代理才算存活。
-    pub health_require: HealthRequirement,
-    /// 冷启动状态：未就绪时 `/api/v1/get` 返回 `503` 而不是空代理。
-    ///
-    /// 未就绪时它的 [`Readiness::request_init`] 会推动后台立刻重试一次
-    /// 初始化，所以客户端不需要自己反复轰炸。
-    pub readiness: Arc<Readiness>,
 }
 
 impl ApiState {
@@ -69,15 +56,14 @@ impl ApiState {
     /// `/api/v1/health` 里的 `uptime_seconds`。
     pub fn new(app: Arc<App>) -> Self {
         Self {
-            pool: app.pool.clone(),
-            strategy: app.config.selection.strategy,
-            reuse_after: app.config.selection.reuse_after,
-            store: app.store.clone(),
+            app,
             started: Instant::now(),
-            health_targets: app.config.health.targets(),
-            health_require: app.config.health.require,
-            readiness: app.readiness().clone(),
         }
+    }
+
+    /// 冷启动状态：未就绪时 `/api/v1/get` 返回 `503` 而不是空代理。
+    fn readiness(&self) -> &Arc<Readiness> {
+        self.app.readiness()
     }
 }
 
@@ -85,10 +71,15 @@ impl ApiState {
 pub fn router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/help", get(help))
         .route("/api/v1/get", get(get_proxy))
         .route("/api/v1/getua", get(get_user_agent))
         .route("/api/v1/proxies", get(list_proxies))
         .route("/api/v1/health", get(health))
+        .route("/api/v1/providers", get(list_providers))
+        .route("/api/v1/config", get(example_config))
+        .route("/api/v1/refresh", post(trigger_refresh))
+        .route("/api/v1/check", post(trigger_check))
         .with_state(state)
 }
 
@@ -207,10 +198,10 @@ async fn get_proxy(State(state): State<Arc<ApiState>>, Query(query): Query<GetQu
     // 冷启动（第一次抓取 + 探测）还没做完时，池子里的内容不代表最终结果，
     // 与其回答"没有可用代理"，不如明确说"还没准备好"。同时请后台立刻再试
     // 一次，所以下一次请求通常就能拿到代理。
-    if !state.readiness.is_ready() {
-        state.readiness.request_init();
+    if !state.readiness().is_ready() {
+        state.readiness().request_init();
         let retry_after = INITIALIZE_RETRY_SECONDS.to_string();
-        let error = state.readiness.error();
+        let error = state.readiness().error();
         let retry_hint = format!(
             "proxygate: still initializing the proxy pool; retry in {INITIALIZE_RETRY_SECONDS} seconds\n"
         );
@@ -227,7 +218,7 @@ async fn get_proxy(State(state): State<Arc<ApiState>>, Query(query): Query<GetQu
                     "error": "initializing",
                     "message": "the proxy pool is still being initialized",
                     "retry_after_seconds": INITIALIZE_RETRY_SECONDS,
-                    "attempts": state.readiness.attempts(),
+                    "attempts": state.readiness().attempts(),
                     "detail": error,
                 })),
             )
@@ -246,22 +237,26 @@ async fn get_proxy(State(state): State<Arc<ApiState>>, Query(query): Query<GetQu
             .into_response();
     }
 
-    let now = SystemTime::now();
-    let Some(selection) = state.pool.select(state.strategy, state.reuse_after, now) else {
+    // 与命令行时代同一条路径：判定够新就直接发，旧了先现探一次
+    // （`selection.verify`），探不通就换下一个候选。
+    let Some(selection) = state
+        .app
+        .select_for_handout(state.app.config.selection.strategy)
+        .await
+    else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            "proxygate: no healthy proxy available\n",
+            [
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (
+                    header::RETRY_AFTER,
+                    INITIALIZE_RETRY_SECONDS.to_string().as_str(),
+                ),
+            ],
+            "proxygate: no verified proxy available\n",
         )
             .into_response();
     };
-
-    if let Err(error) = state
-        .store
-        .persist_throttled(&state.pool, now, PERSIST_INTERVAL)
-    {
-        tracing::warn!(error = %error, "cannot persist state");
-    }
 
     tracing::debug!(
         proxy = %selection.proxy.to_masked_string(),
@@ -292,7 +287,7 @@ async fn get_proxy(State(state): State<Arc<ApiState>>, Query(query): Query<GetQu
 
 /// `GET /api/v1/getua` —— 从内置池里随机取一个 User-Agent。
 ///
-/// 无状态且分布均匀，与 `proxygate getua` 完全一致：不做轮换，也不记忆
+/// 无状态且分布均匀：不做轮换，也不记忆
 /// 之前的调用。
 async fn get_user_agent(Query(query): Query<GetQuery>) -> Response {
     let user_agent = crate::useragent::random();
@@ -315,6 +310,7 @@ async fn get_user_agent(Query(query): Query<GetQuery>) -> Response {
 /// `GET /api/v1/proxies` —— 返回整个代理池，凭据已脱敏。
 async fn list_proxies(State(state): State<Arc<ApiState>>) -> Json<Vec<ProxyEntry>> {
     let mut proxies: Vec<ProxyEntry> = state
+        .app
         .pool
         .snapshot()
         .into_iter()
@@ -355,9 +351,9 @@ async fn list_proxies(State(state): State<Arc<ApiState>>) -> Json<Vec<ProxyEntry
 
 /// `GET /api/v1/health` —— 存活状态与代理池计数。
 async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
-    let stats = state.pool.stats();
+    let stats = state.app.pool.stats();
     // 未就绪优先：`empty` 会被误读成"配置里没有来源"，而这时其实是在初始化。
-    let status = if !state.readiness.is_ready() {
+    let status = if !state.readiness().is_ready() {
         "initializing"
     } else if stats.total == 0 {
         "empty"
@@ -371,14 +367,14 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
         status,
         version: env!("CARGO_PKG_VERSION"),
         uptime_seconds: state.started.elapsed().as_secs(),
-        generation: state.pool.generation(),
-        strategy: state.strategy.as_str(),
-        health_targets: state.health_targets.clone(),
-        health_require: state.health_require.as_str(),
-        ready: state.readiness.is_ready(),
-        initializing: state.readiness.is_initializing(),
-        initialization_attempts: state.readiness.attempts(),
-        initialization_error: state.readiness.error(),
+        generation: state.app.pool.generation(),
+        strategy: state.app.config.selection.strategy.as_str(),
+        health_targets: state.app.config.health.targets(),
+        health_require: state.app.config.health.require.as_str(),
+        ready: state.readiness().is_ready(),
+        initializing: state.readiness().is_initializing(),
+        initialization_attempts: state.readiness().attempts(),
+        initialization_error: state.readiness().error(),
         proxies: HealthCounts {
             total: stats.total,
             alive: stats.alive,
@@ -387,18 +383,139 @@ async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
     })
 }
 
+/// `GET /help` —— 手册本身。
+///
+/// 返回编译进二进制的 `SKILL.md`：agent 可以整份读下去，人类 `curl` 下来
+/// 就是一份 markdown 文件。用 `text/markdown` 而不是 HTML，是为了不加一个
+/// markdown 渲染依赖；浏览器里也能当纯文本读。
+async fn help() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/markdown; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        crate::SKILL,
+    )
+        .into_response()
+}
+
+/// `/api/v1/providers` 的一个条目。
+#[derive(Debug, Serialize)]
+struct ProviderEntry {
+    /// 目录里的 id，配置里用 `provider:` 引用它。
+    name: &'static str,
+    /// 端点（分页来源带 `{page}` 占位符）。
+    url: &'static str,
+    /// 响应内容的解析格式。
+    format: &'static str,
+    /// 分页范围，如 `1-10`；不分页时是 `-`。
+    pages: String,
+    /// 页数。
+    page_count: u32,
+    /// 每个来源最多保留多少条（`null` 表示不限）。
+    limit: Option<usize>,
+    /// 文档或落地页。
+    homepage: &'static str,
+    /// 使用注意事项。
+    notes: &'static str,
+}
+
+/// `GET /api/v1/providers` —— 内置代理来源清单。
+async fn list_providers() -> Json<Vec<ProviderEntry>> {
+    let providers = crate::providers::ALL
+        .iter()
+        .map(|provider| ProviderEntry {
+            name: provider.name,
+            url: provider.url,
+            format: provider.format.as_str(),
+            pages: provider.pages_label(),
+            page_count: provider.page_count(),
+            limit: provider.limit,
+            homepage: provider.homepage,
+            notes: provider.notes,
+        })
+        .collect();
+    Json(providers)
+}
+
+/// `GET /api/v1/config` —— 带注释的示例配置。
+///
+/// `GET /api/v1/config > config.yaml` 就是一份可直接用的配置。
+async fn example_config() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/yaml; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        crate::config::EXAMPLE_CONFIG,
+    )
+        .into_response()
+}
+
+/// 触发类端点的响应体。
+#[derive(Debug, Serialize)]
+struct TriggerResponse {
+    /// `accepted`：后台已经收到请求。
+    status: &'static str,
+    /// 人话说明。
+    message: &'static str,
+    /// 该去轮询哪个端点看结果。
+    poll: &'static str,
+}
+
+/// `POST /api/v1/refresh` —— 让后台立刻抓取一轮订阅源。
+///
+/// 真正干活的是 `serve` 的刷新循环（`App::request_refresh` 把它叫醒），
+/// 所以这里立刻返回 `202`，抓取进度与结果看日志，池子变化看
+/// `/api/v1/health` 与 `/api/v1/proxies`。全量抓取可能要几分钟，让 HTTP
+/// 请求干等那么久不是个好接口。
+async fn trigger_refresh(State(state): State<Arc<ApiState>>) -> Response {
+    state.app.request_refresh();
+    (
+        StatusCode::ACCEPTED,
+        Json(TriggerResponse {
+            status: "accepted",
+            message: "a subscriber refresh will start now; watch the logs and /api/v1/health",
+            poll: "/api/v1/health",
+        }),
+    )
+        .into_response()
+}
+
+/// `POST /api/v1/check` —— 让后台立刻探测一轮代理池。
+async fn trigger_check(State(state): State<Arc<ApiState>>) -> Response {
+    state.app.request_check();
+    (
+        StatusCode::ACCEPTED,
+        Json(TriggerResponse {
+            status: "accepted",
+            message: "a health check will start now; watch the logs and /api/v1/health",
+            poll: "/api/v1/health",
+        }),
+    )
+        .into_response()
+}
+
 /// `GET /` —— 一个极简索引，让端口自己说明用途。
 async fn index() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "name": "proxygate",
         "version": env!("CARGO_PKG_VERSION"),
+        "help": "/help",
         "endpoints": {
+            "help": "/help",
             "get": "/api/v1/get",
             "get_json": "/api/v1/get?format=json",
             "getua": "/api/v1/getua",
             "getua_json": "/api/v1/getua?format=json",
             "proxies": "/api/v1/proxies",
             "health": "/api/v1/health",
+            "providers": "/api/v1/providers",
+            "config": "/api/v1/config",
+            "refresh": "POST /api/v1/refresh",
+            "check": "POST /api/v1/check",
         },
         "http_proxy": "point your client at the gateway port (default 127.0.0.1:8080)",
     }))
@@ -411,8 +528,9 @@ mod tests {
     use crate::pool::HealthUpdate;
     use axum::body::Body;
     use axum::http::Request;
+    use std::time::{Duration, SystemTime};
 
-    use crate::config::Config;
+    use crate::config::{Config, HealthRequirement};
     use tower::ServiceExt;
 
     /// 测试用的运行时上下文：缓存目录指向临时目录，避免碰到真实的
@@ -447,6 +565,47 @@ mod tests {
     /// 冷启动还没做完的共享状态。
     fn initializing_state() -> Arc<ApiState> {
         Arc::new(ApiState::new(test_app()))
+    }
+
+    /// 一个干净、独立的运行时上下文：缓存目录每次新建，避免上一次运行留下的
+    /// `cache.json` 干扰（尤其是"池子里只该有测试塞进去的代理"这类断言）。
+    ///
+    /// `verify: false` 用来对比「发放验证」开关的作用；`max_age = 0` 让判定
+    /// 永远算旧，于是必然现探。
+    fn isolated_app(verify: bool) -> Arc<App> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "proxygate-api-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut config = Config::default();
+        config.state.dir = Some(dir);
+        config.health.target = Some("http://example.test/".to_string());
+        config.health.targets = None;
+        config.health.timeout = Duration::from_millis(500);
+        config.health.concurrency = 1;
+        config.selection.verify = verify;
+        config.selection.max_age = Duration::from_secs(0);
+        Arc::new(App::new(config, None).expect("app"))
+    }
+
+    /// 只接受连接然后立刻关掉的"上游代理"：现探必然失败。
+    async fn dead_proxy() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        address
     }
 
     async fn body_string(response: Response) -> String {
@@ -653,6 +812,164 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
         assert_eq!(value["error"], "initializing");
         assert_eq!(value["retry_after_seconds"], INITIALIZE_RETRY_SECONDS);
+    }
+
+    #[tokio::test]
+    async fn get_verifies_the_proxy_before_handing_it_out() {
+        let address = dead_proxy().await;
+        let app = isolated_app(true);
+        // 缓存里它是"活的"，但现探会失败——这正是发放验证要拦住的场景。
+        let (id, _) = app
+            .pool
+            .insert(normalize(&format!("http://{address}")).expect("proxy url"));
+        app.pool.update_health(&[(
+            id,
+            HealthUpdate {
+                alive: true,
+                latency: Some(Duration::from_millis(5)),
+                checked_at: SystemTime::now(),
+                probes: Vec::new(),
+            },
+        )]);
+        app.readiness.mark_ready();
+
+        let response = router(Arc::new(ApiState::new(app)))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/get")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_string(response).await;
+        assert!(body.contains("no verified proxy"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn verification_can_be_turned_off() {
+        let address = dead_proxy().await;
+        let app = isolated_app(false);
+        let (id, _) = app
+            .pool
+            .insert(normalize(&format!("http://{address}")).expect("proxy url"));
+        app.pool.update_health(&[(
+            id,
+            HealthUpdate {
+                alive: true,
+                latency: Some(Duration::from_millis(5)),
+                checked_at: SystemTime::now(),
+                probes: Vec::new(),
+            },
+        )]);
+        app.readiness.mark_ready();
+
+        let response = router(Arc::new(ApiState::new(app)))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/get")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // `selection.verify: false` 时行为和以前一样：判定说什么就发什么。
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            body_string(response).await.contains(&address.to_string()),
+            "expected the cached proxy to be handed out"
+        );
+    }
+
+    #[tokio::test]
+    async fn help_serves_the_manual() {
+        let response = router(initializing_state())
+            .oneshot(Request::builder().uri("/help").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/markdown; charset=utf-8")
+        );
+
+        let body = body_string(response).await;
+        assert!(body.starts_with("---\n"), "frontmatter missing");
+        assert!(body.contains("/api/v1/get"), "endpoints missing");
+    }
+
+    #[tokio::test]
+    async fn providers_and_config_are_downloadable() {
+        let response = router(initializing_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let providers: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        let rola = providers
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "rola-ip")
+            .expect("rola-ip is in the catalog");
+        assert_eq!(rola["pages"], "1-10");
+        assert_eq!(rola["page_count"], 10);
+
+        let response = router(initializing_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/yaml; charset=utf-8")
+        );
+        assert!(
+            body_string(response).await.contains("builtin-subscribers:"),
+            "the example config should be served verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_and_check_can_be_triggered() {
+        for path in ["/api/v1/refresh", "/api/v1/check"] {
+            let response = router(initializing_state())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "{path}");
+            let value: serde_json::Value =
+                serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(value["status"], "accepted", "{path}");
+            assert_eq!(value["poll"], "/api/v1/health", "{path}");
+        }
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ Turn any proxy source into a uniform, always-ready proxy pool.
 
 ProxyGate collects proxies from HTTP endpoints, local files or arbitrary scripts,
 normalizes whatever it finds into `scheme://user:pass@host:port`, checks which
-ones actually work, and then hands them out — through a CLI, a REST API, or as a
+ones actually work, and then hands them out — through a REST API, or as a
 transparent HTTP proxy gateway that hides the upstream (and its credentials)
 from your clients.
 
@@ -26,7 +26,7 @@ from your clients.
                        ↓
           ┌────────────┼────────────┐
           ↓            ↓            ↓
-     CLI get       REST API      Gateway
+     REST API      Gateway
                                 HTTP Proxy
 ```
 
@@ -38,37 +38,37 @@ From the moment a proxy enters the pool, nothing cares where it came from.
 
 ## Quick start
 
+**This is a server. There is no command-line client** — once it runs, everything
+happens over HTTP:
+
 ```bash
-# 1. One real upstream proxy.
-proxygate get
+# 1. A config (the archives ship one; the server can also hand you its own).
+cp config.example.yaml config.yaml
+
+# 2. Start it: no arguments, reads $PROXYGATE_CONFIG or ./config.yaml.
+proxygate
+
+# 3. Get a (verified) proxy and use it.
+curl -sf http://127.0.0.1:8081/api/v1/get
 http://user:pass@1.2.3.4:8080
+curl -x "$(curl -sf http://127.0.0.1:8081/api/v1/get)" https://example.com
 
-# 2. Use it directly.
-curl -x "$(proxygate get)" https://example.com
-
-# 3. Or run the always-on gateway.
-proxygate serve
+# 4. Or just point your client at the gateway port.
 curl -x http://127.0.0.1:8080 https://example.com
 
-# 4. Or ask the REST API.
-curl http://127.0.0.1:8081/api/v1/get
+# 5. The manual is an endpoint, readable by agents and humans alike.
+curl -s http://127.0.0.1:8081/help
 ```
 
-The gateway can also require credentials of its own:
-
-```bash
-proxygate serve --listen 0.0.0.0:8080 --auth admin:secret
-curl -x http://admin:secret@127.0.0.1:8080 https://example.com
-```
-
-Two layers of authentication stay completely independent: your clients
-authenticate to ProxyGate, ProxyGate authenticates to the upstream provider.
+Mind the `-f` in `curl -sf`: when the pool has nothing to give, `/get` answers
+`503` with an explanatory body, and without `-f` that body would be pasted into
+`-x` as if it were a proxy address.
 
 ## Install
 
 ```bash
 cargo build --release
-install -m755 target/release/proxygate ~/.local/bin/proxygate
+install -m755 target/release/proxygate ~/.local/bin/proxygate   # starts the server
 ```
 
 Or with Docker (see [`Dockerfile`](Dockerfile)):
@@ -112,9 +112,8 @@ With no config file it starts with an empty pool, which is useful for testing
 but not much else. Start from [`config.example.yaml`](config.example.yaml).
 
 > The generated config carries **no client authentication**: it assumes the
-> gateway stays reachable only from this machine. Add `--auth user:pass` on the
-> command line when you expose it — that keeps credentials out of a checked-in
-> file.
+> gateway stays reachable only from this machine. Set `gateway.auth` when you
+> expose it — keeping credentials in a file you do not commit.
 
 | Key                   | Default                                   | Meaning                                              |
 | --------------------- | ----------------------------------------- | ---------------------------------------------------- |
@@ -131,6 +130,10 @@ but not much else. Start from [`config.example.yaml`](config.example.yaml).
 | `health.max_failures` | `3`                                       | Consecutive failures tolerated for a working proxy    |
 | `selection.strategy`  | `random`                                  | `random` or `latency`                                 |
 | `selection.reuse_after` | `30m`                                   | Prefer proxies unused in this window                  |
+| `selection.verify`    | `true`                                    | Probe the chosen proxy before handing it out          |
+| `selection.max_age`   | `60s`                                     | Use its verdict if newer than this; `0s` = always probe |
+| `selection.verify_timeout` | `3s`                                 | Per-candidate timeout while verifying                 |
+| `selection.verify_attempts` | `3`                                 | How many candidates to try before giving up           |
 | `gateway.retries`     | `2`                                       | Extra upstream attempts after the first failure       |
 | `gateway.connect_timeout` | `10s`                                 | Upstream connect + CONNECT handshake timeout       |
 | `gateway.auth`        | –                                         | `user:password` required from clients                 |
@@ -171,11 +174,10 @@ The port splits traffic by request shape:
 | `GET http://host/path` (absolute)   | proxy request | HTTP gateway |
 | `GET /api/v1/get` (origin-form)     | API request   | REST API     |
 
-> **Auth covers proxy requests only.** `gateway.auth` (`--auth user:pass`)
+> **Auth covers proxy requests only.** `gateway.auth`
 > rejects proxy requests, but an API sharing the port stays open — anyone who can
 > reach the port can read `/api/v1/proxies`. Only share the port on a trusted
-> interface (the default is `127.0.0.1`). `proxygate serve` logs a warning when
-> you do. Expose it publicly with the API back on its own port, or behind a
+> interface (the default is `127.0.0.1`). The server logs a warning when you do. Expose it publicly with the API back on its own port, or behind a
 > firewall rule.
 
 There is no functional difference between the two layouts; share a port when
@@ -195,9 +197,9 @@ builtin-subscribers: enabled      # subscribe to every catalog entry
 # disabled                        # use only the subscribers you write
 ```
 
-`proxygate providers` lists the whole catalog (endpoint, format, caveats, docs)
+`GET /api/v1/providers` lists the whole catalog (endpoint, format, caveats, docs)
 and takes `--json`. The switch defaults to `disabled` — nothing reaches the
-network unless a config says so — and `genconfig` writes `enabled`.
+network unless a config says so — and the example config enables it.
 
 A single source can also be picked by name and tuned. A builtin is an HTTP fetch
 underneath, so it takes the same overrides plus `limit`:
@@ -285,94 +287,26 @@ themselves. ProxyGate rejects those (`invalid peer certificate`) — a proxy tha
 re-signs traffic is not a proxy you want, and a client that verifies
 certificates could not use it anyway.
 
-## CLI
+## Logs and progress
 
-Fetching and probing take minutes (with every built-in enabled a `refresh` is
-about four minutes, three of them the single GitHub list), so progress is
-printed to **stderr** by default:
-
-```console
-$ proxygate refresh
-→ 抓取 scdn（json）
-✓ scdn  20 个代理，用时 2s，累计 20
-    http://1.2.3.4:8080
-    …还有 17 个（加 --proxies 全部列出）
-  … freeproxy-gh 已下载 1.2 MB，用时 2m10s
-✗ broken-source  失败：connect: … (Connection refused (os error 111))
-  探测 1200/5157，存活 23，用时 1m20s
-```
-
-The text is Chinese, like the rest of the CLI output. Per subscriber line: name,
-how many proxies, how many were skipped/rejected/truncated, elapsed time and the
-running total. Downloads report bytes every 10 seconds, health checks report
-progress every 5 seconds, five proxies are shown as a sample unless you pass
-`--proxies` (which lists all of them). `-q` turns progress off; progress goes to
-stderr, so `get` still prints exactly one line on stdout and `refresh --json`
-still prints only JSON.
-
-`proxygate --help` (and every subcommand's `--help`) is printed in Chinese: clap
-uses the doc comments as help text. Only clap's own structural headings
-(`Usage:`, `Options:`) and its generated error messages stay English — clap has
-no localization hook for them.
-
-```text
-proxygate get     [--format text|json] [--strategy random|latency] [--no-refresh] [--no-check] [--mask]
-proxygate list    [--alive] [--all] [--show-auth] [--json] [--no-refresh] [--no-check]
-proxygate refresh [--json]
-proxygate check   [--json] [--concurrency N] [--alive-only]
-proxygate serve   [--listen ADDR] [--api ADDR] [--auth USER:PASS] [--no-refresh]
-proxygate genconfig                       # the annotated example config, to stdout
-proxygate getua   [--format text|json]    # one random user agent
-proxygate skill                           # the agent-facing SKILL.md, to stdout
-proxygate providers [--json]              # the built-in proxy source catalog
-```
-
-Global flags: `-c/--config <path>`, `-v` (info), `-vv` (debug), `-vvv` (trace),
-`-q` (errors only). `RUST_LOG` overrides the log filter.
-
-`proxygate get` writes **exactly one line** — the proxy URL — to stdout; every
-log line goes to stderr. That is what makes `curl -x "$(proxygate get)"` work.
-
-Exit codes: `0` success, `1` error, `3` no proxy available.
-
-`genconfig` prints the annotated example config that is embedded in the binary,
-so an installed `proxygate` can bootstrap a config with no checkout around:
-
-```bash
-proxygate genconfig > config.yaml
-```
-
-`getua` prints one user agent out of 100 built into the binary
-([`assets/user_agents.txt`](assets/user_agents.txt) — desktop Chrome, Edge,
-Firefox and Safari on Windows, macOS and Linux; no mobile agents, on purpose).
-It is uniformly random and stateless: no rotation, no memory of previous calls,
-so the same string can come up twice in a row. Handy for pairing with a fresh
-proxy:
-
-```bash
-curl -x "$(proxygate get)" -A "$(proxygate getua)" https://example.com
-```
-
-`skill` prints [`SKILL.md`](SKILL.md) — the same contract this document
-describes, written for an AI agent to read on its own (commands, exit codes, the
-API, the config keys that matter, and what not to trust). It only writes to
-stdout; where the text ends up is the caller's business:
-
-```bash
-proxygate skill > SKILL.md      # keep it
-proxygate skill | pbcopy        # or hand it straight to an agent
-```
+There is no stdout contract to protect, so progress and results go to the
+**stderr log** (`RUST_LOG`, default `info`):
 
 ```console
-$ proxygate list
-PROXY                           STATUS   TARGETS  LATENCY
-http://***:***@127.0.0.1:18080  alive    2/2      824ms
-http://127.0.0.1:18083          alive    1/2      817ms    # only cn.bing.com answers
-http://203.0.113.7:3128         dead     0/2      -
-
-$ proxygate get --format json
-{"proxy":"http://user:pass@127.0.0.1:18080","latency_ms":824,"round":3}
+$ proxygate
+INFO proxygate is listening proxy=127.0.0.1:8080 api=127.0.0.1:8081 shared_port=false ...
+INFO API documentation help=http://127.0.0.1:8081/help
+INFO fetching subscriber subscriber=scdn kind=builtin format=json
+INFO subscriber fetched subscriber=scdn found=20 rejected=0 skipped=0 elapsed_ms=2423
+INFO still downloading subscriber=freeproxy-gh kilobytes=1300 elapsed_ms=130000
+INFO proxygate is ready proxies=5157 alive=66
+INFO hand-out verification passed proxy=http://***:***@1.2.3.4:8080 elapsed_ms=312
 ```
+
+One line per subscriber with its counts and elapsed time, a byte count every ten
+seconds for slow downloads, probe progress every five seconds, and one line per
+hand-out verification — so "why was this proxy not handed out" is answerable
+from the log.
 
 ## REST API
 
@@ -383,6 +317,11 @@ $ proxygate get --format json
 | `GET /api/v1/getua`             | one random user agent as `text/plain`                         |
 | `GET /api/v1/getua?format=json` | `{"user_agent": "Mozilla/5.0 ..."}`                          |
 | `GET /api/v1/proxies`           | the pool as JSON, credentials masked                         |
+| `GET /api/v1/providers`         | the built-in source catalog as JSON                          |
+| `GET /api/v1/config`            | the annotated example config as `text/yaml`                  |
+| `POST /api/v1/refresh`          | `202` — fetch every subscriber now                           |
+| `POST /api/v1/check`            | `202` — probe the whole pool now                             |
+| `GET /help`                     | this project's manual (`SKILL.md`), as `text/markdown`       |
 | `GET /api/v1/health`            | `{"status": "ok", "proxies": {"total": 2, "alive": 2, ...}}` |
 | `GET /`                         | a small index of the above                                   |
 
@@ -422,7 +361,7 @@ Credentials are never exposed by `/proxies` (they are replaced with `***:***`).
 
 ## Gateway
 
-`proxygate serve` runs four things on one Tokio runtime: subscriber refresh,
+The server runs four things on one Tokio runtime: subscriber refresh,
 health checking, the REST API and the HTTP proxy gateway.
 
 * **CONNECT** (HTTPS) becomes a byte tunnel. The upstream is chosen, dialled and
@@ -430,7 +369,7 @@ health checking, the REST API and the HTTP proxy gateway.
   transparently. One tunnel is pinned to one upstream for its whole lifetime.
 * **Plain HTTP** is forwarded with the absolute request target preserved, so the
   upstream does the DNS and the connecting.
-* Client credentials (`--auth`) are consumed by ProxyGate and never forwarded;
+* Client credentials (`gateway.auth`) are consumed by ProxyGate and never forwarded;
   upstream credentials are added by ProxyGate and never exposed.
 
 Retries follow the boring, safe rule:
@@ -453,21 +392,19 @@ silently entering the pool as proxies that cannot serve CONNECT.
 ### Who runs the health check
 
 Probing connects to every proxy (thousands with all built-ins enabled, minutes
-per pass), so it is deliberately **not** something every `get`/`list` does:
+per pass), so it is split in two:
 
-| Command | Probing behaviour |
+| Who | Probing behaviour |
 | --- | --- |
-| `refresh` | only the proxies it just fetched (the others still have a valid verdict) |
-| `check` | the whole pool (`--alive-only` limits it to the currently alive ones) |
-| `get` / `list` | **none by default** — cached verdicts are used; a check happens only when there has never been one (cold start) |
-| `get --check` / `list --check` | force a full re-probe |
-| `get --no-check` / `list --no-check` | never probe, not even on a cold start |
-| `serve` | probes in the background every `health.interval` and feeds both the REST API and the gateway |
+| the background loop | re-probes the whole pool on `health.interval` and feeds both the REST API and the gateway |
+| `POST /api/v1/refresh` | only the proxies it just fetched (the others still have a valid verdict) |
+| `POST /api/v1/check` | the whole pool, right now |
+| hand-out verification | the one proxy `/api/v1/get` picked, when its verdict is older than `selection.max_age` (`selection.verify`, on by default) |
 
-The usual split is therefore: `refresh` or `serve` does the physical, `get` and
-`list` just read the results and return in milliseconds. The cost is that a proxy
-that died between two passes can still be handed out until the next `refresh` /
-`check` — normal for free proxies.
+So the experience is: a handed-out proxy is one that just passed, and the
+background loop keeps the pool's verdicts from going stale. With
+`selection.verify: false` only the loop remains — verdicts can then be minutes
+old and dead proxies do get handed out.
 
 `refresh` also persists **as it goes**: every subscriber is merged into the pool
 and written to `cache.json` the moment it finishes instead of waiting for the
@@ -494,14 +431,14 @@ When every healthy proxy has been handed out, the round increments
 
 ```text
 A, B, C in the pool
-proxygate get   →  A
-proxygate get   →  B
-proxygate get   →  C
-proxygate get   →  round 2 starts, A/B/C are all fair game again
+GET /api/v1/get  →  A
+GET /api/v1/get  →  B
+GET /api/v1/get  →  C
+GET /api/v1/get  →  round 2 starts, A/B/C are all fair game again
 ```
 
 `state.json` persists the round number and each proxy's last use, so the
-rotation continues across CLI invocations and restarts. A proxy that is added
+rotation continues across requests and restarts. A proxy that is added
 later (a refresh found a new one) is unused in the current round and therefore
 handed out first — new proxies get exercised instead of gathering dust.
 
@@ -540,11 +477,11 @@ A probe verdict is authoritative:
   upstream after the same threshold; a later success revives it.
 
 `alive`, `latency` and `failures` are never treated as permanent facts — but the
-last result *is* cached for `health.interval` (30s by default) so that a burst of
-`proxygate get` calls does not re-probe a 10,000-proxy pool every time. Likewise,
-subscriber output is reused for `refresh.interval`. `--no-check` / `--no-refresh`
-tell the CLI to trust those caches even when they are stale, which is what you
-want in a tight loop or an air-gapped test.
+last result *is* cached: the background loop refreshes it on `health.interval`,
+and a hand-out re-checks the chosen proxy only when its verdict is older than
+`selection.max_age`. So a burst of `/api/v1/get` calls does not re-probe a
+10,000-proxy pool every time, and it does not hand out week-old verdicts either.
+Subscriber output is reused for `refresh.interval`.
 
 ## State files
 
@@ -577,7 +514,7 @@ timestamp:
 
 `cache.json` contains proxy URLs **including credentials** in plaintext (it has
 to, to rebuild the pool), which is why the directory is private. Delete both
-files to start from scratch; `proxygate refresh` rebuilds the pool.
+files to start from scratch; `POST /api/v1/refresh` rebuilds the pool.
 
 ## Security notes
 
@@ -585,11 +522,11 @@ files to start from scratch; `proxygate refresh` rebuilds the pool.
   do not load a config you would not run as a shell script.
 * The API has no authentication of its own. It binds `127.0.0.1` by default —
   exposing it publishes your working proxies to whoever can reach the port.
-* Set `gateway.auth` (or `--auth`) before binding the gateway to a public
+* Set `gateway.auth` before binding the gateway to a public
   interface. Credentials are compared in constant time and `Proxy-Authorization`
   is stripped before forwarding.
-* Proxy credentials are masked in `proxygate list`, the REST API and all logs.
-  The one place they appear is `proxygate get` (that is its job) and the private
+* Proxy credentials are masked in `/api/v1/proxies`, the REST API and all logs.
+  The one place they appear is `/api/v1/get` (that is its job) and the private
   `cache.json`.
 
 ## Not included yet
@@ -622,22 +559,23 @@ binaries:
 
 ## Project layout
 
-This is a **library crate with a thin binary**: `src/lib.rs` holds all the
-logic and `src/main.rs` is a few dozen lines that parse arguments, initialize
-tracing, dispatch and map errors to exit codes. To use ProxyGate from another
-Rust program, add the dependency and `use proxygate::...` — the CLI is optional.
+This is a **library crate plus a binary that only starts the server**:
+`src/lib.rs` holds all the logic and `src/main.rs` is a few dozen lines that
+handle `--version`/`--help`, initialize tracing and call `server::run`. There are
+no subcommands and no client commands — everything else is HTTP. To use ProxyGate
+from another Rust program, add the dependency and `use proxygate::...`.
 
 ```text
 src/
   lib.rs         crate root: module list, crate docs, embedded SKILL.md
-  main.rs        thin shell: parse, init tracing, dispatch, exit code
-  app.rs         shared runtime: pool + state store + HTTP clients + checker
-  commands.rs    one function per CLI subcommand
-  cli.rs         clap definitions
+  main.rs        thin shell: --version/--help, tracing, start the server
+  server.rs      the server: bind, run gateway/API/loops, handle Ctrl-C
+  app.rs         shared runtime: pool + state store + clients + checker + hand-out verification
+  progress.rs    progress events for fetching, probing and verification
   config.rs      config.yaml model, defaults, validation
   model.rs       Proxy, stable ids, URL normalization, small codecs
   subscriber.rs  builtin/http/file/exec subscribers and the built-in parsers
-  providers.rs   the built-in source catalog (printed by `proxygate providers`)
+  providers.rs   the built-in source catalog (`GET /api/v1/providers`)
   pool.rs        the pool: merge, health updates, selection (rounds)
   checker.rs     health checker + shared upstream client cache
   selector.rs    candidate filtering and the random/latency strategies
@@ -649,7 +587,7 @@ src/
 assets/          data embedded in the binary (user agent pool)
 subscribers/     exec subscriber contract + example.py
 tests/           integration tests with in-process fake upstreams
-SKILL.md         the agent-facing document printed by `proxygate skill`
+SKILL.md         the manual served by `GET /help`
 ```
 
 Splitting out the library lets the integration tests drive the real gateway

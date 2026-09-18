@@ -1,6 +1,6 @@
 # ProxyGate configuration.
 #
-# Every key is optional: with no config file at all, `proxygate serve` starts
+# Every key is optional: with no config file at all, the server starts
 # with an empty pool on 127.0.0.1:8080 (proxy) and 127.0.0.1:8081 (API).
 #
 # Durations accept `30s`, `10m`, `2h`, `1d`, `250ms`, `1h30m` or plain seconds.
@@ -21,7 +21,7 @@ server:
 # Where proxies come from.
 #
 # `builtin-subscribers: enabled` subscribes to every source in the catalog that
-# ProxyGate ships (`proxygate providers` lists them with their endpoints,
+# ProxyGate ships (`GET /api/v1/providers` lists them with their endpoints,
 # formats and caveats). Set it to `disabled` to use only the sources you write
 # yourself below.
 #
@@ -31,9 +31,9 @@ server:
 # `refresh.interval` at 10m or slower.
 #
 # A paginated source expands into one subscriber per page (`rola-ip#1` …
-# `rola-ip#10`), so `proxygate refresh` reports every page separately and a page
+# `rola-ip#10`), so a refresh reports every page separately and a page
 # that fails does not hide the rest. Nothing to configure here: the page range
-# lives in the catalog, and `proxygate providers` prints it.
+# lives in the catalog, and `GET /api/v1/providers` prints it.
 builtin-subscribers: enabled
 
 subscribers:
@@ -104,7 +104,7 @@ health:
   #   - http://connect.rom.miui.com/generate_204    (domestic, very fast)
   # `target: <url>` (singular) is still accepted as an alias for a one-entry list.
   # How long a health result is reused before probing again. Also the window
-  # that keeps a burst of `proxygate get` calls from re-probing the whole pool.
+  # that keeps a burst of `/api/v1/get` calls from re-probing the whole pool.
   interval: 30s
   # Per-proxy request timeout.
   timeout: 5s
@@ -119,6 +119,17 @@ selection:
   strategy: random
   # Prefer proxies that were not handed out within this window.
   reuse_after: 30m
+  # Probe the chosen proxy before handing it out, so `/api/v1/get` returns one
+  # that just passed instead of one whose verdict may be hours old.
+  verify: true
+  # Skip that probe when the cached verdict is newer than this. `0s` probes
+  # every time (the safest and, in a one-client setup, perfectly affordable).
+  max_age: 60s
+  # Timeout for probing a single candidate while handing out. Shorter than
+  # `health.timeout` on purpose: better to try the next candidate quickly.
+  verify_timeout: 3s
+  # Candidates to try when a verification fails before giving up.
+  verify_attempts: 3
 
 gateway:
   # Extra upstream attempts after the first one fails. CONNECT tunnels retry any
@@ -127,8 +138,9 @@ gateway:
   # Timeout for connecting to an upstream and completing the CONNECT handshake.
   connect_timeout: 10s
   # No client authentication: this file assumes the gateway stays reachable only
-  # from this machine. Requiring credentials is a command line decision
-  # (`proxygate serve --help`), which keeps them out of a checked-in config.
+  # from this machine. Set `auth: user:password` to require credentials from
+  # gateway clients — note that the REST API stays open either way when
+  # `server.api` shares the proxy port.
 
 state:
   # Where state.json and cache.json live.

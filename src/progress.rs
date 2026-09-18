@@ -4,9 +4,8 @@
 //! 一次要四分钟），中间什么都不打印是没法用的。但库不该自己往终端写东西，
 //! 所以这里只有事件和一个接收器 trait：
 //!
-//! * 命令行把事件渲染成给人看的进度（[`crate::commands`] 里的
-//!   `ConsoleProgress`，写到 stderr，所以不影响 stdout 的数据契约）；
-//! * `serve` 把事件转成日志（[`crate::app::LogProgress`]）；
+//! * `serve` 把事件转成日志（[`crate::app::LogProgress`]），这也是唯一
+//!   的显示渠道——没有命令行客户端了；
 //! * 测试与库内部用 `()`，什么都不做。
 
 use std::time::Duration;
@@ -52,6 +51,23 @@ pub struct CheckEvent {
     pub elapsed: Duration,
 }
 
+/// 发放前验证一个候选代理的结果。
+#[derive(Debug)]
+pub struct VerifyEvent<'a> {
+    /// 被验证的代理（已脱敏）。
+    pub proxy: &'a str,
+    /// 通过与否。
+    pub ok: bool,
+    /// 通过时的延迟。
+    pub latency: Option<Duration>,
+    /// 失败原因。
+    pub error: Option<&'a str>,
+    /// 这是第几个候选（从 1 开始）。
+    pub attempt: usize,
+    /// 最多会试几个候选。
+    pub attempts: usize,
+}
+
 /// 进度接收器。
 ///
 /// 两个方法都有默认空实现，只关心其中一种的实现者不必写另一个。
@@ -66,6 +82,11 @@ pub trait Progress: Send + Sync {
 
     /// 收到一次探测进度。
     fn check(&self, event: CheckEvent) {
+        let _ = event;
+    }
+
+    /// 收到一次发放验证的结果。
+    fn verify(&self, event: VerifyEvent<'_>) {
         let _ = event;
     }
 }

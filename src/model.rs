@@ -223,7 +223,7 @@ impl Proxy {
             .collect()
     }
 
-    /// 包含凭据的完整 URL，即 `proxygate get` 打印的内容。
+    /// 包含凭据的完整 URL，即 `GET /api/v1/get` 打印的内容。
     pub fn to_full_string(&self) -> String {
         render_url(&self.url, true)
     }
@@ -238,7 +238,7 @@ impl Proxy {
         render_url(&self.url, show_auth)
     }
 
-    /// `proxygate list` 使用的人类可读状态。
+    /// `GET /api/v1/proxies` 使用的人类可读状态。
     pub fn status(&self) -> &'static str {
         if self.alive { "alive" } else { "dead" }
     }
