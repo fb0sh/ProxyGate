@@ -165,6 +165,12 @@ jobs:
           # The example config points at these by relative path, so an archive
           # without them ships a config that cannot load its subscribers.
           cp -r subscribers "dist/${name}/"
+          # ...and that is exactly the kind of thing that rots quietly, so assert
+          # it: every `lua_file:` in the packaged config must be in the archive.
+          while read -r script; do
+            test -f "dist/${name}/${script}" \
+              || { echo "::error::${script} is missing from the archive"; exit 1; }
+          done < <(grep -o 'subscribers/[A-Za-z0-9_.-]*\.lua' config.example.yaml | sort -u)
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           echo "packaged dist/${name}.tar.gz"
           tar -tzf "dist/${name}.tar.gz"
@@ -180,7 +186,18 @@ jobs:
           Copy-Item README.md, README.en.md, SKILL.md, LICENSE, config.example.yaml "dist/$name/"
           # Same relative layout as the tar.gz archives: config.example.yaml
           # resolves `lua_file: subscribers/...` against its own directory.
-          Copy-Item -Recurse subscribers "dist/$name/"
+          # Explicit destination + wildcard so PowerShell copies the *contents*
+          # into `subscribers/` instead of depending on Copy-Item's rules for an
+          # existing destination directory.
+          New-Item -ItemType Directory -Force -Path "dist/$name/subscribers" | Out-Null
+          Copy-Item -Path "subscribers\*" -Destination "dist/$name/subscribers" -Recurse
+          # Assert it: every `lua_file:` in the packaged config must be present.
+          $scripts = Select-String -Path config.example.yaml -Pattern 'subscribers/[A-Za-z0-9_.-]+\.lua' -AllMatches |
+            ForEach-Object { $_.Matches.Value } | Sort-Object -Unique
+          foreach ($script in $scripts) {
+            $path = Join-Path "dist/$name" ($script -replace '/', '\')
+            if (-not (Test-Path $path)) { Write-Error "$script is missing from the archive"; exit 1 }
+          }
           # Same layout as the tar.gz archives: one top-level directory.
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip" -Force
           Write-Host "packaged dist/$name.zip"
