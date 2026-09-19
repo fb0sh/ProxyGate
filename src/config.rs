@@ -354,6 +354,14 @@ pub struct SubscriberConfig {
     /// 是否启用该订阅源，默认 `true`。
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 出口策略，YAML 键 `via`，默认 `fallback`：
+    ///
+    /// * `direct` —— 永远直连；
+    /// * `pool` —— 优先借池子里的健康代理（站点按 IP 限流/封 IP 时用这个，
+    ///   顺便也让被拉黑的是代理而不是你自己的机器）；
+    /// * `fallback` —— 先直连，失败了再借一个健康代理重试。
+    #[serde(default)]
+    pub via: crate::subscriber::EgressPolicy,
     /// 其余所有键都会成为脚本里的全局变量（数字、布尔、字符串、表）。
     #[serde(flatten)]
     pub params: BTreeMap<String, serde_yaml::Value>,
@@ -1224,6 +1232,7 @@ gateway:
             timeout: None,
             limit: None,
             enabled: true,
+            via: Default::default(),
             params: Default::default(),
         };
         let mut config = Config {

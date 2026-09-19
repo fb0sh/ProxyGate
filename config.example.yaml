@@ -39,8 +39,15 @@ subscribers:
   # `while true do end`. Every refresh builds a fresh Lua state.
   #
   # Any key that is not `name`/`script_name`, `lua_code`, `lua_file`, `timeout`,
-  # `limit` or `enabled` becomes a global in the script — that is how a script
-  # gets its parameters. `lua_code` and `lua_file` are mutually exclusive.
+  # `limit`, `enabled` or `via` becomes a global in the script — that is how a
+  # script gets its parameters. `lua_code` and `lua_file` are mutually exclusive.
+  #
+  # `via` picks how the script reaches the network: `direct` (never use the
+  # pool), `pool` (prefer a healthy proxy from our own pool, fall back to direct
+  # when the pool is empty) or `fallback` (default: direct first, retry through a
+  # pooled proxy if that fails). `fetch(url, headers)` takes an optional table of
+  # request headers, and every request already carries a desktop browser's
+  # User-Agent instead of ours.
 
   # zdaye.com (站大爷) 的免费代理列表：HTML 表格，一页 20 条，国内段一共 22 页
   # （第 1 页是 `/free/`，之后 `/free/2/` … `/free/22/`）。
@@ -50,8 +57,13 @@ subscribers:
   # 做了三件事——页与页之间 `sleep`、单页失败用 `pcall` 跳过、默认只抓前几页。
   # 想把 22 页全抓完就得调大 `max_pages`，但那基本一定会被拦；与其如此，不如
   # 每轮拿前几页，反正免费代理的存活率摆在那里（见 BENCHMARKS.md）。
+  #
+  # `via: pool` scrapes **through a healthy proxy from our own pool**: the IP the
+  # site blacklists is the proxy's, not your machine's. While the pool is still
+  # empty (the very first refresh) it falls back to a direct request.
   - name: zdaye
     timeout: 120s
+    via: pool
     base_url: https://www.zdaye.com/free/
     max_pages: 3
     delay: 2
@@ -85,9 +97,10 @@ subscribers:
 
   # 海外段：同一套页面结构，只是路径是 `/free_haiwai/`（第 1 页没有数字后缀，
   # 之后 `/free_haiwai/2/` … 实测第 118 页还有 9 条）。同样是 WAF 后面的站点，
-  # 所以默认也只抓前几页。
+  # so it takes the first few pages, through the pool as well.
   - name: zdaye-overseas
     timeout: 120s
+    via: pool
     base_url: https://www.zdaye.com/free_haiwai/
     max_pages: 3
     delay: 2

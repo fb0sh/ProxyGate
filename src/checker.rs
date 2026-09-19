@@ -102,7 +102,9 @@ impl ProxyClients {
             .no_proxy()
             .proxy(reqwest::Proxy::all(proxy.url.clone())?)
             .connect_timeout(self.connect_timeout)
-            .user_agent(concat!("proxygate/", env!("CARGO_PKG_VERSION")));
+            // 探测也装成普通桌面浏览器：`proxygate/x.y.z` 这种自报名号会被一部分
+            // 站点（和一部分代理）直接拒掉，而那会把一条其实能用的代理判死。
+            .user_agent(crate::useragent::random());
 
         let builder = match mode {
             ClientMode::Check => builder

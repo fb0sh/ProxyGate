@@ -305,8 +305,11 @@ impl App {
             config.gateway.connect_timeout,
         ));
         let verify_checker = HealthChecker::new(&config.health, verify_clients);
-        let subscribers = SubscriberSet::new(&config)?;
         let pool = Arc::new(ProxyPool::new());
+        // 订阅源可以把池子里的健康代理当作出口（`via: pool` / `via: fallback`），
+        // 所以集合要在池子之后建。
+        let subscribers =
+            SubscriberSet::new(&config)?.with_egress(pool.clone(), config.selection_options());
 
         // 1. Proxies from the cache.
         let cache = store.load_cache();
@@ -1247,6 +1250,7 @@ mod tests {
             timeout: None,
             limit: None,
             enabled: true,
+            via: Default::default(),
             params: BTreeMap::new(),
         }
     }
@@ -1371,6 +1375,7 @@ mod tests {
             timeout: Some(Duration::from_secs(10)),
             limit: None,
             enabled: true,
+            via: Default::default(),
             params: BTreeMap::from([(
                 "slow_url".to_string(),
                 serde_yaml::Value::from(format!("http://{address}/list.txt")),
@@ -1426,6 +1431,7 @@ mod backoff_tests {
             timeout: None,
             limit: None,
             enabled: true,
+            via: Default::default(),
             params: Default::default(),
         }
     }
@@ -1485,6 +1491,7 @@ mod backoff_tests {
             timeout: None,
             limit: None,
             enabled: true,
+            via: Default::default(),
             params: Default::default(),
         }];
         let app = Arc::new(App::new(config, None).expect("app"));

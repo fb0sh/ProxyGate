@@ -187,6 +187,7 @@ of proxy tables** — one per proxy, with `type`, `ip`, `port` and an optional
 subscribers:
   - name: zdaye
     timeout: 60s
+    via: pool
     lua_code: |
       local page, pages = 1, 1
       local result = {}
@@ -223,6 +224,7 @@ What the script can use:
 | `fetch_json(url)` | same, but decodes the body into a Lua table |
 | `json_encode(v)` / `json_decode(s)` | Lua value <-> JSON string |
 | `sleep(seconds)` | wait before the next request (pace yourself against a rate limit) |
+| `fetch(url, headers)` | the second argument is optional: a `{ ["Header"] = "value" }` table |
 | `log(...)` / `print(...)` | writes to ProxyGate's log at `info`; **not** a way to emit proxies |
 
 Every key ProxyGate does not recognise (`name`/`script_name`, `lua_code`,
@@ -248,6 +250,25 @@ loaded, and `dofile`, `loadfile`, `load` and `require` are removed, so `fetch` i
 the only way out. `timeout` (or `refresh.timeout`) bounds the whole script,
 including `while true do end`. Every refresh builds a fresh Lua state, so scripts
 cannot see each other. `lua_code` and `lua_file` are mutually exclusive.
+
+#### Direct, or through the pool
+
+Some sites rate-limit or blacklist by IP — the example's zdaye answers ten requests and
+then blocks with a 405 — so every subscriber can declare `via`:
+
+| `via` | Behaviour |
+| --- | --- |
+| `direct` | always connect directly; some sources should never see a proxy's IP |
+| `pool` | prefer a healthy proxy from our own pool, falling back to a direct request while the pool is still empty (the very first refresh) — the IP the site blacklists is the proxy's, not yours |
+| `fallback` (default) | direct first, then retry through a healthy proxy if that was blocked, timed out or answered 5xx; once a fallback succeeds, the rest of that run goes through the proxy |
+
+A pooled fetch tries up to **three distinct proxies** before falling back to a direct
+request: free proxies are broken often enough that giving up after one is simply a
+wasted round.
+
+Every outgoing request (subscriber fetches and health probes alike) carries an ordinary
+desktop browser's User-Agent from the built-in pool instead of `proxygate/x.y.z`, and a
+script can add its own headers with `fetch(url, { ["Referer"] = "..." })`.
 
 This is what replaced the built-in source catalog, its `builtin` kind and the
 `http`/`file`/`exec` kinds before it: paging, signing and field reshaping were

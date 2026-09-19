@@ -51,17 +51,22 @@
 //!
 //! 写进日志的单条消息超过 4 KiB 会被截断。配置文件本身是可信输入。
 
-use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 
-use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib, Value as LuaValue, Variadic};
+use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib, Table, Value as LuaValue, Variadic};
+use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use url::Url;
 
 use crate::config::{Config, SubscriberConfig, SubscriberSource};
 use crate::error::{Error, Result};
 use crate::model::{self, ProxyScheme};
+use crate::pool::ProxyPool;
 use crate::progress::{FetchEvent, Progress};
+use crate::selector::SelectionOptions;
 
 /// 一次订阅源拉取的结果。订阅源失败属于数据而非错误：
 /// 一个来源坏掉不能拖停其他来源。
@@ -95,25 +100,118 @@ impl FetchOutcome {
     }
 }
 
+/// 让订阅源脚本能"借"池子里的健康代理出门。
+///
+/// 存在的理由很实际：有些站点（比如 zdaye）按 IP 限流甚至直接封 IP，直连抓
+/// 十来个请求就被 405 拦掉；换成一个健康代理的 IP 就又能拿到数据。它同时也
+/// 保护了部署者自己的 IP——被站方拉黑的是代理，不是你的服务器。
+///
+/// 每个代理 URL 只建一次客户端并缓存：`reqwest::Client` 里装着连接池和 TLS
+/// 配置，按请求新建的开销不值得。
+#[derive(Debug)]
+pub struct Egress {
+    pool: Arc<ProxyPool>,
+    options: SelectionOptions,
+    timeout: Duration,
+    clients: Mutex<HashMap<String, reqwest::Client>>,
+}
+
+impl Egress {
+    /// 从池子里挑一个健康代理；池子空或全死时返回 `None`。
+    fn pick(&self) -> Option<Url> {
+        let selection = self.pool.select(self.options, SystemTime::now())?;
+        // 日志里能看出"这次抓取是从哪个代理出去的"——排查某源为何慢/失败时
+        // 这是第一个要看的线索。
+        tracing::debug!(
+            proxy = %selection.proxy.to_masked_string(),
+            "fetching through a pooled proxy"
+        );
+        Some(selection.proxy.url.clone())
+    }
+
+    /// 该代理对应的客户端，按需创建并缓存。
+    fn client(&self, proxy: &Url) -> Result<reqwest::Client> {
+        let key = proxy.to_string();
+        let mut clients = self.clients.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(client) = clients.get(&key) {
+            return Ok(client.clone());
+        }
+
+        let client = reqwest::Client::builder()
+            // 既然指定了出口，就别再让环境变量里的代理插一脚。
+            .no_proxy()
+            .proxy(reqwest::Proxy::all(key.clone())?)
+            .user_agent(crate::useragent::random())
+            .timeout(self.timeout)
+            .build()?;
+        clients.insert(key, client.clone());
+        Ok(client)
+    }
+}
+
+/// 一个订阅源的出口策略：直连、走代理池，还是先直连失败后再走。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EgressPolicy {
+    /// 永远直连（有些来源不该看到代理的 IP）。
+    Direct,
+    /// 优先走池子里的健康代理，没有可用代理时才直连。
+    Pool,
+    /// 先直连；失败了（被拦、超时、5xx）再借一个健康代理重试。
+    ///
+    /// 这是默认值：能直连的来源行为完全不变，抓不动的来源多一次机会。
+    #[default]
+    Fallback,
+}
+
+impl EgressPolicy {
+    /// 策略的小写名称，与 YAML 中使用的值一致。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EgressPolicy::Direct => "direct",
+            EgressPolicy::Pool => "pool",
+            EgressPolicy::Fallback => "fallback",
+        }
+    }
+}
+
 /// 负责拉取所有已配置的订阅源。
 pub struct SubscriberSet {
     subscribers: Vec<SubscriberConfig>,
     timeout: Duration,
     client: reqwest::Client,
+    /// 走代理池的出口；`None` 表示这个集合不碰池子（库的使用者直接构造时）。
+    egress: Option<Arc<Egress>>,
 }
 
 impl SubscriberSet {
     /// 依据配置构建订阅源集合，并创建共享的 HTTP 客户端。
+    ///
+    /// 客户端带一个**普通桌面浏览器**的 User-Agent（取自内置的 UA 池）：拿
+    /// `proxygate/0.5.0` 去敲门，很多站点会直接拒掉，而我们的目的只是取一份
+    /// 公开的代理列表。
     pub fn new(config: &Config) -> Result<Self> {
         let client = reqwest::Client::builder()
-            .user_agent(concat!("proxygate/", env!("CARGO_PKG_VERSION")))
+            .user_agent(crate::useragent::random())
             .timeout(config.refresh.timeout)
             .build()?;
         Ok(Self {
             subscribers: config.subscribers.clone(),
             timeout: config.refresh.timeout,
             client,
+            egress: None,
         })
+    }
+
+    /// 挂上代理池：`via: pool` / `via: fallback` 的订阅源因此能借健康代理出门。
+    pub fn with_egress(mut self, pool: Arc<ProxyPool>, options: SelectionOptions) -> Self {
+        self.egress = Some(Arc::new(Egress {
+            pool,
+            options,
+            timeout: self.timeout,
+            clients: Mutex::new(HashMap::new()),
+        }));
+        self
     }
 
     /// 只包含已启用的订阅源。
@@ -272,6 +370,8 @@ impl SubscriberSet {
             &subscriber.params,
             subscriber.timeout.unwrap_or(self.timeout),
             &self.client,
+            self.egress.clone(),
+            subscriber.via,
         )
         .await
     }
@@ -297,6 +397,8 @@ async fn run_lua(
     params: &BTreeMap<String, serde_yaml::Value>,
     timeout: Duration,
     client: &reqwest::Client,
+    egress: Option<Arc<Egress>>,
+    via: EgressPolicy,
 ) -> Result<ParsedResult> {
     let fail = |message: String| Error::Subscriber {
         name: name.to_string(),
@@ -335,15 +437,27 @@ async fn run_lua(
     }
 
     // `fetch` / `fetch_json`：脚本访问外部世界的唯一方式，共用订阅源的
-    // HTTP 客户端（同一份 UA、连接池与 TLS 配置）。
+    // HTTP 客户端（同一份浏览器 UA、连接池与 TLS 配置）。
+    //
+    // 出口策略见 [`EgressPolicy`]：`pool` 先借代理、`fallback` 直连失败后再借。
+    // `via_proxy` 记着"这一轮已经改用代理了"，所以一次回退之后剩下的请求不用
+    // 再白试一次直连——抓一个被 WAF 拦住的站点时，这一条能省掉一半请求。
+    let via_proxy = Arc::new(AtomicBool::new(false));
+
     let fetch_client = client.clone();
+    let fetch_state = (egress.clone(), Arc::clone(&via_proxy), name.to_string());
     let fetch = lua
-        .create_async_function(move |_, url: String| {
+        .create_async_function(move |_, (url, headers): (String, Option<Table>)| {
             let client = fetch_client.clone();
+            let (egress, via_proxy, label) = fetch_state.clone();
             async move {
-                http_get(&client, &url, timeout)
-                    .await
-                    .map_err(mlua::Error::runtime)
+                let headers = read_headers(headers)?;
+                let egress = egress.as_deref();
+                fetch_body(
+                    &client, egress, &via_proxy, &label, via, &url, &headers, timeout,
+                )
+                .await
+                .map_err(mlua::Error::runtime)
             }
         })
         .map_err(|e| fail(format!("cannot define `fetch` for Lua: {e}")))?;
@@ -352,13 +466,25 @@ async fn run_lua(
         .map_err(|e| fail(format!("cannot define `fetch` for Lua: {e}")))?;
 
     let fetch_json_client = client.clone();
+    let fetch_json_state = (egress, Arc::clone(&via_proxy), name.to_string());
     let fetch_json = lua
-        .create_async_function(move |lua, url: String| {
+        .create_async_function(move |lua, (url, headers): (String, Option<Table>)| {
             let client = fetch_json_client.clone();
+            let (egress, via_proxy, label) = fetch_json_state.clone();
             async move {
-                let body = http_get(&client, &url, timeout)
-                    .await
-                    .map_err(mlua::Error::runtime)?;
+                let headers = read_headers(headers)?;
+                let body = fetch_body(
+                    &client,
+                    egress.as_deref(),
+                    &via_proxy,
+                    &label,
+                    via,
+                    &url,
+                    &headers,
+                    timeout,
+                )
+                .await
+                .map_err(mlua::Error::runtime)?;
                 let value: JsonValue = serde_json::from_str(&body).map_err(|e| {
                     mlua::Error::runtime(format!("`{url}` did not return JSON: {e}"))
                 })?;
@@ -466,26 +592,142 @@ async fn run_lua(
     Ok(entries_to_candidates(&returned))
 }
 
-/// 一次同步 GET（对 Lua 而言是同步的），返回响应体文本。
-async fn http_get(
+/// 一次请求最多试几个不同的代理。
+///
+/// 免费代理池里能用的比例很低（实测 1~5%），只试一个等于没试；但这些尝试都
+/// 只发生在直连已经失败、或者来源明确要求走代理的时候，所以不至于白烧请求。
+const EGRESS_PROXY_ATTEMPTS: usize = 3;
+
+/// 按出口策略排出"先试哪条路"：`None` 是直连，`Some(proxy)` 是借那个代理。
+///
+/// 纯函数，方便单独测顺序；`egress` 为空（池子空/没挂池子）时只会返回直连。
+fn egress_attempts(
+    via: EgressPolicy,
+    egress: Option<&Egress>,
+    already_proxied: bool,
+) -> Vec<Option<Url>> {
+    let mut attempts: Vec<Option<Url>> = Vec::new();
+    let push_proxies = |attempts: &mut Vec<Option<Url>>| {
+        let Some(egress) = egress else {
+            return;
+        };
+        for _ in 0..EGRESS_PROXY_ATTEMPTS {
+            let Some(proxy) = egress.pick() else {
+                return;
+            };
+            // `select` 的轮换本来就会换一个，这里再兜一次底：同一个代理试两遍没意义。
+            if !attempts
+                .iter()
+                .any(|attempt| attempt.as_ref() == Some(&proxy))
+            {
+                attempts.push(Some(proxy));
+            }
+        }
+    };
+
+    match via {
+        EgressPolicy::Direct => attempts.push(None),
+        // 站点按 IP 限流/封 IP 时用这个：先借代理，代理都不成才直连碰运气。
+        EgressPolicy::Pool => {
+            push_proxies(&mut attempts);
+            attempts.push(None);
+        }
+        // 默认：直连优先；这一轮已经因为回退改用代理了就直接走代理。
+        EgressPolicy::Fallback if already_proxied => {
+            push_proxies(&mut attempts);
+            attempts.push(None);
+        }
+        EgressPolicy::Fallback => {
+            attempts.push(None);
+            push_proxies(&mut attempts);
+        }
+    }
+
+    attempts
+}
+
+/// 从 Lua 传进来的表里读出请求头。
+fn read_headers(table: Option<Table>) -> mlua::Result<Vec<(String, String)>> {
+    let Some(table) = table else {
+        return Ok(Vec::new());
+    };
+    let mut headers = Vec::new();
+    for pair in table.pairs::<String, String>() {
+        let (name, value) = pair?;
+        headers.push((name, value));
+    }
+    Ok(headers)
+}
+
+/// 按出口策略取一段响应体：直连、借池子里的健康代理，或者两者按顺序试。
+///
+/// 一次回退成功之后会把 `via_proxy` 置上，同一轮脚本剩下的请求就直接走代理，
+/// 不再对着已知会失败的直连路径白试一遍。
+#[allow(clippy::too_many_arguments)]
+async fn fetch_body(
     client: &reqwest::Client,
+    egress: Option<&Egress>,
+    via_proxy: &AtomicBool,
+    label: &str,
+    via: EgressPolicy,
     url: &str,
+    headers: &[(String, String)],
     timeout: Duration,
 ) -> std::result::Result<String, String> {
-    let response = client
-        .get(url)
-        .timeout(timeout)
-        .send()
-        .await
-        .map_err(|e| format!("{url}: {}", crate::error::describe_reqwest_error(&e)))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("{url}: HTTP {status}"));
+    let already_proxied = via_proxy.load(Ordering::Relaxed);
+    let attempts = egress_attempts(via, egress, already_proxied);
+
+    let mut last_error = format!("{url}: no attempt was made");
+    for attempt in attempts {
+        let request_client = match &attempt {
+            None => client.clone(),
+            Some(proxy) => match egress.expect("a proxy implies an egress").client(proxy) {
+                Ok(client) => client,
+                Err(error) => {
+                    last_error = format!("{url}: cannot use proxy {proxy}: {error}");
+                    continue;
+                }
+            },
+        };
+
+        let mut request = request_client.get(url).timeout(timeout);
+        if !headers.is_empty() {
+            let mut map = reqwest::header::HeaderMap::new();
+            for (name, value) in headers {
+                let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|e| format!("invalid header name `{name}`: {e}"))?;
+                let value = reqwest::header::HeaderValue::from_str(value)
+                    .map_err(|e| format!("invalid header value for `{name}`: {e}"))?;
+                map.insert(name, value);
+            }
+            request = request.headers(map);
+        }
+
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                return response
+                    .text()
+                    .await
+                    .map_err(|e| format!("{url}: {}", crate::error::describe_reqwest_error(&e)));
+            }
+            Ok(response) => {
+                let status = response.status();
+                if attempt.is_some() {
+                    via_proxy.store(true, Ordering::Relaxed);
+                }
+                last_error = format!("{url}: HTTP {status}");
+            }
+            Err(error) => {
+                if attempt.is_some() {
+                    via_proxy.store(true, Ordering::Relaxed);
+                }
+                last_error = format!("{url}: {}", crate::error::describe_reqwest_error(&error));
+            }
+        }
     }
-    response
-        .text()
-        .await
-        .map_err(|e| format!("{url}: {}", crate::error::describe_reqwest_error(&e)))
+
+    tracing::debug!(subscriber = %label, "fetch failed: {last_error}");
+    Err(last_error)
 }
 
 /// 截断一段文本到 `max` 字节，按字符边界切，末尾加省略号。
@@ -729,6 +971,7 @@ mod tests {
             timeout: Some(Duration::from_secs(5)),
             limit: None,
             enabled: true,
+            via: EgressPolicy::default(),
             params: BTreeMap::new(),
         }
     }
@@ -814,6 +1057,81 @@ mod tests {
         assert_eq!(parsed.rejected.len(), 5, "{:?}", parsed.rejected);
         assert!(parsed.rejected[0].contains("missing `ip`"));
         assert!(parsed.rejected[4].contains("proxy table or string"));
+    }
+
+    #[test]
+    fn the_egress_order_follows_the_policy() {
+        // 没有池子时，无论什么策略都只有直连一条路。
+        for via in [
+            EgressPolicy::Direct,
+            EgressPolicy::Pool,
+            EgressPolicy::Fallback,
+        ] {
+            let attempts = egress_attempts(via, None, false);
+            assert_eq!(attempts, vec![None], "{via:?}");
+        }
+    }
+
+    #[test]
+    fn the_egress_order_prefers_the_pool_or_direct_as_configured() {
+        // 池子里三条健康代理（借本地假上游指代），分别验证三种策略的顺序。
+        let pool = Arc::new(ProxyPool::new());
+        for port in [18081, 18082, 18083] {
+            let (id, _) =
+                pool.insert(crate::model::normalize(&format!("127.0.0.1:{port}")).unwrap());
+            pool.apply_health_pass(
+                &[(
+                    id,
+                    crate::pool::HealthUpdate {
+                        alive: true,
+                        latency: Some(Duration::from_millis(1)),
+                        checked_at: SystemTime::now(),
+                        probes: Vec::new(),
+                    },
+                )],
+                &crate::pool::HealthPolicy::default(),
+            );
+        }
+        let egress = Egress {
+            pool,
+            options: crate::selector::SelectionOptions::default(),
+            timeout: Duration::from_secs(1),
+            clients: Mutex::new(HashMap::new()),
+        };
+
+        // `direct` 只有一条直连。
+        assert_eq!(
+            egress_attempts(EgressPolicy::Direct, Some(&egress), false),
+            vec![None]
+        );
+
+        // `pool` 先代理（最多三条）、再直连兜底。
+        let attempts = egress_attempts(EgressPolicy::Pool, Some(&egress), false);
+        assert_eq!(attempts.len(), 4, "{attempts:?}");
+        assert!(attempts[0].is_some() && attempts[1].is_some() && attempts[2].is_some());
+        assert_eq!(attempts[3], None, "{attempts:?}");
+        // 每条代理都指向池子里的地址，而不是别处。
+        for attempt in &attempts[..3] {
+            let url = attempt.as_ref().expect("pooled attempt");
+            assert!(url.host_str() == Some("127.0.0.1"), "{url}");
+        }
+        // 三个代理互不相同。
+        let mut proxies: Vec<String> = attempts
+            .iter()
+            .filter_map(|attempt| attempt.as_ref().map(|url| url.to_string()))
+            .collect();
+        let before = proxies.len();
+        proxies.dedup();
+        assert_eq!(proxies.len(), before, "不该重复试同一个代理");
+
+        // `fallback` 先直连，再借代理。
+        let attempts = egress_attempts(EgressPolicy::Fallback, Some(&egress), false);
+        assert_eq!(attempts[0], None);
+        assert!(attempts[1].is_some());
+        // 已经回退过：代理优先。
+        let attempts = egress_attempts(EgressPolicy::Fallback, Some(&egress), true);
+        assert!(attempts[0].is_some());
+        assert_eq!(attempts.last(), Some(&None));
     }
 
     #[test]

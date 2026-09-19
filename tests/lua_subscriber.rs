@@ -8,10 +8,14 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+
+use std::sync::Arc;
 
 use proxygate::config::{Config, SubscriberConfig};
-use proxygate::subscriber::SubscriberSet;
+use proxygate::pool::{HealthPolicy, HealthUpdate, ProxyPool};
+use proxygate::selector::SelectionOptions;
+use proxygate::subscriber::{EgressPolicy, SubscriberSet};
 
 /// A JSON envelope in the shape a lot of panel APIs use.
 const ENVELOPE: &str = r#"{
@@ -41,6 +45,7 @@ fn lua(name: &str, code: &str) -> SubscriberConfig {
         timeout: Some(Duration::from_secs(10)),
         limit: None,
         enabled: true,
+        via: Default::default(),
         // Filled in per test through `with_param`.
         params: BTreeMap::new(),
     }
@@ -445,4 +450,234 @@ async fn the_shipped_zdaye_script_survives_a_blocked_page() {
         "只有第 1 页的三条应该留下：{:?}",
         rendered(&outcome)
     );
+}
+
+// ---------------------------------------------------------------------------
+// 出口：浏览器 UA，以及"直连抓不动就借池子里的健康代理"。
+// ---------------------------------------------------------------------------
+
+/// 一个只认绝对形式请求（也就是"经过代理"）的来源服务器：
+/// 直连是 `GET /list`，经过代理是 `GET http://host:port/list`。
+///
+/// 用它来区分"这条请求到底走没走代理"，比去数代理那边收到了几次更直接。
+async fn origin_only_behind_proxy(body: &'static str) -> std::net::SocketAddr {
+    common::spawn_server(move |mut stream| async move {
+        use tokio::io::AsyncWriteExt;
+
+        let Some(head) = common::read_head(&mut stream).await else {
+            return;
+        };
+        let request_line = head.lines().next().unwrap_or_default().to_string();
+        let (status, payload) = if request_line.starts_with("GET http://") {
+            ("200 OK", body)
+        } else {
+            ("500 Blocked", "direct access is not allowed")
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+    })
+    .await
+}
+
+/// 一个"健康代理"：把任何请求都当成自己的活，回同样的内容。
+async fn pretend_proxy(body: &'static str) -> std::net::SocketAddr {
+    common::fake_http_server(body).await
+}
+
+/// 造一个池子，里面只有一个指向 `proxy` 的健康代理。
+fn pool_with_proxy(proxy: std::net::SocketAddr) -> Arc<ProxyPool> {
+    let pool = Arc::new(ProxyPool::new());
+    let (id, _) =
+        pool.insert(proxygate::model::normalize(&format!("http://{proxy}")).expect("proxy url"));
+    pool.apply_health_pass(
+        &[(
+            id,
+            HealthUpdate {
+                alive: true,
+                latency: Some(Duration::from_millis(5)),
+                checked_at: SystemTime::now(),
+                probes: Vec::new(),
+            },
+        )],
+        &HealthPolicy::default(),
+    );
+    pool
+}
+
+/// 用指定的出口策略跑一次脚本，允许指定池子。
+async fn run_with_egress(
+    mut subscriber: SubscriberConfig,
+    via: EgressPolicy,
+    pool: Option<Arc<ProxyPool>>,
+) -> proxygate::subscriber::FetchOutcome {
+    subscriber.via = via;
+    let config = config_with(vec![subscriber]);
+    let mut set = SubscriberSet::new(&config).expect("subscriber set");
+    if let Some(pool) = pool {
+        set = set.with_egress(pool, SelectionOptions::default());
+    }
+    set.fetch_all().await.remove(0)
+}
+
+#[tokio::test]
+async fn the_default_user_agent_is_an_ordinary_browser() {
+    // 抓公开列表时用 `proxygate/x.y.z` 敲门会被不少站点直接拒掉。
+    let seen = Arc::new(std::sync::Mutex::new(String::new()));
+    let recorder = seen.clone();
+    let address = common::spawn_server(move |mut stream| {
+        let recorder = recorder.clone();
+        async move {
+            use tokio::io::AsyncWriteExt;
+
+            let Some(head) = common::read_head(&mut stream).await else {
+                return;
+            };
+            *recorder.lock().expect("lock") = head.clone();
+            let body = "1.2.3.4:8080";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+    })
+    .await;
+
+    let outcome = run_one(lua(
+        "ua",
+        &format!("return {{ fetch('http://{address}/list') }}"),
+    ))
+    .await;
+    assert!(outcome.ok(), "{:?}", outcome.error);
+
+    let head = seen.lock().expect("lock").clone();
+    let user_agent = head
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        user_agent.contains("mozilla/5.0"),
+        "expected a browser UA, got `{head}`"
+    );
+    assert!(
+        !user_agent.contains("proxygate"),
+        "our own UA must not be sent any more: {head}"
+    );
+}
+
+#[tokio::test]
+async fn a_script_can_send_its_own_headers() {
+    let seen = Arc::new(std::sync::Mutex::new(String::new()));
+    let recorder = seen.clone();
+    let address = common::spawn_server(move |mut stream| {
+        let recorder = recorder.clone();
+        async move {
+            use tokio::io::AsyncWriteExt;
+
+            let Some(head) = common::read_head(&mut stream).await else {
+                return;
+            };
+            *recorder.lock().expect("lock") = head.clone();
+            let _ = stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            let _ = stream.flush().await;
+        }
+    })
+    .await;
+
+    let outcome = run_one(lua(
+        "headers",
+        &format!(
+            "return {{ fetch('http://{address}/list', {{ ['Accept-Language'] = 'zh-CN,zh;q=0.9', ['Referer'] = 'http://{address}/' }}) }}"
+        ),
+    ))
+    .await;
+    assert!(outcome.ok(), "{:?}", outcome.error);
+
+    let head = seen.lock().expect("lock").clone().to_ascii_lowercase();
+    assert!(head.contains("accept-language: zh-cn,zh;q=0.9"), "{head}");
+    assert!(
+        head.contains(&format!("referer: http://{address}/")),
+        "{head}"
+    );
+}
+
+#[tokio::test]
+async fn via_pool_scrapes_through_a_pooled_proxy() {
+    // 直连会被 "Blocked"，经过代理才给数据——就像一个按 IP 封的站点。
+    let origin = origin_only_behind_proxy("10.0.0.9:8080\n").await;
+    let proxy = pretend_proxy("10.0.0.9:8080\n").await;
+    let pool = pool_with_proxy(proxy);
+
+    let subscriber = lua(
+        "pooled",
+        &format!("return {{ fetch('http://{origin}/list') }}"),
+    );
+    let outcome = run_with_egress(subscriber, EgressPolicy::Pool, Some(pool)).await;
+
+    assert!(outcome.ok(), "{:?}", outcome.error);
+    assert_eq!(rendered(&outcome), vec!["http://10.0.0.9:8080".to_string()]);
+}
+
+#[tokio::test]
+async fn via_direct_never_touches_the_pool() {
+    let origin = origin_only_behind_proxy("10.0.0.9:8080\n").await;
+    let proxy = pretend_proxy("10.0.0.9:8080\n").await;
+    let pool = pool_with_proxy(proxy);
+
+    let subscriber = lua(
+        "direct",
+        &format!(
+            "local ok, body = pcall(fetch, 'http://{origin}/list')\n\
+             if ok then return {{ body }} end\n\
+             return {{}}"
+        ),
+    );
+    let outcome = run_with_egress(subscriber, EgressPolicy::Direct, Some(pool)).await;
+
+    // 脚本自己 `pcall` 了，所以来源本身成功，但一条代理都没有。
+    assert!(outcome.ok(), "{:?}", outcome.error);
+    assert_eq!(outcome.count(), 0, "直连被拦，且不该借代理");
+}
+
+#[tokio::test]
+async fn via_fallback_retries_through_the_pool_after_a_failure() {
+    let origin = origin_only_behind_proxy("10.0.0.9:8080\n").await;
+    let proxy = pretend_proxy("10.0.0.9:8080\n").await;
+    let pool = pool_with_proxy(proxy);
+
+    let subscriber = lua(
+        "fallback",
+        &format!("return {{ fetch('http://{origin}/list') }}"),
+    );
+    let outcome = run_with_egress(subscriber, EgressPolicy::Fallback, Some(pool)).await;
+
+    assert!(outcome.ok(), "{:?}", outcome.error);
+    assert_eq!(rendered(&outcome), vec!["http://10.0.0.9:8080".to_string()]);
+}
+
+#[tokio::test]
+async fn an_empty_pool_still_allows_a_direct_fetch() {
+    // 冷启动时池子是空的：`via: pool` 不该因此什么都拿不到。
+    let address = common::fake_http_server("1.1.1.1:8080\n").await;
+    let subscriber = lua(
+        "cold",
+        &format!("return {{ fetch('http://{address}/list') }}"),
+    );
+    let outcome = run_with_egress(
+        subscriber,
+        EgressPolicy::Pool,
+        Some(Arc::new(ProxyPool::new())),
+    )
+    .await;
+
+    assert!(outcome.ok(), "{:?}", outcome.error);
+    assert_eq!(rendered(&outcome), vec!["http://1.1.1.1:8080".to_string()]);
 }

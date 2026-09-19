@@ -122,6 +122,7 @@ server:
 subscribers:                 # where proxies come from: Lua scripts
   - name: zdaye
     timeout: 120s
+    via: pool                # scrape through a proxy from our own pool
     base_url: https://www.zdaye.com/free/   # extra keys -> script globals
     max_pages: 3
     delay: 2                 # seconds between pages; the site has a WAF
@@ -190,7 +191,12 @@ subscribers:
       return result
 ```
 
-`lua_code` and `lua_file` are mutually exclusive; every other key
+`via` picks the egress: `direct` (never use a proxy), `pool` (prefer a healthy proxy
+from ProxyGate's own pool, direct only while the pool is empty) or `fallback` (default:
+direct first, retry through a pooled proxy if it fails; a pooled fetch tries up to three
+distinct proxies before giving up). Every request already carries a
+desktop browser User-Agent rather than ProxyGate's own. `lua_code` and `lua_file` are
+mutually exclusive; every other key
 (`name`/`script_name`, `timeout`, `limit`, `enabled` aside) becomes a global in
 the script, which is how a script gets its parameters. Available inside the
 script:
@@ -201,6 +207,7 @@ script:
 | `fetch_json(url)` | same, but decodes the body into a Lua table |
 | `json_encode(v)` / `json_decode(s)` | Lua value <-> JSON string |
 | `sleep(seconds)` | wait before the next request (a paginated site's rate limit) |
+| `fetch(url, headers)` | optional `{ ["Header"] = "value" }` table for the request |
 | `log(...)` / `print(...)` | writes to ProxyGate's log at `info`; **not** a way to emit proxies |
 
 Entry rules: `type` of `http`/`https`/`ssl` becomes `http` (in a list, "https"
