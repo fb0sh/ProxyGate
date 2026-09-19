@@ -5,7 +5,7 @@
 //! 没有命令行客户端（`GET /help` 返回本 crate 里的 `SKILL.md`）。
 //!
 //! ```text
-//! Subscribers (http / file / exec / lua)
+//! Subscribers (lua scripts)
 //!         |
 //!         v
 //!     Normalizer  ->  Pool  ->  Checker
@@ -23,7 +23,8 @@
 //! 后续的检查、选择与分发都只面对这一个统一的代理池。
 //!
 //! 想接一个「要翻页、要签名、要按字段拼串」的来源，不必改这个 crate：写一段
-//! `lua` 订阅源即可，见 [`subscriber`] 模块文档里的脚本 API 与沙箱说明。
+//! Lua 订阅源脚本即可——它返回一组代理表，见 [`subscriber`] 模块文档里的脚本
+//! API、返回结构与沙箱说明。
 //!
 //! # 快速开始
 //!
@@ -38,9 +39,12 @@
 //! ```console
 //! proxygate --example-config > config.yaml                    # 带注释的示例配置
 //! proxygate                                                  # 启动，无参数
-//! curl -sf http://127.0.0.1:8081/api/v1/get                  # 拿一个代理
-//! curl -x "$(curl -sf http://127.0.0.1:8081/api/v1/get)" https://example.com
+//! curl -sf http://127.0.0.1:8080/api/v1/get                  # 拿一个代理
+//! curl -x "$(curl -sf http://127.0.0.1:8080/api/v1/get)" https://example.com
 //! ```
+//!
+//! HTTP 代理网关与 REST API **共用** `server.listen` 一个端口：请求形状不同，
+//! 网关按形状分流。
 //!
 //! 完整端点列表见 `GET /help`，也就是本仓库的 `SKILL.md`。
 //! 项目源码与主页：<https://github.com/fb0sh/ProxyGate>。
@@ -59,7 +63,7 @@
 //! - [`selector`]：选择器，决定从代理池中挑选哪一个代理。
 //! - [`server`]：把网关、REST API 与后台循环跑起来（程序的唯一入口）。
 //! - [`state`]：`state.json` 与缓存文件的落盘。
-//! - [`subscriber`]：订阅源的抓取、格式解析，以及 `lua` 脚本沙箱。
+//! - [`subscriber`]：订阅源脚本的执行、返回值转换，以及 Lua 沙箱。
 //! - [`useragent`]：内置的 User-Agent 池。
 
 // 文档注释是这个 crate 的正式参考（docs.rs 上展示的就是它），所以公开
@@ -118,8 +122,10 @@ mod tests {
             "/api/v1/getua",
             "/api/v1/refresh",
             "/api/v1/check",
-            "type: lua",
             "lua_code:",
+            "return result",
+            "server:",
+            "listen:",
             "--example-config",
             "/help",
             "curl -sf",

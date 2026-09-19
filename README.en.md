@@ -49,15 +49,15 @@ cp config.example.yaml config.yaml
 proxygate
 
 # 3. Get a (verified) proxy and use it.
-curl -sf http://127.0.0.1:8081/api/v1/get
+curl -sf http://127.0.0.1:8080/api/v1/get
 http://user:pass@1.2.3.4:8080
-curl -x "$(curl -sf http://127.0.0.1:8081/api/v1/get)" https://example.com
+curl -x "$(curl -sf http://127.0.0.1:8080/api/v1/get)" https://example.com
 
 # 4. Or just point your client at the gateway port.
 curl -x http://127.0.0.1:8080 https://example.com
 
 # 5. The manual is an endpoint, readable by agents and humans alike.
-curl -s http://127.0.0.1:8081/help
+curl -s http://127.0.0.1:8080/help
 ```
 
 Mind the `-f` in `curl -sf`: when the pool has nothing to give, `/get` answers
@@ -75,7 +75,7 @@ Or with Docker (see [`Dockerfile`](Dockerfile)):
 
 ```bash
 docker build -t proxygate .
-docker run --rm -p 8080:8080 -p 8081:8081 \
+docker run --rm -p 8080:8080 \
   -v "$PWD/config.yaml:/home/proxygate/config.yaml:ro" \
   -v proxygate-cache:/home/proxygate/.cache/proxygate \
   proxygate
@@ -117,16 +117,15 @@ but not much else. Start from [`config.example.yaml`](config.example.yaml).
 
 | Key                   | Default                                   | Meaning                                              |
 | --------------------- | ----------------------------------------- | ---------------------------------------------------- |
-| `server.proxy`        | `127.0.0.1:8080`                          | HTTP proxy gateway address                            |
-| `server.api`          | `127.0.0.1:8081`                          | REST API address; `same` shares the gateway port      |
+| `server.listen`       | `127.0.0.1:8080`                          | the only listen address: the gateway and the REST API share it |
 | `subscribers`         | `[]`                                      | Where proxies come from (see below)                   |
-| `refresh.interval`    | `10m`                                     | How long a fetched list is reused                     |
+| `refresh.interval`    | `10m`                                     | How often the subscriber scripts run and pull in new proxies |
 | `refresh.timeout`     | `20s`                                     | Per-subscriber timeout                                |
 | `health.targets`      | Google 204 + `cn.bing.com`                | URLs fetched *through* each proxy, probed concurrently |
 | `health.require`      | `any`                                     | `any` target may answer, or `all` of them must          |
-| `health.interval`     | `30s`                                     | Health pass interval, and health cache lifetime       |
-| `health.timeout`      | `5s`                                      | Per-proxy probe timeout                               |
-| `health.concurrency`  | `100`                                     | Proxies probed in parallel                            |
+| `health.interval`     | `5m`                                      | How often the *existing* pool is probed again, and the verdict cache lifetime |
+| `health.timeout`      | `3s`                                      | Per-proxy probe timeout                               |
+| `health.concurrency`  | `300`                                     | Proxies probed in parallel — what decides how long the first check takes |
 | `health.max_failures` | `3`                                       | Consecutive failures tolerated for a working proxy    |
 | `selection.strategy`  | `random`                                  | `random` or `latency`                                 |
 | `selection.reuse_after` | `30m`                                   | Prefer proxies unused in this window                  |
@@ -148,80 +147,50 @@ proxy really has international connectivity, and `cn.bing.com` proves the tunnel
 is not broken for everything else. By default `require: any` accepts a proxy
 that reaches either one; the `TARGETS` column tells you which.
 
-> **The example config grows the pool a lot.** A cold start of its four
-> subscribers fetches 5,000+ proxies (measured: `scdn` 20, `freeproxy-cn` 117,
-> `rola-ip` 4,439 in ~28s — its ten pages are now one loop inside the script, and
-> `freeproxy-gh` capped at 1000 by `limit`), and one health pass over them takes
-> minutes (5,157 checked in ~3.5 minutes with 66 alive, measured). With the default `health.interval` of
-> 30s the checker is then busy almost continuously — raise it to `10m`, or cap a
-> source with `limit`, if you want it to rest.
+> **The slow part is the health check, not the scripts.** `rola-ip` alone
+> returns 4,400+ proxies (its ten pages are one loop inside the script), which is
+> why the example caps it with `limit: 1000`: among free proxies the survivors
+> are scarce (one measured pool of 1,020 had 13 working), so probing 5,000 of them
+> buys five times the waiting for a limited gain in usable proxies. The five times
+> are better spent on refreshing.
+>
+> `health.concurrency` is the knob that decides how long that first check takes:
+> on the same 1,020-proxy pool against the real targets, 300 in flight finished
+> in 14s and 100 in 30s (the gap depends on how quickly dead proxies fail, not
+> only on the parallelism).
 
-### Sharing one port with the API
+### One port
 
-`server.api` also accepts `same` (or `proxy`, or a literal copy of the
-`server.proxy` address):
+`server.listen` is a single address; the HTTP proxy gateway and the REST API
+share it. They never collide, because the request shapes differ:
 
-```yaml
-server:
-  proxy: 127.0.0.1:8080
-  api: same          # the REST API shares 127.0.0.1:8080 with the gateway
-```
+| Request received                  | Verdict       | Destination |
+| --------------------------------- | ------------- | ----------- |
+| `CONNECT host:443`                | proxy request | HTTP gateway |
+| `GET http://host/path` (absolute) | proxy request | HTTP gateway |
+| `GET /api/v1/get` (origin-form)   | API request   | REST API     |
 
-The port splits traffic by request shape:
-
-| Request received                    | Verdict       | Destination |
-| ----------------------------------- | ------------- | ----------- |
-| `CONNECT host:443`                  | proxy request | HTTP gateway |
-| `GET http://host/path` (absolute)   | proxy request | HTTP gateway |
-| `GET /api/v1/get` (origin-form)     | API request   | REST API     |
-
-> **Auth covers proxy requests only.** `gateway.auth`
-> rejects proxy requests, but an API sharing the port stays open — anyone who can
-> reach the port can read `/api/v1/proxies`. Only share the port on a trusted
-> interface (the default is `127.0.0.1`). The server logs a warning when you do. Expose it publicly with the API back on its own port, or behind a
-> firewall rule.
-
-There is no functional difference between the two layouts; share a port when
-mapping one container port is convenient, split them when you want them
-separable while debugging.
+> **Auth covers proxy requests only.** `gateway.auth` rejects proxy requests,
+> but the API on the same port stays open — anyone who can reach the port can
+> read `/api/v1/proxies`. That is why the default only listens on `127.0.0.1`;
+> to expose it, set `listen: 0.0.0.0:8080` and put your own access control in
+> front of it.
 
 ### Subscribers
 
-Four kinds: `http`, `file`, `exec`, and `lua`. The first three only carry a
-payload around; `lua` writes down what to fetch, how to page through it and how
-to turn it into proxy URLs:
+A subscriber is a Lua script. It fetches whatever it wants and **returns a list
+of proxy tables** — one per proxy, with `type`, `ip`, `port` and an optional
+`auth`:
 
 ```yaml
 subscribers:
-  - name: scdn
-    type: http
-    url: https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20
-    format: json             # plaintext (default) | json | clash
-    timeout: 20s
-    limit: 200               # keep at most this many usable proxies (0 = no cap)
-    headers:
-      Authorization: Bearer <token>
-
-  - name: local
-    type: file
-    path: ./proxies.txt
-    format: plaintext
-
-  - name: weird-provider
-    type: exec
-    command: [python3, ./subscribers/example.py, --url, https://example.com/weird-api]
-    env:
-      API_TOKEN: "..."
-
   - name: rola-ip
-    type: lua
-    url: https://rola-ip.co/proxy-api/api/v1/proxies   # not a ProxyGate key -> script global
-    page_size: 500
     timeout: 60s
     lua_code: |
       local page, pages = 1, 1
+      local result = {}
       repeat
-        local body = fetch_json(url .. "?page=" .. page .. "&pageSize=" .. page_size)
+        local body = fetch_json("https://rola-ip.co/proxy-api/api/v1/proxies?page=" .. page .. "&pageSize=500")
         pages = (body.pagination and body.pagination.totalPages) or 1
         for _, item in ipairs(body.data or {}) do
           local scheme = nil
@@ -235,40 +204,58 @@ subscribers:
             end
           end
           if scheme then
-            print(scheme .. "://" .. item.ip .. ":" .. item.port)
+            table.insert(result, {
+              type = scheme,
+              ip = item.ip,
+              port = item.port,
+              auth = item.auth or ""
+            })
           end
         end
         page = page + 1
       until page > pages
+      return result
+
+  # A script can live in its own file, with the endpoint passed in as a global.
+  - name: my_scraper
+    timeout: 30s
+    target_url: https://api.example.com/data.json   # not a ProxyGate key -> script global
+    token: "..."
+    limit: 500                                      # keep at most this many (0 = no cap)
+    lua_file: ./scripts/my_scraper.lua
 ```
 
-`limit` exists because the health checker probes every proxy it is given: 16,000
-of them is a twelve minute pass at the default concurrency. The example config
-caps the one huge source (a 2.5 MB GitHub list) at 1000, taking entries in the
-order returned (big lists are ordered fastest-first).
+`limit` exists because the health checker probes every proxy it is given: tens of
+thousands of them is a very long pass at the default concurrency.
 
-A subscriber only has to produce proxy URLs — one per line on stdout for `exec`
-and one per `print` for `lua`. The built-in parsers cover plaintext lists, JSON
-APIs (arrays, bare `host:port` strings, objects with `ip`/`host`/`server` +
-`port` + credentials, and arbitrarily nested envelopes such as
-`{"code":200,"data":{"proxies":["1.2.3.4:8080"]}}`) and Clash/Clash.Meta
-`proxies:` lists. Anything else belongs in a script; see
-[`subscribers/README.md`](subscribers/README.md) and
-[`subscribers/example.py`](subscribers/example.py).
+#### Writing a subscriber
 
-#### Writing a Lua subscriber
-
-Every key ProxyGate does not recognise (`name`/`script_name`, `lua_code`,
-`lua_file`, `format`, `timeout`, `limit`, `enabled`, `type`) becomes a global in
-the script — that is how a script gets its parameters. What the script can use:
+What the script can use:
 
 | Name | Meaning |
 | ---- | ------- |
-| `print(...)` | one output line per call, arguments joined by a tab; **these lines are the payload**, parsed with `format` |
 | `fetch(url)` | one GET, returns the body as a string; raises on a non-2xx status |
 | `fetch_json(url)` | same, but decodes the body into a Lua table |
 | `json_encode(v)` / `json_decode(s)` | Lua value <-> JSON string |
-| `log(...)` | writes to ProxyGate's log at `info`; does not affect the output |
+| `log(...)` / `print(...)` | writes to ProxyGate's log at `info`; **not** a way to emit proxies |
+
+Every key ProxyGate does not recognise (`name`/`script_name`, `lua_code`,
+`lua_file`, `timeout`, `limit`, `enabled`) becomes a global in the script — that
+is how a script gets its parameters. Each returned table is read like this:
+
+| Field | Meaning |
+| ----- | ------- |
+| `type` | `http`/`https`/`ssl` become `http`; `socks5`/`socks5h`/`socks` become `socks5h`; `socks4` or an unknown name is **skipped** |
+| `ip` | hostname or IP; `host`, `hostname`, `server`, `address` and `addr` work too, and IPv6 gets bracketed |
+| `port` | number or string; omitted uses the scheme's default port |
+| `auth` | optional `user:password` (or just `user`), percent-encoded |
+
+In a list, "https" means the proxy can CONNECT to HTTPS, not TLS-to-proxy, so it
+becomes `http`. `socks5` becoming `socks5h` is deliberate: the proxy resolves
+names, and with poisoned local DNS a locally resolved address would be handed
+over as-is. An entry can also be a plain string (`"1.2.3.4:8080"`); entries that
+are neither, lack an `ip`, or carry an unusable `port` are counted in `rejected`
+without killing the source.
 
 The script runs in a **sandbox**: `io`, `os`, `package` and `debug` are not
 loaded, and `dofile`, `loadfile`, `load` and `require` are removed, so `fetch` is
@@ -276,15 +263,15 @@ the only way out. `timeout` (or `refresh.timeout`) bounds the whole script,
 including `while true do end`. Every refresh builds a fresh Lua state, so scripts
 cannot see each other. `lua_code` and `lua_file` are mutually exclusive.
 
-This replaced the built-in source catalog and its `builtin` kind: paging,
-signing and field reshaping were always a script's job, and keeping them in the
-config means adding a source no longer needs a ProxyGate release.
+This is what replaced the built-in source catalog, its `builtin` kind and the
+`http`/`file`/`exec` kinds before it: paging, signing and field reshaping were
+always a script's job, and keeping them in the config means adding a source no
+longer needs a ProxyGate release.
 
-Protocol fields in payloads are understood in the shapes lists actually use:
-`protocol` as a string, `protocols` as an array, and joined strings like
-`"socks4+socks5"`. The mapping:
+The script's `type` is understood in the shapes real lists use: a string, or an
+array such as `["http", "socks5"]`. The mapping:
 
-| The payload says | Becomes | Why |
+| The script says | Becomes | Why |
 | ---------------- | ------- | --- |
 | `http` / `https` / `ssl` | `http://` | in a list, "https" means the proxy can CONNECT to HTTPS, not TLS-to-proxy |
 | `socks5` / `socks5h` / `socks` | `socks5h://` | the proxy resolves names: with poisoned local DNS, `socks5://` hands the proxy a bogus address and both the probe and real use fail |
@@ -292,7 +279,8 @@ Protocol fields in payloads are understood in the shapes lists actually use:
 
 An entry offering both picks `http`.
 
-Accepted URL shapes:
+A string entry goes through the same normalizer as everything else, so these all
+work:
 
 ```text
 http://1.2.3.4:8080          socks5://1.2.3.4:1080
@@ -302,11 +290,8 @@ user:pass@1.2.3.4:3128       socks5h://user:pass@[2001:db8::1]:1080
 
 The first source in the example config is
 [proxy.scdn.io](https://proxy.scdn.io/api_docs.php): it answers with a JSON
-envelope holding bare `host:port` entries, which the `json` format reads
-directly. Since the payload carries no scheme, such entries are treated as HTTP
-proxies — ask for `protocol=http`, or switch the entry to `type: lua` and
-`print("socks5h://" .. item)` if you want its `socks4`/`socks5` endpoints (the
-`rola-ip` script above does exactly that).
+envelope holding bare `host:port` entries, so the script asks for
+`protocol=http` and turns each string into an HTTP proxy.
 
 Two things to expect from free lists like that one, both of which the health
 check is designed to surface: most entries are simply dead, and a fair share of
@@ -322,11 +307,10 @@ There is no stdout contract to protect, so progress and results go to the
 
 ```console
 $ proxygate
-INFO proxygate is listening proxy=127.0.0.1:8080 api=127.0.0.1:8081 shared_port=false ...
-INFO API documentation help=http://127.0.0.1:8081/help
-INFO fetching subscriber subscriber=scdn kind=http format=json
+INFO proxygate is listening listen=127.0.0.1:8080 config=Some("./config.yaml") proxies=0 alive=0 auth=false ready=false
+INFO API documentation help=http://127.0.0.1:8080/help
+INFO running subscriber script subscriber=rola-ip
 INFO subscriber fetched subscriber=scdn found=20 rejected=0 skipped=0 elapsed_ms=2423
-INFO still downloading subscriber=freeproxy-gh kilobytes=1300 elapsed_ms=130000
 INFO proxygate is ready proxies=5157 alive=66
 INFO hand-out verification passed proxy=http://***:***@1.2.3.4:8080 elapsed_ms=312
 ```
@@ -352,10 +336,10 @@ from the log.
 | `GET /`                         | a small index of the above                                   |
 
 ```console
-$ curl http://127.0.0.1:8081/api/v1/get
+$ curl http://127.0.0.1:8080/api/v1/get
 http://user:pass@1.2.3.4:8080
 
-$ curl -s http://127.0.0.1:8081/api/v1/health
+$ curl -s http://127.0.0.1:8080/api/v1/health
 {"status":"ok","version":"0.1.0","uptime_seconds":42,"generation":3,
  "strategy":"random","health_targets":["https://cn.bing.com/"],
  "health_require":"any","ready":true,"initializing":false,
@@ -364,7 +348,8 @@ $ curl -s http://127.0.0.1:8081/api/v1/health
 # While the first pass runs, `status` is "initializing" and `ready` is false.
 ```
 
-With `server.api: same`, use port `8080` in the examples above; the paths
+The API and the gateway share a port, so the examples above and `curl -x` use
+the same address. The paths
 are unchanged.
 
 `/get` has two distinct `503`s, told apart by the body:
@@ -434,7 +419,7 @@ old and dead proxies do get handed out.
 
 `refresh` also persists **as it goes**: every subscriber is merged into the pool
 and written to `cache.json` the moment it finishes instead of waiting for the
-slowest one (`freeproxy-gh` takes four minutes). A Ctrl-C or a power cut keeps
+slowest one (`rola-ip` takes 35 seconds). A Ctrl-C or a power cut keeps
 whatever was already fetched; because the pass never completed, `fetched_at` is
 not updated and the next run fetches again to fill in the rest.
 
@@ -544,7 +529,8 @@ files to start from scratch; `POST /api/v1/refresh` rebuilds the pool.
 
 ## Security notes
 
-* **`exec` subscribers run arbitrary commands.** `config.yaml` is trusted input;
+* **The config file is trusted input.** A subscriber script runs with the
+  server's privileges and can reach the network through `fetch`;
   do not load a config you would not run as a shell script.
 * The API has no authentication of its own. It binds `127.0.0.1` by default —
   exposing it publishes your working proxies to whoever can reach the port.
@@ -560,7 +546,7 @@ files to start from scratch; `POST /api/v1/refresh` rebuilds the pool.
 Deliberate omissions, so the core stays small: no database or Redis, no plugin
 framework, no rate limiting or per-client quotas, no `https://` upstream
 proxies, no SOCKS5 *server* (clients speak HTTP proxy), and no upstream
-selection by geolocation or provider.
+selection by geolocation.
 
 ## Development
 
@@ -580,8 +566,7 @@ binaries:
 | -------------------------- | ------------------------------------------------------------- |
 | `tests/pool.rs`            | dedupe, usage persistence, health thresholds, state round trip |
 | `tests/selector.rs`        | the rotation contract, reuse window, restart behaviour         |
-| `tests/subscriber.rs`      | file/http/exec, the three formats, failure isolation           |
-| `tests/lua_subscriber.rs`  | Lua: print output, parameter globals, fetch_json, sandbox      |
+| `tests/lua_subscriber.rs`  | Lua: return values, parameter globals, paging, credentials, sandbox, timeouts |
 | `tests/gateway.rs`         | CONNECT, plain HTTP, auth, retries, SOCKS5 and SOCKS5 auth     |
 
 ## Project layout
@@ -601,7 +586,7 @@ src/
   progress.rs    progress events for fetching, probing and verification
   config.rs      config.yaml model, defaults, validation
   model.rs       Proxy, stable ids, URL normalization, small codecs
-  subscriber.rs  http/file/exec/lua subscribers, the parsers, the Lua sandbox
+  subscriber.rs  subscriber script execution, return-value mapping, Lua sandbox
   pool.rs        the pool: merge, health updates, selection (rounds)
   checker.rs     health checker + shared upstream client cache
   selector.rs    candidate filtering and the random/latency strategies
@@ -611,7 +596,6 @@ src/
   state.rs       state.json / cache.json, RFC 3339 timestamps
   error.rs       error type shared by every module
 assets/          data embedded in the binary (user agent pool)
-subscribers/     exec subscriber contract + example.py
 tests/           integration tests with in-process fake upstreams
 SKILL.md         the manual served by `GET /help`
 ```
@@ -624,7 +608,7 @@ Deviations from the v0.1 design notes, each for a reason found while building it
 
 * `src/lib.rs` as above; the package is lowercase (`proxygate`) so the binary
   name matches the commands in this document.
-* `server.api` accepts `same` so the REST API and the proxy gateway can share a
+* `server.listen` is one address so the REST API and the proxy gateway always share a
   single port, dispatched by request shape.
 * Built-in sources can be paginated: the URL carries `{page}` and the catalog
   declares the range, which `normalize` expands into one subscriber per page so
@@ -647,10 +631,10 @@ Deviations from the v0.1 design notes, each for a reason found while building it
   broken for everything else.
 * `https://` upstream proxies are rejected when a list is loaded rather than
   accepted and then failing at CONNECT time.
-* A fourth subscriber kind, `lua`: the design doc only listed http/file/exec, but
-  free-pool APIs routinely need paging or per-field string building, and a Lua
-  script in the config is easier to maintain than a Rust branch per source. It
-  runs in a sandbox whose only exit is `fetch`.
+* Subscribers are Lua scripts and nothing else: the design doc listed
+  http/file/exec, but the interesting difference between sources is how they are
+  fetched and reshaped, which is exactly what a script is good at. It runs in a
+  sandbox whose only exit is `fetch`.
 * Payload protocol fields are normalized per the table above. `socks5` becoming
   `socks5h` is deliberate: with poisoned local DNS, resolving on the client side
   hands the proxy a bogus address.

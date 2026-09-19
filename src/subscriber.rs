@@ -1,68 +1,63 @@
 //! 订阅源：代理从哪里来。
 //!
-//! 只有四种类型：
+//! 只有一种：一段 **Lua 脚本**（[`SubscriberConfig`]）。脚本自己决定去哪里取、
+//! 怎么翻页、怎么按字段拼装，最后**返回一组代理表**——`type`、`ip`、`port`，
+//! 外加可选的 `auth`。
 //!
-//! * `http` —— 拉取一个 URL（`proxies.txt`、API 或订阅）；
-//! * `file` —— 读取本地文件；
-//! * `exec` —— 运行一条命令并读取其 stdout；
-//! * `lua` —— 运行一段 Lua 脚本，脚本 `print` 出来的每一行就是一条代理。
+//! 之所以不给「拉一个 URL」「跑一条命令」各留一个类型：那些来源真正的差别都在
+//! 「怎么取、怎么拼」上，而那正是脚本擅长的事。少一个类型，就少一份要跟着
+//! 各个面板 API 变的解析代码。
 //!
-//! 无论载荷长什么样，订阅源唯一的职责就是产出代理 URL。`plaintext`、
-//! `json` 和 `clash` 三种格式由内置解析器覆盖；剩下的（要签名、要翻页、
-//! 要按字段拼串的 API）都交给 `lua`——它既能发请求又能写逻辑，而且不用
-//! 为了一个来源去改 ProxyGate 本身。真正需要外部程序的时候才用 `exec`。
-//!
-//! # Lua 脚本
+//! # 脚本
 //!
 //! ```yaml
 //! subscribers:
 //!   - name: my_scraper
-//!     type: lua
-//!     target_url: https://api.example.com/data.json   # 额外键 -> 全局变量
-//!     limit: 500
+//!     target_url: https://api.example.com/data.json   # 不是 ProxyGate 的键 -> 脚本全局变量
+//!     limit: 500                                      # 最多保留多少个可用代理
+//!     timeout: 30s
 //!     lua_code: |
+//!       local result = {}
 //!       for page = 1, 10 do
 //!         local data = fetch_json(target_url .. "?page=" .. page)
 //!         for _, item in ipairs(data.proxies or {}) do
-//!           print(item.ip .. ":" .. item.port)
+//!           table.insert(result, { type = "http", ip = item.ip, port = item.port, auth = "" })
 //!         end
 //!       end
+//!       return result
 //! ```
 //!
-//! 脚本里可用的全局变量与函数：
+//! 脚本里能用的东西：
 //!
 //! | 名称 | 说明 |
 //! | --- | --- |
 //! | 配置里的额外键 | 原样变成全局变量（`target_url`、`token`……），数字、布尔、字符串和表都支持 |
-//! | `print(...)` | 每个参数用 tab 连接输出一行；**这些行就是候选代理** |
 //! | `fetch(url)` | 同步发一次 GET，返回响应体字符串；非 2xx 会抛错 |
 //! | `fetch_json(url)` | 同上，但把响应体解析成 Lua 表 |
 //! | `json_encode(v)` / `json_decode(s)` | Lua 值与 JSON 字符串互转 |
-//! | `log(...)` | 以 `info` 级别写进 ProxyGate 日志，不影响输出 |
+//! | `log(...)` / `print(...)` | 以 `info` 级别写进 ProxyGate 日志；**不是**输出代理的通道 |
+//!
+//! 返回值的每个条目是一个代理表，也可以直接写成字符串。字段与取值规则见
+//! [`ParsedResult`]；一句话概括：`socks5` 一律升级成 `socks5h`（让代理去解析
+//! 域名，本机 DNS 被污染时才不会把假地址交给代理），`socks4` 与认不出来的
+//! 协议直接跳过，缺 `ip` 或端口不合法的条目记进 `rejected` 而不拖垮整个来源。
 //!
 //! 这是一个**沙箱**：不加载 `io`、`os`、`package`、`debug`，`dofile`、
-//! `loadfile`、`load`、`require` 也都被摘掉了，脚本只能通过 `fetch` 接触
-//! 外部世界。整段脚本受订阅源的 `timeout`（缺省用 `refresh.timeout`）限制，
-//! 连 `while true do end` 这种死循环也会被指令钩子掐断。
+//! `loadfile`、`load`、`require` 也都被摘掉了，脚本只能通过 `fetch` 接触外部
+//! 世界。整段脚本受订阅源的 `timeout`（缺省用 `refresh.timeout`）限制，连
+//! `while true do end` 这种死循环也会被指令钩子掐断；每次刷新都新建一个 Lua
+//! 状态，脚本之间互不影响。
 //!
-//! 输出有上限：最多收集 100,000 行，`print` 的单个参数超过 4 KiB 会被截断
-//! （末尾加省略号）。超过行数上限的部分会被丢弃，不会让进程吃掉所有内存。
-//!
-//! 注意：`exec` 会以 ProxyGate 进程的权限运行配置文件里的命令。这是一条
-//! 有意留出的逃生通道——请把 `config.yaml` 当作可信输入。
+//! 写进日志的单条消息超过 4 KiB 会被截断。配置文件本身是可信输入。
 
 use std::collections::BTreeMap;
-use std::process::Stdio;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib, Value as LuaValue, Variadic};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value as JsonValue;
-use tokio::process::Command;
 use url::Url;
 
-use crate::config::{Config, Format, SubscriberConfig};
+use crate::config::{Config, SubscriberConfig, SubscriberSource};
 use crate::error::{Error, Result};
 use crate::model::{self, ProxyScheme};
 use crate::progress::{FetchEvent, Progress};
@@ -73,10 +68,6 @@ use crate::progress::{FetchEvent, Progress};
 pub struct FetchOutcome {
     /// 订阅源名称。
     pub name: String,
-    /// 订阅源类型（`http`、`file` 或 `exec`）。
-    pub kind: &'static str,
-    /// 解析响应体时使用的格式。
-    pub format: Format,
     /// 成功归一化得到的代理。
     pub proxies: Vec<Url>,
     /// 无法转换为代理 URL 的行。
@@ -158,7 +149,7 @@ impl SubscriberSet {
     ///
     /// 用 `FuturesUnordered` 而不是 `join_all`：前者在**每个**订阅源完成时
     /// 立刻返回，调用方因此能立刻看到是哪个来源、拿到了多少，而不是等最慢
-    /// 的那个（`freeproxy-gh` 要四分钟）一起返回。
+    /// 的那个一起返回。
     pub async fn fetch_all_reporting(&self, progress: &dyn Progress) -> Vec<FetchOutcome> {
         self.fetch_all_streaming(progress, |_| {}).await
     }
@@ -166,7 +157,7 @@ impl SubscriberSet {
     /// 与 [`SubscriberSet::fetch_all_reporting`] 相同，但每个订阅源一完成就
     /// 调一次 `on_finished`。
     ///
-    /// 调用方用它做**增量落盘**：一轮全量刷新可能跑四分钟，中途被 Ctrl-C
+    /// 调用方用它做**增量落盘**：一轮全量刷新可能跑几十秒，中途被 Ctrl-C
     /// 或断电不该把已经拿到的代理全丢掉。
     pub async fn fetch_all_streaming(
         &self,
@@ -188,7 +179,7 @@ impl SubscriberSet {
         outcomes
     }
 
-    /// 拉取单个订阅源，并把任何失败都转换为 `FetchOutcome::error`。
+    /// 运行单个订阅源的脚本，并把任何失败都转换为 `FetchOutcome::error`。
     pub async fn fetch_one(&self, subscriber: &SubscriberConfig) -> FetchOutcome {
         self.fetch_one_reporting(subscriber, &()).await
     }
@@ -204,8 +195,6 @@ impl SubscriberSet {
     ) -> FetchOutcome {
         progress.fetch(FetchEvent::Started {
             name: subscriber.name(),
-            kind: subscriber.kind(),
-            format: subscriber.format(),
         });
 
         let outcome = self.fetch_one_inner(subscriber, progress).await;
@@ -214,17 +203,15 @@ impl SubscriberSet {
         outcome
     }
 
-    /// 真正的拉取：取响应体、解析、归一化、截断。
+    /// 真正的拉取：跑脚本、归一化、截断。
     async fn fetch_one_inner(
         &self,
         subscriber: &SubscriberConfig,
-        progress: &dyn Progress,
+        _progress: &dyn Progress,
     ) -> FetchOutcome {
         let started = Instant::now();
         let mut outcome = FetchOutcome {
             name: subscriber.name().to_string(),
-            kind: subscriber.kind(),
-            format: subscriber.format(),
             proxies: Vec::new(),
             rejected: Vec::new(),
             skipped: 0,
@@ -233,8 +220,8 @@ impl SubscriberSet {
             error: None,
         };
 
-        let payload = match self.read_payload(subscriber, progress).await {
-            Ok(payload) => payload,
+        let result = match self.run_subscriber(subscriber).await {
+            Ok(result) => result,
             Err(error) => {
                 // The outcome already carries the name, so unwrap the variant
                 // that repeats it in its Display.
@@ -247,17 +234,13 @@ impl SubscriberSet {
             }
         };
 
-        match parse_payload(&payload, subscriber.format()) {
-            Ok(parsed) => {
-                outcome.skipped = parsed.skipped;
-                for candidate in parsed.candidates {
-                    match model::normalize(&candidate) {
-                        Ok(url) => outcome.proxies.push(url),
-                        Err(error) => outcome.rejected.push(error.to_string()),
-                    }
-                }
+        outcome.skipped = result.skipped;
+        outcome.rejected = result.rejected;
+        for candidate in result.candidates {
+            match model::normalize(&candidate) {
+                Ok(url) => outcome.proxies.push(url),
+                Err(error) => outcome.rejected.push(error.to_string()),
             }
-            Err(error) => outcome.error = Some(error.to_string()),
         }
 
         // Keep the cap last, so it applies to usable proxies rather than to
@@ -268,192 +251,29 @@ impl SubscriberSet {
         outcome
     }
 
-    /// 按订阅源类型读取响应体。
-    async fn read_payload(
-        &self,
-        subscriber: &SubscriberConfig,
-        progress: &dyn Progress,
-    ) -> Result<String> {
-        match subscriber {
-            SubscriberConfig::Http {
-                url,
-                headers,
-                timeout,
-                ..
-            } => {
-                self.fetch_http(subscriber, url, headers, *timeout, progress)
+    /// 运行订阅源的脚本，把返回值变成候选代理字符串。
+    async fn run_subscriber(&self, subscriber: &SubscriberConfig) -> Result<ParsedResult> {
+        let code = match subscriber.source() {
+            SubscriberSource::Inline(code) => code.to_string(),
+            SubscriberSource::File(path) => {
+                tokio::fs::read_to_string(path)
                     .await
-            }
-            SubscriberConfig::Lua {
-                lua_code,
-                lua_file,
-                params,
-                timeout,
-                ..
-            } => {
-                let code = match (lua_code.as_deref(), lua_file.as_deref()) {
-                    (Some(code), _) => code.to_string(),
-                    (None, Some(path)) => {
-                        tokio::fs::read_to_string(path)
-                            .await
-                            .map_err(|e| Error::Subscriber {
-                                name: subscriber.name().to_string(),
-                                message: format!("cannot read {}: {e}", path.display()),
-                            })?
-                    }
-                    (None, None) => {
-                        return Err(Error::Subscriber {
-                            name: subscriber.name().to_string(),
-                            message: "needs `lua_code` or `lua_file`".into(),
-                        });
-                    }
-                };
-                run_lua(
-                    subscriber,
-                    params,
-                    &code,
-                    timeout.unwrap_or(self.timeout),
-                    &self.client,
-                )
-                .await
-            }
-            SubscriberConfig::File { path, .. } => tokio::fs::read_to_string(path)
-                .await
-                .map_err(|e| Error::Other(format!("cannot read {}: {e}", path.display()))),
-            SubscriberConfig::Exec {
-                command,
-                env,
-                timeout,
-                ..
-            } => run_command(command, env, timeout.unwrap_or(self.timeout)).await,
-        }
-    }
-
-    /// 发起一次 HTTP GET 请求并返回响应体文本。
-    ///
-    /// 响应体是流式读的，而且每隔 [`DOWNLOAD_REPORT_INTERVAL`] 发一次
-    /// [`FetchEvent::Download`]：`freeproxy-gh` 的 2.5 MB 在这里要四分钟，
-    /// 不报进度就只像是卡住了。
-    async fn fetch_http(
-        &self,
-        subscriber: &SubscriberConfig,
-        url: &str,
-        headers: &BTreeMap<String, String>,
-        timeout: Option<Duration>,
-        progress: &dyn Progress,
-    ) -> Result<String> {
-        let mut request = self
-            .client
-            .get(url)
-            .timeout(timeout.unwrap_or(self.timeout));
-        if !headers.is_empty() {
-            let mut map = HeaderMap::new();
-            for (name, value) in headers {
-                let name =
-                    HeaderName::from_bytes(name.as_bytes()).map_err(|e| Error::Subscriber {
+                    .map_err(|e| Error::Subscriber {
                         name: subscriber.name().to_string(),
-                        message: format!("invalid header name `{name}`: {e}"),
-                    })?;
-                let value = HeaderValue::from_str(value).map_err(|e| Error::Subscriber {
-                    name: subscriber.name().to_string(),
-                    message: format!("invalid header value for `{name}`: {e}"),
-                })?;
-                map.insert(name, value);
+                        message: format!("cannot read {}: {e}", path.display()),
+                    })?
             }
-            request = request.headers(map);
-        }
+        };
 
-        let response = request.send().await.map_err(|error| Error::Subscriber {
-            name: subscriber.name().to_string(),
-            message: crate::error::describe_reqwest_error(&error),
-        })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Error::Subscriber {
-                name: subscriber.name().to_string(),
-                message: format!("HTTP {status}"),
-            });
-        }
-        use futures_util::StreamExt;
-
-        let name = subscriber.name().to_string();
-        let started = Instant::now();
-        let mut body: Vec<u8> = Vec::new();
-        let mut last_report = Instant::now();
-        let mut stream = response.bytes_stream();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| Error::Subscriber {
-                name: name.clone(),
-                message: format!(
-                    "cannot read the response body: {}",
-                    crate::error::describe_reqwest_error(&error)
-                ),
-            })?;
-            body.extend_from_slice(&chunk);
-
-            if last_report.elapsed() >= DOWNLOAD_REPORT_INTERVAL {
-                progress.fetch(FetchEvent::Download {
-                    name: subscriber.name(),
-                    bytes: body.len() as u64,
-                    elapsed: started.elapsed(),
-                });
-                last_report = Instant::now();
-            }
-        }
-
-        String::from_utf8(body).map_err(|error| Error::Subscriber {
-            name,
-            message: format!("the response body is not UTF-8: {error}"),
-        })
-    }
-}
-
-/// 运行一个 `exec` 订阅源并返回其 stdout。
-async fn run_command(
-    command: &[String],
-    env: &std::collections::BTreeMap<String, String>,
-    timeout: Duration,
-) -> Result<String> {
-    let (program, args) = command
-        .split_first()
-        .ok_or_else(|| Error::Other("empty exec command".into()))?;
-
-    let mut child = Command::new(program);
-    child
-        .args(args)
-        .envs(env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // If the timeout fires the future is dropped; make sure the child dies.
-        .kill_on_drop(true);
-
-    let label = command.join(" ");
-    let output = tokio::time::timeout(timeout, child.output())
+        run_lua(
+            subscriber.name(),
+            &code,
+            &subscriber.params,
+            subscriber.timeout.unwrap_or(self.timeout),
+            &self.client,
+        )
         .await
-        .map_err(|_| Error::Other(format!("`{label}` timed out after {timeout:?}")))?
-        .map_err(|e| Error::Other(format!("cannot run `{label}`: {e}")))?;
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.trim().is_empty() {
-        tracing::debug!(command = %label, "exec subscriber wrote to stderr: {}", stderr.trim());
     }
-
-    if !output.status.success() {
-        let tail: String = stderr.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
-        return Err(Error::Other(format!(
-            "`{label}` exited with {}{}",
-            output.status,
-            if tail.is_empty() {
-                String::new()
-            } else {
-                format!(" (stderr: {tail})")
-            }
-        )));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Lua 沙箱里每执行这么多条 VM 指令调一次钩子，用来检查脚本是否超时。
@@ -462,27 +282,23 @@ async fn run_command(
 /// 让出执行权，而纯计算的死循环永远不会让出。
 const LUA_HOOK_INTERVAL: u32 = 10_000;
 
-/// `print` 最多收集多少行，防止脚本把内存写爆。
-const LUA_MAX_LINES: usize = 100_000;
-
-/// `print` 的单个参数最长保留多少字节，超出部分截断。
+/// 写进日志的单条消息最长保留多少字节，超出部分截断。
 const LUA_MAX_ARG: usize = 4 * 1024;
 
-/// 运行一段 Lua 订阅源脚本，返回它 `print` 出来的全部内容（换行连接）。
+/// 运行一段 Lua 订阅源脚本，把它返回的代理表翻译成候选代理字符串。
 ///
 /// 脚本可用的全局变量与函数见本模块的文档。这里是**一次性**沙箱：每次刷新
 /// 都新建一个 Lua 状态，脚本之间不共享任何东西——一个来源的脚本改坏了全
 /// 局变量，不会影响另一个来源。
 async fn run_lua(
-    subscriber: &SubscriberConfig,
-    params: &BTreeMap<String, serde_yaml::Value>,
+    name: &str,
     code: &str,
+    params: &BTreeMap<String, serde_yaml::Value>,
     timeout: Duration,
     client: &reqwest::Client,
-) -> Result<String> {
-    let name = subscriber.name().to_string();
+) -> Result<ParsedResult> {
     let fail = |message: String| Error::Subscriber {
-        name: name.clone(),
+        name: name.to_string(),
         message,
     };
 
@@ -516,26 +332,6 @@ async fn run_lua(
             .set(forbidden, LuaValue::Nil)
             .map_err(|e| fail(format!("cannot harden the Lua sandbox: {e}")))?;
     }
-
-    // `print` 是唯一的输出通道：每次调用收集一行。
-    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&lines);
-    let print = lua
-        .create_function(move |_, args: Variadic<LuaValue>| {
-            let mut parts = Vec::with_capacity(args.len());
-            for arg in args {
-                parts.push(truncate_text(arg.to_string()?, LUA_MAX_ARG));
-            }
-            let mut sink = sink.lock().unwrap_or_else(|e| e.into_inner());
-            if sink.len() < LUA_MAX_LINES {
-                sink.push(parts.join("\t"));
-            }
-            Ok(())
-        })
-        .map_err(|e| fail(format!("cannot define `print` for Lua: {e}")))?;
-    lua.globals()
-        .set("print", print)
-        .map_err(|e| fail(format!("cannot define `print` for Lua: {e}")))?;
 
     // `fetch` / `fetch_json`：脚本访问外部世界的唯一方式，共用订阅源的
     // HTTP 客户端（同一份 UA、连接池与 TLS 配置）。
@@ -593,7 +389,9 @@ async fn run_lua(
         .set("json_decode", decode)
         .map_err(|e| fail(format!("cannot define `json_decode` for Lua: {e}")))?;
 
-    let log_name = name.clone();
+    // `log`（以及它的别名 `print`）只写日志：脚本的**返回值**才是代理，
+    // 这样 `print` 不会被误当成输出通道，也不会把杂音打到进程 stdout 上。
+    let log_name = name.to_string();
     let log = lua
         .create_function(move |_, args: Variadic<LuaValue>| {
             let mut parts = Vec::with_capacity(args.len());
@@ -604,13 +402,15 @@ async fn run_lua(
             Ok(())
         })
         .map_err(|e| fail(format!("cannot define `log` for Lua: {e}")))?;
-    lua.globals()
-        .set("log", log)
-        .map_err(|e| fail(format!("cannot define `log` for Lua: {e}")))?;
+    for alias in ["log", "print"] {
+        lua.globals()
+            .set(alias, log.clone())
+            .map_err(|e| fail(format!("cannot define `{alias}` for Lua: {e}")))?;
+    }
 
     // 指令钩子：纯计算的死循环只有它能掐断。
     //
-    // 必须用 `set_global_hook`：`exec_async` 会把脚本放进一条新协程执行，
+    // 必须用 `set_global_hook`：`eval_async` 会把脚本放进一条新协程执行，
     // 而 `set_hook` 只管当前线程。
     let deadline = Instant::now() + timeout;
     let expired = format!("script timed out after {timeout:?}");
@@ -628,20 +428,23 @@ async fn run_lua(
     .map_err(|e| fail(format!("cannot arm the Lua watchdog: {e}")))?;
 
     let chunk = lua.load(code).set_name(format!("subscriber `{name}`"));
-    match tokio::time::timeout(timeout, chunk.exec_async()).await {
-        Err(_) => Err(fail(expired)),
+    let returned = match tokio::time::timeout(timeout, chunk.eval_async::<LuaValue>()).await {
+        Err(_) => return Err(fail(expired)),
         Ok(Err(error)) => {
-            if Instant::now() >= deadline {
+            return if Instant::now() >= deadline {
                 Err(fail(expired))
             } else {
                 Err(fail(format!("Lua error: {error}")))
-            }
+            };
         }
-        Ok(Ok(())) => {
-            let lines = lines.lock().unwrap_or_else(|e| e.into_inner());
-            Ok(lines.join("\n"))
-        }
-    }
+        Ok(Ok(value)) => value,
+    };
+
+    let returned: JsonValue = lua
+        .from_value(returned)
+        .map_err(|e| fail(format!("cannot read what the script returned: {e}")))?;
+
+    Ok(entries_to_candidates(&returned))
 }
 
 /// 一次同步 GET（对 Lua 而言是同步的），返回响应体文本。
@@ -697,204 +500,126 @@ pub fn apply_limit(proxies: &mut Vec<Url>, limit: Option<usize>) -> usize {
     }
 }
 
-/// 下载响应体时，两次进度报告之间的最小间隔。
-const DOWNLOAD_REPORT_INTERVAL: Duration = Duration::from_secs(10);
-
-/// 把一段响应体交给某个内置格式解析器处理得到的结果。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ParsedPayload {
+/// 脚本返回值的转换结果。
+///
+/// 和 [`FetchOutcome`] 的分工：这里只管把脚本给的东西翻译成候选代理字符串，
+/// 归一化与计数归 [`FetchOutcome`]。
+#[derive(Debug, Clone, Default)]
+pub struct ParsedResult {
     /// 候选代理字符串，尚未归一化。
     pub candidates: Vec<String>,
-    /// 因协议不受支持而跳过的条目。
+    /// 因为协议不受支持（`socks4`、写错的名称）而故意丢掉的条目。
     pub skipped: usize,
+    /// 结构不对、用不了的条目，附上原因。
+    pub rejected: Vec<String>,
 }
 
-/// 把订阅源响应体解析为候选代理字符串。
-pub fn parse_payload(text: &str, format: Format) -> Result<ParsedPayload> {
-    match format {
-        Format::Plaintext => Ok(parse_plaintext(text)),
-        Format::Json => {
-            let value: JsonValue = serde_json::from_str(text)?;
-            Ok(parse_json_value(&value))
-        }
-        Format::Clash => {
-            // Clash files are YAML; convert once and reuse the JSON walker.
-            let value: serde_yaml::Value = serde_yaml::from_str(text)?;
-            let value: JsonValue = serde_json::to_value(value)
-                .map_err(|e| Error::Other(format!("unsupported clash payload: {e}")))?;
-            Ok(parse_json_value(&value))
-        }
-    }
-}
-
-/// 每行一个代理；空行与 `#` 注释会被忽略。
-fn parse_plaintext(text: &str) -> ParsedPayload {
-    let mut parsed = ParsedPayload::default();
-    for line in text.lines() {
-        if model::is_ignorable_line(line) {
-            continue;
-        }
-        let candidate = model::strip_inline_comment(line).trim();
-        if !candidate.is_empty() {
-            parsed.candidates.push(candidate.to_string());
-        }
-    }
-    parsed
-}
-
-/// 遍历一段 JSON/YAML 数据以寻找代理。
+/// 把一个脚本返回值翻译成候选代理字符串。
 ///
-/// 可识别的形态：字符串或对象组成的数组、带 `proxies` 或 `data`
-/// 数组的对象，或者单个代理对象。
-fn parse_json_value(value: &JsonValue) -> ParsedPayload {
-    let mut parsed = ParsedPayload::default();
-    walk(value, &mut parsed, 0);
-    parsed
-}
-
-/// 数据嵌套深度的上限，超过就计为跳过。
-const MAX_DEPTH: usize = 6;
-
-/// 其数组值存放代理的容器字段名。
-const CONTAINER_KEYS: [&str; 5] = ["proxies", "data", "items", "list", "result"];
-
-/// 存放代理端点（主机名或完整 URL）的主机字段名。
-const HOST_KEYS: [&str; 6] = ["server", "host", "hostname", "ip", "address", "addr"];
-/// 直接存放完整代理 URL 的字段名。
-const URL_KEYS: [&str; 4] = ["url", "proxy", "uri", "address_url"];
-
-/// 递归遍历一个 JSON 值，把识别到的代理追加到 `parsed`。
-fn walk(value: &JsonValue, parsed: &mut ParsedPayload, depth: usize) {
-    if depth > MAX_DEPTH {
-        parsed.skipped += 1;
-        return;
-    }
-    match value {
-        JsonValue::Array(items) => {
-            for item in items {
-                walk(item, parsed, depth + 1);
-            }
-        }
-        JsonValue::String(text) => {
-            let cleaned = model::clean_line(text);
-            if !cleaned.is_empty() {
-                parsed.candidates.push(cleaned.to_string());
-            }
-        }
-        JsonValue::Object(map) => {
-            let host = lookup(map, &HOST_KEYS);
-            let url = lookup(map, &URL_KEYS);
-
-            // Recognised containers first, but only on something that is not
-            // itself a proxy entry: `{"proxies":[...]}`, `{"data":[...]}`.
-            if host.is_none() && url.is_none() {
-                let mut nested = false;
-                for key in CONTAINER_KEYS {
-                    if let Some(inner) = map.get(key) {
-                        if inner.is_array() {
-                            walk(inner, parsed, depth + 1);
-                            nested = true;
-                        }
-                    }
-                }
-                if nested {
-                    return;
-                }
-            }
-
-            // A full URL under a known key, or a proxy described by fields.
-            if let Some(url) = url {
-                parsed.candidates.push(url);
-                return;
-            }
-            if let Some(candidate) = proxy_from_fields(map) {
-                parsed.candidates.push(candidate);
-                return;
-            }
-
-            // It has a host but named a protocol ProxyGate cannot tunnel
-            // (socks4, vmess, ...). Count it and stop here: descending into its
-            // fields would mine metadata — `"protocols": ["socks4"]` is a list of
-            // protocol names, not a list of proxies.
-            if host.is_some() {
-                parsed.skipped += 1;
-                return;
-            }
-
-            // Otherwise this is an envelope (`{"code":200,"data":{"proxies":[...]}}`)
-            // or a metadata object: descend into whatever is nested inside. A
-            // leaf object that describes nothing is counted, not silently lost.
-            let mut descended = false;
-            for inner in map.values() {
-                if inner.is_array() || inner.is_object() {
-                    walk(inner, parsed, depth + 1);
-                    descended = true;
-                }
-            }
-            if !descended {
-                parsed.skipped += 1;
-            }
-        }
-        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) => parsed.skipped += 1,
-    }
-}
-
-/// 按顺序查找一组键，返回第一个命中且非空的字符串值。
-fn lookup(map: &serde_json::Map<String, JsonValue>, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| {
-        map.get(*key)
-            .and_then(|value| value.as_str())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    })
-}
-
-/// 依据大多数 JSON API 和 Clash 使用的字段名拼出一个代理 URL。
+/// 期待一个代理表组成的数组；单个代理表、以及 `nil`（脚本什么都没返回）
+/// 也接受。每个代理表认这些字段：
 ///
-/// 对 ProxyGate 无法使用的协议（Shadowsocks、VMess、Trojan……）返回
-/// `None`，这样它们会被记为跳过而不是拒绝。
-fn proxy_from_fields(map: &serde_json::Map<String, JsonValue>) -> Option<String> {
-    let host = lookup(map, &HOST_KEYS)?;
+/// | 字段 | 含义 |
+/// | --- | --- |
+/// | `type` | 协议：`http`/`https`/`ssl`、`socks5`/`socks5h`/`socks`；其它（如 `socks4`）会被跳过 |
+/// | `ip` | 主机名或 IP，`host`/`hostname`/`server`/`address`/`addr` 也算 |
+/// | `port` | 端口，数字或字符串；缺省时用协议的默认端口 |
+/// | `auth` | 可选，`user:password`（也可以只写 `user`） |
+///
+/// 数组里直接写字符串也可以，那就按代理 URL 交给归一化处理。
+fn entries_to_candidates(value: &JsonValue) -> ParsedResult {
+    let mut parsed = ParsedResult::default();
 
-    // Which protocol the entry claims. A list source may express it as a string
-    // (`"protocol": "HTTP"`), as a list (`"protocols": ["https"]`), or as a
-    // joined string (`"socks4+socks5"`); all three are common in the wild.
-    let scheme = scheme_from_fields(map)?;
-
-    let port = map
-        .get("port")
-        .and_then(|value| match value {
-            JsonValue::Number(number) => number.as_u64().map(|port| port as u16),
-            JsonValue::String(text) => text.trim().parse::<u16>().ok(),
-            _ => None,
-        })
-        .unwrap_or_else(|| scheme.default_port());
-
-    let username = lookup(map, &["username", "user"]);
-    let password = lookup(map, &["password", "pass"]);
-    let auth = match (&username, &password) {
-        (Some(user), Some(pass)) => format!("{}:{}@", encode_userinfo(user), encode_userinfo(pass)),
-        (Some(user), None) => format!("{}@", encode_userinfo(user)),
-        _ => String::new(),
+    let entries: &[JsonValue] = match value {
+        JsonValue::Array(items) => items,
+        JsonValue::Object(_) => std::slice::from_ref(value),
+        JsonValue::Null => return parsed,
+        other => {
+            parsed
+                .rejected
+                .push(format!("expected a list of proxies, got `{other}`"));
+            return parsed;
+        }
     };
 
+    for entry in entries {
+        match entry_to_candidate(entry) {
+            Ok(Some(candidate)) => parsed.candidates.push(candidate),
+            Ok(None) => parsed.skipped += 1,
+            Err(reason) => parsed.rejected.push(reason),
+        }
+    }
+
+    parsed
+}
+
+/// 一个代理表（或一条代理字符串）转成候选字符串。
+///
+/// `Ok(None)` 表示这个条目协议不受支持、应当计入 skipped。
+fn entry_to_candidate(entry: &JsonValue) -> std::result::Result<Option<String>, String> {
+    let JsonValue::Object(map) = entry else {
+        return match entry {
+            JsonValue::String(text) => Ok(Some(text.clone())),
+            other => Err(format!("expected a proxy table or string, got `{other}`")),
+        };
+    };
+
+    let Some(scheme) = scheme_from_entry(map) else {
+        return Ok(None);
+    };
+
+    let host = ["ip", "host", "hostname", "server", "address", "addr"]
+        .iter()
+        .find_map(|key| map.get(*key).and_then(value_as_text))
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| "missing `ip`".to_string())?;
+
+    let port = match map.get("port") {
+        Some(value) => value_as_text(value)
+            .and_then(|text| text.trim().parse::<u16>().ok())
+            .filter(|port| *port != 0)
+            .ok_or_else(|| format!("invalid `port` for `{host}`"))?,
+        None => scheme.default_port(),
+    };
+
+    // IPv6 字面量要塞进方括号，否则拼出来的 URL 会被解析成端口。
     let host = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
     } else {
         host
     };
 
-    Some(format!("{}://{auth}{host}:{port}", scheme.as_str()))
+    let auth = map.get("auth").and_then(value_as_text).unwrap_or_default();
+    let userinfo = if auth.is_empty() {
+        String::new()
+    } else {
+        let (user, password) = match auth.split_once(':') {
+            Some((user, password)) => (user, Some(password)),
+            None => (auth.as_str(), None),
+        };
+        let mut userinfo = encode_userinfo(user);
+        if let Some(password) = password {
+            userinfo.push(':');
+            userinfo.push_str(&encode_userinfo(password));
+        }
+        userinfo.push('@');
+        userinfo
+    };
+
+    Ok(Some(format!(
+        "{}://{userinfo}{host}:{port}",
+        scheme.as_str()
+    )))
 }
 
-/// 条目声明的协议，ProxyGate 无法使用时为 `None`。
+/// 从代理表里读出协议。
 ///
-/// 这些列表里的命名很随意：`https` 指的是“能够 CONNECT 到 HTTPS 的
-/// HTTP 代理”，而不是“到代理的 TLS”；`socks5` 会被改写为
-/// [`ProxyScheme::Socks5h`]，由*代理*去解析域名。这一点很关键：在 DNS
-/// 被污染的网络里，客户端自己解析 `www.google.com` 会把伪造的地址交给
-/// 代理，而由代理远端解析则能正常工作。
-fn scheme_from_fields(map: &serde_json::Map<String, JsonValue>) -> Option<ProxyScheme> {
+/// `http`/`https`/`ssl` 归一为 [`ProxyScheme::Http`]（列表里的 https 指
+/// “这个代理能 CONNECT 到 HTTPS”，不是“对代理做 TLS”）；`socks` 一族统一
+/// 成 [`ProxyScheme::Socks5h`]，由*代理*去解析域名——在 DNS 被污染的网络里，
+/// 客户端自己解析会把伪造的地址交给代理。`socks4` 或无法识别的名称返回
+/// `None`，调用方据此跳过该条目。
+fn scheme_from_entry(map: &serde_json::Map<String, JsonValue>) -> Option<ProxyScheme> {
     let mut named: Vec<String> = Vec::new();
     for key in ["type", "scheme", "protocol", "protocols", "proxy_type"] {
         if let Some(value) = map.get(key) {
@@ -902,7 +627,7 @@ fn scheme_from_fields(map: &serde_json::Map<String, JsonValue>) -> Option<ProxyS
         }
     }
 
-    // Nothing said: a bare `host:port` is an HTTP proxy by convention.
+    // 什么都没说：按惯例当成 HTTP 代理。
     if named.is_empty() {
         return Some(ProxyScheme::Http);
     }
@@ -942,6 +667,15 @@ fn collect_scheme_names(value: &JsonValue, out: &mut Vec<String>) {
     }
 }
 
+/// JSON 标量转成文本：数字和字符串都算，其它不算。
+fn value_as_text(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::String(text) => Some(text.clone()),
+        JsonValue::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
 /// 对会破坏 URL userinfo 段的字符做百分号编码。
 fn encode_userinfo(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
@@ -964,154 +698,405 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    /// 构造一个订阅源脚本条目，超时 5 秒、没有额外参数。
+    fn lua_subscriber(code: &str) -> SubscriberConfig {
+        SubscriberConfig {
+            name: "lua".into(),
+            lua_code: Some(code.into()),
+            lua_file: None,
+            timeout: Some(Duration::from_secs(5)),
+            limit: None,
+            enabled: true,
+            params: BTreeMap::new(),
+        }
+    }
+
+    /// 用一个只含该订阅源的配置跑一次。
+    async fn run_one(subscriber: SubscriberConfig) -> FetchOutcome {
+        let config = Config {
+            subscribers: vec![subscriber],
+            ..Config::default()
+        };
+        let mut outcomes = SubscriberSet::new(&config).unwrap().fetch_all().await;
+        outcomes.remove(0)
+    }
+
+    /// 跑一段脚本并返回规范渲染后的代理。
+    async fn run_script(code: &str) -> Vec<String> {
+        let outcome = run_one(lua_subscriber(code)).await;
+        assert!(outcome.ok(), "{:?}", outcome.error);
+        rendered(&outcome)
+    }
+
+    /// 把归一化后的代理渲染成规范的 `scheme://host:port` 形式，便于比较。
+    fn rendered(outcome: &FetchOutcome) -> Vec<String> {
+        outcome
+            .proxies
+            .iter()
+            .map(|proxy| model::render_url(proxy, true))
+            .collect()
+    }
+
+    fn json(text: &str) -> JsonValue {
+        serde_json::from_str(text).unwrap()
+    }
+
     #[test]
-    fn parses_plaintext_lists() {
-        let payload = "\u{feff}# comment\n\nhttp://1.2.3.4:8080\n1.2.3.4:8080\r\nsocks5://user:pass@5.6.7.8:1080  # fast\n";
-        let parsed = parse_payload(payload, Format::Plaintext).unwrap();
+    fn proxy_tables_become_candidate_urls() {
+        let parsed = entries_to_candidates(&json(
+            r#"[
+                {"type": "http", "ip": "1.2.3.4", "port": 8080},
+                {"type": "https", "host": "5.6.7.8", "port": "3128", "auth": "u:p"},
+                {"type": "socks5", "ip": "9.9.9.9", "port": 1080},
+                {"type": "socks", "ip": "9.9.9.8", "port": 1080},
+                {"type": "socks4", "ip": "9.9.9.7", "port": 1080},
+                {"type": "weird", "ip": "9.9.9.6", "port": 1080},
+                {"type": "http", "ip": "2001:db8::1", "port": 8080},
+                {"type": "http", "server": "10.0.0.1"},
+                "1.1.1.1:1111"
+            ]"#,
+        ));
+
         assert_eq!(
             parsed.candidates,
             vec![
                 "http://1.2.3.4:8080".to_string(),
-                "1.2.3.4:8080".to_string(),
-                "socks5://user:pass@5.6.7.8:1080".to_string(),
+                "http://u:p@5.6.7.8:3128".to_string(),
+                "socks5h://9.9.9.9:1080".to_string(),
+                // `socks` 也是 socks5h：让代理去解析域名。
+                "socks5h://9.9.9.8:1080".to_string(),
+                // IPv6 会被套上方括号。
+                "http://[2001:db8::1]:8080".to_string(),
+                // 端口缺省时用协议的默认端口。
+                "http://10.0.0.1:80".to_string(),
+                // 直接写字符串也收。
+                "1.1.1.1:1111".to_string(),
             ]
         );
+        assert_eq!(parsed.skipped, 2, "socks4 与未知协议该被跳过");
+        assert!(parsed.rejected.is_empty());
     }
 
     #[test]
-    fn parses_json_arrays_of_strings() {
-        let parsed =
-            parse_payload(r#"["http://1.2.3.4:8080", "5.6.7.8:3128"]"#, Format::Json).unwrap();
-        assert_eq!(parsed.candidates.len(), 2);
-        assert!(model::normalize(&parsed.candidates[1]).is_ok());
+    fn entries_without_a_host_or_a_good_port_are_rejected() {
+        let parsed = entries_to_candidates(&json(
+            r#"[
+                {"type": "http", "port": 8080},
+                {"type": "http", "ip": "1.2.3.4", "port": "nope"},
+                {"type": "http", "ip": "1.2.3.4", "port": 0},
+                {"type": "http", "ip": "", "port": 1},
+                42
+            ]"#,
+        ));
+        assert!(parsed.candidates.is_empty());
+        assert_eq!(parsed.rejected.len(), 5, "{:?}", parsed.rejected);
+        assert!(parsed.rejected[0].contains("missing `ip`"));
+        assert!(parsed.rejected[4].contains("proxy table or string"));
     }
 
     #[test]
-    fn parses_json_objects_into_urls() {
-        let payload = r#"
-        {
-          "data": [
-            {"ip": "1.2.3.4", "port": 8080, "username": "u", "password": "p"},
-            {"host": "5.6.7.8", "port": "3128", "protocol": "socks5"},
-            {"server": "9.9.9.9", "port": 1080, "type": "ss", "cipher": "aes-256-gcm"},
-            {"url": "http://7.7.7.7:8000"}
-          ]
-        }
-        "#;
-        let parsed = parse_payload(payload, Format::Json).unwrap();
-        assert_eq!(
-            parsed.candidates,
-            vec![
-                "http://u:p@1.2.3.4:8080".to_string(),
-                "socks5h://5.6.7.8:3128".to_string(),
-                "http://7.7.7.7:8000".to_string(),
-            ]
-        );
-        // The Shadowsocks entry is counted, not silently dropped.
-        assert_eq!(parsed.skipped, 1);
-    }
-
-    #[test]
-    fn parses_a_nested_data_envelope() {
-        // The shape served by proxy.scdn.io (and by a lot of other panel APIs):
-        // the proxies sit in an array inside an object inside an object.
-        let payload = r#"{"code":200,"message":"success","data":{"proxies":["47.237.113.119:16044","8.138.147.110:8008"],"count":2}}"#;
-        let parsed = parse_payload(payload, Format::Json).unwrap();
-        assert_eq!(
-            parsed.candidates,
-            vec![
-                "47.237.113.119:16044".to_string(),
-                "8.138.147.110:8008".to_string(),
-            ]
-        );
-        assert_eq!(parsed.skipped, 0, "an envelope is not a skipped proxy");
-        for candidate in &parsed.candidates {
-            assert!(crate::model::normalize(candidate).is_ok());
-        }
-    }
-
-    #[test]
-    fn descends_through_arbitrary_envelopes() {
-        let payload = r#"{"ok":true,"payload":{"page":1,"result":{"list":[{"host":"1.2.3.4","port":8080}]}}}"#;
-        let parsed = parse_payload(payload, Format::Json).unwrap();
+    fn a_single_proxy_table_or_nothing_is_fine() {
+        // 一个代理表（没有包数组）。
+        let parsed = entries_to_candidates(&json(r#"{"ip": "1.2.3.4", "port": 8080}"#));
         assert_eq!(parsed.candidates, vec!["http://1.2.3.4:8080".to_string()]);
-        assert_eq!(parsed.skipped, 0);
+
+        // 脚本什么都没返回。
+        assert!(
+            entries_to_candidates(&JsonValue::Null)
+                .candidates
+                .is_empty()
+        );
+
+        // 返回了别的东西：算一条被拒绝的条目，而不是把整个来源判死。
+        let parsed = entries_to_candidates(&json("7"));
+        assert!(parsed.candidates.is_empty());
+        assert_eq!(parsed.rejected.len(), 1);
     }
 
     #[test]
-    fn reads_the_protocol_field_in_every_shape_lists_use() {
-        // Real payloads name the protocol as a string, as a list, as a joined
-        // string, and in mixed case.
-        let payload = r#"[
-            {"ip": "1.1.1.1", "port": 80, "protocol": "HTTP"},
-            {"ip": "2.2.2.2", "port": 80, "protocol": "HTTPS"},
-            {"ip": "3.3.3.3", "port": 1080, "protocol": "Socks5"},
-            {"ip": "4.4.4.4", "port": 1080, "protocols": ["socks5"]},
-            {"ip": "5.5.5.5", "port": 8080, "protocols": ["https"]},
-            {"ip": "6.6.6.6", "port": 8080, "protocols": ["http", "socks5"]},
-            {"ip": "7.7.7.7", "port": 1080, "protocol": "socks4+socks5"},
-            {"ip": "8.8.8.8", "port": 1080, "protocol": "SOCKS4"},
-            {"ip": "9.9.9.9", "port": 1080, "protocols": ["socks4"]},
-            {"ip": "10.10.10.10", "port": 3128}
-        ]"#;
-        let parsed = parse_payload(payload, Format::Json).unwrap();
-        let rendered: Vec<String> = parsed
-            .candidates
-            .iter()
-            .map(|candidate| model::render_url(&model::normalize(candidate).unwrap(), true))
-            .collect();
+    fn credentials_are_percent_encoded() {
+        let parsed = entries_to_candidates(&json(
+            r#"[{"ip": "1.2.3.4", "port": 8080, "auth": "u ser:p@ss"}]"#,
+        ));
+        assert_eq!(
+            parsed.candidates,
+            vec!["http://u%20ser:p%40ss@1.2.3.4:8080".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_script_returns_proxy_tables() {
+        let rendered = run_script(
+            r#"
+            local result = {}
+            for i = 1, 3 do
+              table.insert(result, { type = "http", ip = "10.0.0." .. i, port = 8080 })
+            end
+            table.insert(result, { type = "socks5", ip = "1.2.3.4", port = 1080 })
+            return result
+            "#,
+        )
+        .await;
 
         assert_eq!(
             rendered,
             vec![
-                "http://1.1.1.1:80".to_string(),
-                // `https` in a list means "can CONNECT to HTTPS", not TLS-to-proxy.
-                "http://2.2.2.2:80".to_string(),
-                // socks5 becomes socks5h: the proxy resolves names, which is what
-                // makes blocked destinations work from a poisoned-DNS network.
-                "socks5h://3.3.3.3:1080".to_string(),
-                "socks5h://4.4.4.4:1080".to_string(),
-                "http://5.5.5.5:8080".to_string(),
-                // An entry offering both: HTTP wins, it is the safer default.
-                "http://6.6.6.6:8080".to_string(),
-                "socks5h://7.7.7.7:1080".to_string(),
-                // The last one said nothing, so it keeps the host:port convention.
-                "http://10.10.10.10:3128".to_string(),
+                "http://10.0.0.1:8080".to_string(),
+                "http://10.0.0.2:8080".to_string(),
+                "http://10.0.0.3:8080".to_string(),
+                "socks5h://1.2.3.4:1080".to_string(),
             ]
         );
-        assert_eq!(parsed.skipped, 2, "socks4-only entries are not usable");
     }
 
-    #[test]
-    fn limits_come_from_the_lua_subscriber_config() {
-        use crate::config::SubscriberConfig;
+    #[tokio::test]
+    async fn a_script_that_returns_nothing_is_empty_not_broken() {
+        let outcome = run_one(lua_subscriber("local _ = 1")).await;
+        assert!(outcome.ok(), "{:?}", outcome.error);
+        assert_eq!(outcome.count(), 0);
+    }
 
-        let lua = |limit| SubscriberConfig::Lua {
-            name: "x".into(),
-            lua_code: Some("print('1.1.1.1:8080')".into()),
-            lua_file: None,
-            format: Format::Plaintext,
-            timeout: None,
-            limit,
-            enabled: true,
-            params: Default::default(),
+    #[tokio::test]
+    async fn print_goes_to_the_log_not_to_the_pool() {
+        // `print` 是 `log` 的别名：它不该被当成输出通道。
+        let outcome = run_one(lua_subscriber(
+            r#"
+            print("11.11.11.11:1111")
+            return { { type = "http", ip = "10.0.0.1", port = 8080 } }
+            "#,
+        ))
+        .await;
+        assert_eq!(rendered(&outcome), vec!["http://10.0.0.1:8080".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_script_sees_extra_config_keys_as_globals() {
+        // 额外键变成全局变量：字符串、数字、以及整个表都能用。
+        let mut subscriber = lua_subscriber(
+            r#"
+            return {
+              { type = "http", ip = target_host, port = port },
+              { type = "http", ip = "10.0.0.9", port = port, auth = token },
+            }
+            "#,
+        );
+        subscriber
+            .params
+            .insert("target_host".into(), serde_yaml::Value::from("10.1.2.3"));
+        subscriber.params.insert(
+            "port".into(),
+            serde_yaml::Value::Number(serde_yaml::Number::from(8080)),
+        );
+        subscriber
+            .params
+            .insert("token".into(), serde_yaml::Value::from("u:p"));
+        // `key:` 后面什么都不写：全局变量保持未定义，而不是拿到一个 null。
+        subscriber
+            .params
+            .insert("unused".into(), serde_yaml::Value::Null);
+
+        let outcome = run_one(subscriber).await;
+        assert!(outcome.ok(), "{:?}", outcome.error);
+        assert_eq!(
+            rendered(&outcome),
+            vec![
+                "http://10.1.2.3:8080".to_string(),
+                "http://u:p@10.0.0.9:8080".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lua_sandbox_has_no_file_or_process_access() {
+        let outcome = run_one(lua_subscriber(
+            r#"
+            local missing = 0
+            local names = {"io", "os", "package", "debug", "dofile", "loadfile", "load", "require"}
+            for _, name in ipairs(names) do
+              if _G[name] == nil then missing = missing + 1 end
+            end
+            return { { type = "http", ip = "10.0.0." .. missing, port = 8080 } }
+            "#,
+        ))
+        .await;
+
+        assert!(outcome.ok(), "{:?}", outcome.error);
+        assert_eq!(rendered(&outcome), vec!["http://10.0.0.8:8080".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_script_can_fetch_json_from_an_endpoint() {
+        let app = axum::Router::new().route(
+            "/list",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "data": {"proxies": ["10.9.8.7:3128", {"ip": "10.9.8.6", "port": 3128}]}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let outcome = run_one(lua_subscriber(&format!(
+            r#"
+            local data = fetch_json("http://{address}/list")
+            local result = {{}}
+            for _, item in ipairs(data.data.proxies) do
+              if type(item) == "table" then
+                table.insert(result, {{ type = "socks5", ip = item.ip, port = item.port }})
+              else
+                table.insert(result, item)
+              end
+            end
+            return result
+            "#,
+        )))
+        .await;
+        server.abort();
+
+        assert!(outcome.ok(), "{:?}", outcome.error);
+        assert_eq!(
+            rendered(&outcome),
+            vec![
+                "http://10.9.8.7:3128".to_string(),
+                "socks5h://10.9.8.6:3128".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn lua_errors_are_reported_not_fatal() {
+        let outcome = run_one(lua_subscriber("error('boom')")).await;
+        assert!(!outcome.ok());
+        let error = outcome.error.unwrap();
+        assert!(error.contains("boom"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_fetch_surfaces_as_a_subscriber_error() {
+        // 端口 1 上没有任何东西在监听：脚本该失败，异常要带上 URL。
+        let outcome = run_one(lua_subscriber(
+            r#"return { fetch("http://127.0.0.1:1/nope") }"#,
+        ))
+        .await;
+        assert!(!outcome.ok());
+        let error = outcome.error.unwrap();
+        assert!(error.contains("127.0.0.1:1"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_runaway_lua_script_is_stopped() {
+        let mut subscriber = lua_subscriber("while true do end");
+        subscriber.timeout = Some(Duration::from_millis(300));
+
+        let started = Instant::now();
+        let outcome = run_one(subscriber).await;
+        let error = outcome.error.expect("a runaway script must fail");
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the watchdog took {:?} to fire",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lua_limit_truncates_the_result() {
+        let mut subscriber = lua_subscriber(
+            r#"
+            local result = {}
+            for i = 1, 10 do
+              table.insert(result, { type = "http", ip = "10.0.0." .. i, port = 8080 })
+            end
+            return result
+            "#,
+        );
+        subscriber.limit = Some(3);
+
+        let outcome = run_one(subscriber).await;
+        assert!(outcome.ok(), "{:?}", outcome.error);
+        assert_eq!(outcome.count(), 3);
+        assert_eq!(outcome.truncated, 7);
+    }
+
+    #[tokio::test]
+    async fn disabled_subscribers_are_skipped() {
+        let mut subscriber = lua_subscriber("return { { ip = '1.2.3.4', port = 8080 } }");
+        subscriber.enabled = false;
+
+        let config = Config {
+            subscribers: vec![subscriber],
+            ..Config::default()
+        };
+        let set = SubscriberSet::new(&config).unwrap();
+        assert!(set.is_empty());
+        assert!(set.fetch_all().await.is_empty());
+    }
+
+    /// 记录进度事件的接收器。
+    #[derive(Default)]
+    struct Recorder {
+        started: std::sync::Mutex<Vec<String>>,
+        finished: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Progress for Recorder {
+        fn fetch(&self, event: FetchEvent<'_>) {
+            match event {
+                FetchEvent::Started { name } => self.started.lock().unwrap().push(name.to_string()),
+                FetchEvent::Finished(outcome) => self.finished.lock().unwrap().push(format!(
+                    "{}={}",
+                    outcome.name,
+                    outcome.count()
+                )),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_subscriber_is_reported_whether_it_works_or_not() {
+        let config = Config {
+            subscribers: vec![
+                SubscriberConfig {
+                    name: "good".into(),
+                    ..lua_subscriber("return { { ip = '1.2.3.4', port = 8080 } }")
+                },
+                SubscriberConfig {
+                    name: "bad".into(),
+                    ..lua_subscriber("error('nope')")
+                },
+            ],
+            ..Config::default()
         };
 
-        // 只有脚本声明了 `limit` 才有上限。
-        assert_eq!(effective_limit(&lua(None)), None);
-        assert_eq!(effective_limit(&lua(Some(25))), Some(25));
+        let recorder = Recorder::default();
+        let outcomes = SubscriberSet::new(&config)
+            .unwrap()
+            .fetch_all_reporting(&recorder)
+            .await;
+        assert_eq!(outcomes.len(), 2);
+
+        let mut started = recorder.started.lock().unwrap().clone();
+        started.sort();
+        assert_eq!(started, vec!["bad".to_string(), "good".to_string()]);
+
+        let mut finished = recorder.finished.lock().unwrap().clone();
+        finished.sort();
+        assert_eq!(finished, vec!["bad=0".to_string(), "good=1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn limits_come_from_the_config() {
+        let mut subscriber = lua_subscriber("return {}");
+        assert_eq!(effective_limit(&subscriber), None);
+        subscriber.limit = Some(25);
+        assert_eq!(effective_limit(&subscriber), Some(25));
         // `0` 表示不限。
-        assert_eq!(effective_limit(&lua(Some(0))), None);
-
-        // 其他种类没有 `limit` 字段，永远不限。
-        let file = SubscriberConfig::File {
-            name: "f".into(),
-            path: "x".into(),
-            format: Format::Plaintext,
-            limit: None,
-            enabled: true,
-        };
-        assert_eq!(effective_limit(&file), None);
+        subscriber.limit = Some(0);
+        assert_eq!(effective_limit(&subscriber), None);
     }
 
     #[test]
@@ -1127,475 +1112,16 @@ mod tests {
 
         assert_eq!(apply_limit(&mut proxies, Some(4)), 6);
         assert_eq!(proxies.len(), 4);
-        assert_eq!(
-            proxies[0].host_str(),
-            Some("10.0.0.1"),
-            "keeps the first entries"
-        );
+        assert_eq!(proxies[3].host_str(), Some("10.0.0.4"));
     }
 
     #[test]
-    fn parses_clash_proxies() {
-        let payload = r#"
-proxies:
-  - name: "a"
-    type: http
-    server: 1.2.3.4
-    port: 8080
-    username: user
-    password: "p@ss word"
-  - name: "b"
-    type: socks5
-    server: 5.6.7.8
-    port: 1080
-  - name: "c"
-    type: vmess
-    server: 9.9.9.9
-    port: 443
-    uuid: whatever
-"#;
-        let parsed = parse_payload(payload, Format::Clash).unwrap();
-        assert_eq!(parsed.candidates.len(), 2);
-        assert_eq!(parsed.skipped, 1);
-
-        let first = crate::model::Proxy::new(model::normalize(&parsed.candidates[0]).unwrap());
-        assert_eq!(first.username().as_deref(), Some("user"));
-        assert_eq!(first.password().as_deref(), Some("p@ss word"));
-        assert_eq!(first.to_masked_string(), "http://***:***@1.2.3.4:8080");
-        assert_eq!(
-            first.to_full_string(),
-            "http://user:p%40ss%20word@1.2.3.4:8080"
-        );
-
-        // A clash entry naming socks5 becomes socks5h: the proxy resolves names.
-        let second = model::normalize(&parsed.candidates[1]).unwrap();
-        assert_eq!(model::render_url(&second, true), "socks5h://5.6.7.8:1080");
-    }
-
-    #[test]
-    fn reports_broken_payloads() {
-        assert!(parse_payload("{not json", Format::Json).is_err());
-        assert!(parse_payload("proxies: [", Format::Clash).is_err());
-    }
-
-    #[tokio::test]
-    async fn reads_a_file_subscriber() {
-        let dir = std::env::temp_dir().join(format!("proxygate-sub-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("proxies.txt");
-        std::fs::write(&path, "1.2.3.4:8080\n5.6.7.8:3128\nnot a proxy\n").unwrap();
-
-        let config = Config {
-            subscribers: vec![SubscriberConfig::File {
-                name: "local".into(),
-                path: path.clone(),
-                format: Format::Plaintext,
-                limit: None,
-                enabled: true,
-            }],
-            ..Config::default()
-        };
-        let set = SubscriberSet::new(&config).unwrap();
-        let outcomes = set.fetch_all().await;
-
-        assert_eq!(outcomes.len(), 1);
-        let outcome = &outcomes[0];
-        assert!(outcome.ok(), "{:?}", outcome.error);
-        assert_eq!(outcome.count(), 2);
-        // `not a proxy` parses as a hostname without a port, which normalize rejects.
-        assert_eq!(outcome.rejected.len(), 1);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 记录收到的事件，用来断言进度真的发出去了。
-    #[derive(Default)]
-    struct Recorder {
-        started: std::sync::Mutex<Vec<String>>,
-        finished: std::sync::Mutex<Vec<String>>,
-    }
-
-    impl Progress for Recorder {
-        fn fetch(&self, event: FetchEvent<'_>) {
-            match event {
-                FetchEvent::Started { name, .. } => {
-                    self.started.lock().unwrap().push(name.to_string())
-                }
-                FetchEvent::Finished(outcome) => self.finished.lock().unwrap().push(format!(
-                    "{}={}",
-                    outcome.name,
-                    outcome.count()
-                )),
-                FetchEvent::Download { .. } => {}
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn fetch_reports_started_and_finished_for_every_subscriber() {
-        let dir = std::env::temp_dir().join(format!("proxygate-progress-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let good = dir.join("good.txt");
-        std::fs::write(&good, "1.2.3.4:8080\n").unwrap();
-
-        let config = Config {
-            subscribers: vec![
-                SubscriberConfig::File {
-                    name: "good".into(),
-                    path: good,
-                    format: Format::Plaintext,
-                    limit: None,
-                    enabled: true,
-                },
-                SubscriberConfig::Exec {
-                    name: "bad".into(),
-                    command: shell("exit 3"),
-                    env: BTreeMap::new(),
-                    format: Format::Plaintext,
-                    timeout: None,
-                    limit: None,
-                    enabled: true,
-                },
-            ],
-            ..Config::default()
-        };
-
-        let recorder = std::sync::Arc::new(Recorder::default());
-        let set = SubscriberSet::new(&config).unwrap();
-        let outcomes = set.fetch_all_reporting(recorder.as_ref()).await;
-
-        assert_eq!(outcomes.len(), 2);
-        let mut started = recorder.started.lock().unwrap().clone();
-        started.sort();
-        assert_eq!(started, vec!["bad".to_string(), "good".to_string()]);
-
-        // 失败也要有 Finished 事件，否则进度里会永远少一行。
-        let mut finished = recorder.finished.lock().unwrap().clone();
-        finished.sort();
-        assert_eq!(finished, vec!["bad=0".to_string(), "good=1".to_string()]);
-    }
-
-    /// 用当前平台的 shell 跑一小段脚本，让 exec 订阅源的测试两边都能跑。
-    fn shell(script: &str) -> Vec<String> {
-        if cfg!(windows) {
-            vec!["cmd".into(), "/C".into(), script.into()]
-        } else {
-            vec!["sh".into(), "-c".into(), script.into()]
-        }
-    }
-
-    #[tokio::test]
-    async fn exec_subscriber_uses_stdout() {
-        let config = Config {
-            subscribers: vec![SubscriberConfig::Exec {
-                name: "custom".into(),
-                // 注释行/空行的处理由 `parses_plaintext_lists` 覆盖，
-                // 这里只验证 stdout 被当作载荷。
-                command: shell("echo 1.2.3.4:8080"),
-                env: BTreeMap::new(),
-                format: Format::Plaintext,
-                timeout: None,
-                limit: None,
-                enabled: true,
-            }],
-            ..Config::default()
-        };
-        let set = SubscriberSet::new(&config).unwrap();
-        let outcomes = set.fetch_all().await;
-        assert!(outcomes[0].ok(), "{:?}", outcomes[0].error);
-        assert_eq!(outcomes[0].count(), 1);
-    }
-
-    #[tokio::test]
-    async fn exec_failures_are_reported_not_fatal() {
-        let config = Config {
-            subscribers: vec![
-                SubscriberConfig::Exec {
-                    name: "broken".into(),
-                    command: shell("exit 3"),
-                    env: BTreeMap::new(),
-                    format: Format::Plaintext,
-                    timeout: None,
-                    limit: None,
-                    enabled: true,
-                },
-                SubscriberConfig::Exec {
-                    name: "missing".into(),
-                    command: vec!["/definitely/not/a/binary".into()],
-                    env: BTreeMap::new(),
-                    format: Format::Plaintext,
-                    timeout: None,
-                    limit: None,
-                    enabled: true,
-                },
-            ],
-            ..Config::default()
-        };
-        let set = SubscriberSet::new(&config).unwrap();
-        let outcomes = set.fetch_all().await;
-        assert_eq!(outcomes.len(), 2);
-        assert!(outcomes.iter().all(|outcome| !outcome.ok()));
-    }
-
-    #[tokio::test]
-    async fn disabled_subscribers_are_skipped() {
-        let config = Config {
-            subscribers: vec![SubscriberConfig::Exec {
-                name: "off".into(),
-                command: shell("echo 1.2.3.4:8080"),
-                env: BTreeMap::new(),
-                format: Format::Plaintext,
-                timeout: None,
-                limit: None,
-                enabled: false,
-            }],
-            ..Config::default()
-        };
-        let set = SubscriberSet::new(&config).unwrap();
-        assert!(set.is_empty());
-        assert!(set.fetch_all().await.is_empty());
-    }
-
-    /// 构造一个 `lua` 订阅源，超时给 5 秒，参数留空。
-    fn lua_subscriber(code: &str) -> SubscriberConfig {
-        SubscriberConfig::Lua {
-            name: "lua".into(),
-            lua_code: Some(code.into()),
-            lua_file: None,
-            format: Format::Plaintext,
-            timeout: Some(Duration::from_secs(5)),
-            limit: None,
-            enabled: true,
-            params: BTreeMap::new(),
-        }
-    }
-
-    /// 用一个只含该订阅源的配置跑一次拉取。
-    async fn run_one(subscriber: SubscriberConfig) -> FetchOutcome {
-        let config = Config {
-            subscribers: vec![subscriber],
-            ..Config::default()
-        };
-        let mut outcomes = SubscriberSet::new(&config).unwrap().fetch_all().await;
-        outcomes.remove(0)
-    }
-
-    /// 把归一化后的代理渲染成规范的 `scheme://host:port` 形式，便于比较。
-    fn rendered(outcome: &FetchOutcome) -> Vec<String> {
-        outcome
-            .proxies
-            .iter()
-            .map(|proxy| model::render_url(proxy, true))
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn lua_prints_become_proxies() {
-        let outcome = run_one(lua_subscriber(
-            r#"
-            for i = 1, 3 do
-              print("10.0.0." .. i .. ":8080")
-            end
-            print("socks5://1.2.3.4:1080")
-            "#,
-        ))
-        .await;
-
-        assert!(outcome.ok(), "{:?}", outcome.error);
-        assert_eq!(outcome.kind, "lua");
-        assert_eq!(
-            rendered(&outcome),
-            vec![
-                "http://10.0.0.1:8080".to_string(),
-                "http://10.0.0.2:8080".to_string(),
-                "http://10.0.0.3:8080".to_string(),
-                "socks5://1.2.3.4:1080".to_string(),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn lua_output_is_parsed_with_the_configured_format() {
-        let mut subscriber =
-            lua_subscriber(r#"print('{"data":{"proxies":["10.1.1.1:8080","10.1.1.2:8080"]}}')"#);
-        if let SubscriberConfig::Lua { format, .. } = &mut subscriber {
-            *format = Format::Json;
-        }
-        let outcome = run_one(subscriber).await;
-        assert!(outcome.ok(), "{:?}", outcome.error);
-        assert_eq!(outcome.count(), 2);
-    }
-
-    /// 直接运行一段脚本，返回它 `print` 出来的原始内容。
-    ///
-    /// 需要看清脚本到底输出了什么（而不是它被归一化成哪些代理）时用它。
-    async fn lua_payload(code: &str, params: &[(&str, serde_yaml::Value)]) -> String {
-        let subscriber = lua_subscriber(code);
-        let SubscriberConfig::Lua { timeout, .. } = &subscriber else {
-            unreachable!("`lua_subscriber` builds a Lua subscriber");
-        };
-        let mut merged: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
-        for (key, value) in params {
-            merged.insert((*key).to_string(), value.clone());
-        }
-        run_lua(
-            &subscriber,
-            &merged,
-            code,
-            timeout.unwrap(),
-            &reqwest::Client::new(),
-        )
-        .await
-        .expect("the script should run")
-    }
-
-    #[tokio::test]
-    async fn lua_sees_extra_config_keys_as_globals() {
-        // 额外键变成全局变量：字符串、数字、以及整个表都能用。
-        let payload = lua_payload(
-            r#"
-            print(target_url)
-            print(host .. ":" .. tostring(port))
-            print("flag=" .. tostring(deep.flag))
-            "#,
-            &[
-                ("target_url", serde_yaml::Value::from("hello")),
-                ("host", serde_yaml::Value::from("10.1.2.3")),
-                (
-                    "port",
-                    serde_yaml::Value::Number(serde_yaml::Number::from(8080)),
-                ),
-                ("deep", serde_yaml::from_str("flag: true").unwrap()),
-            ],
-        )
-        .await;
-
-        assert_eq!(payload, "hello\n10.1.2.3:8080\nflag=true");
-    }
-
-    #[tokio::test]
-    async fn the_lua_sandbox_has_no_file_or_process_access() {
-        let payload = lua_payload(
-            r#"
-            local missing = 0
-            local names = {"io", "os", "package", "debug", "dofile", "loadfile", "load", "require"}
-            for _, name in ipairs(names) do
-              if _G[name] == nil then missing = missing + 1 end
-            end
-            print("missing=" .. missing)
-            "#,
-            &[],
-        )
-        .await;
-
-        assert_eq!(payload, "missing=8");
-    }
-
-    #[tokio::test]
-    async fn lua_can_fetch_json_from_an_endpoint() {
-        let app = axum::Router::new().route(
-            "/list",
-            axum::routing::get(|| async {
-                axum::Json(serde_json::json!({
-                    "data": {"proxies": ["10.9.8.7:3128", "10.9.8.6:3128"]}
-                }))
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-
-        let outcome = run_one(lua_subscriber(&format!(
-            r#"
-            local data = fetch_json("http://{address}/list")
-            for _, item in ipairs(data.data.proxies) do
-              print(item)
-            end
-            print("encoded=" .. json_encode({{1, 2}}))
-            "#,
-        )))
-        .await;
-        server.abort();
-
-        assert!(outcome.ok(), "{:?}", outcome.error);
-        assert_eq!(
-            rendered(&outcome),
-            vec![
-                "http://10.9.8.7:3128".to_string(),
-                "http://10.9.8.6:3128".to_string()
-            ]
-        );
-        // 非代理行被拒绝，错误信息里带上原始那一行。
-        assert_eq!(outcome.rejected.len(), 1);
-        assert!(
-            outcome.rejected[0].contains("encoded=[1,2]"),
-            "{}",
-            outcome.rejected[0]
-        );
-    }
-
-    #[tokio::test]
-    async fn lua_errors_are_reported_not_fatal() {
-        let outcome = run_one(lua_subscriber("error('boom')")).await;
-        assert!(!outcome.ok());
-        let error = outcome.error.unwrap();
-        assert!(error.contains("boom"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn a_failing_fetch_surfaces_as_a_subscriber_error() {
-        // 端口 1 上没有任何东西在监听：脚本该失败，异常要带上 URL。
-        let outcome = run_one(lua_subscriber(r#"print(fetch("http://127.0.0.1:1/nope"))"#)).await;
-        assert!(!outcome.ok());
-        let error = outcome.error.unwrap();
-        assert!(error.contains("127.0.0.1:1"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn a_runaway_lua_script_is_stopped() {
-        let mut subscriber = lua_subscriber("while true do end");
-        if let SubscriberConfig::Lua { timeout, .. } = &mut subscriber {
-            *timeout = Some(Duration::from_millis(300));
-        }
-
-        let started = Instant::now();
-        let outcome = run_one(subscriber).await;
-        let error = outcome.error.expect("a runaway script must fail");
-        assert!(error.contains("timed out"), "{error}");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the watchdog took {:?} to fire",
-            started.elapsed()
-        );
-    }
-
-    #[tokio::test]
-    async fn a_lua_limit_truncates_the_output() {
-        let mut subscriber =
-            lua_subscriber("for i = 1, 10 do print('10.0.0.' .. i .. ':8080') end");
-        if let SubscriberConfig::Lua { limit, .. } = &mut subscriber {
-            *limit = Some(3);
-        }
-        let outcome = run_one(subscriber).await;
-        assert!(outcome.ok(), "{:?}", outcome.error);
-        assert_eq!(outcome.count(), 3);
-        assert_eq!(outcome.truncated, 7);
-    }
-
-    #[tokio::test]
-    async fn lua_output_is_collected_line_by_line() {
-        // 一行的各个参数用 tab 连接；超长参数按字符边界截断后加省略号；
-        // `print()` 打印空行。
-        let long = "x".repeat(LUA_MAX_ARG * 2);
-        let payload = lua_payload(&format!("print('a', 'b')\nprint('{long}')\nprint()"), &[]).await;
-
-        let lines: Vec<&str> = payload.split('\n').collect();
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], "a\tb");
-        assert_eq!(lines[1].chars().count(), LUA_MAX_ARG + 1);
-        assert!(lines[1].ends_with('…'), "the long line should be elided");
-        assert_eq!(lines[2], "");
+    fn long_text_is_truncated_on_a_character_boundary() {
+        assert_eq!(truncate_text("hello".to_string(), 16), "hello");
+        assert_eq!(truncate_text("hello".to_string(), 3), "hel…");
+        // 多字节字符不会被切成半个：4 落在「代」中间，只能退到 3。
+        let chinese = "代理池".to_string();
+        assert_eq!(truncate_text(chinese.clone(), 6), "代理…");
+        assert_eq!(truncate_text(chinese, 4), "代…");
     }
 }

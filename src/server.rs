@@ -31,8 +31,7 @@ use crate::gateway::{Gateway, GatewayOptions};
 pub async fn run(config_path: Option<std::path::PathBuf>) -> Result<()> {
     let (config, path) = Config::load(config_path.as_deref())?;
     let credentials = config.gateway_credentials()?;
-    let proxy_address = config.server.proxy.clone();
-    let api_address = config.server.api.clone();
+    let listen = config.server.listen.clone();
 
     let bootstrap = Bootstrap {
         refresh: Freshness::IfStale,
@@ -40,23 +39,10 @@ pub async fn run(config_path: Option<std::path::PathBuf>) -> Result<()> {
     };
     let app = Arc::new(App::new_with_progress(config, path, Arc::new(LogProgress))?);
 
-    let proxy_listener = TcpListener::bind(&proxy_address).await.map_err(|error| {
-        Error::Other(format!(
-            "cannot bind the HTTP proxy on {proxy_address}: {error}"
-        ))
-    })?;
-    // `api: same`（或 API 地址与代理地址相同）让两个角色共用一个监听端口：
-    // 没有客户端会同时发代理请求和 API 请求，所以按请求形状就能分辨。
-    let shared_port = app.config.server.shares_port();
-    let api_listener = if shared_port {
-        None
-    } else {
-        Some(TcpListener::bind(&api_address).await.map_err(|error| {
-            Error::Other(format!(
-                "cannot bind the REST API on {api_address}: {error}"
-            ))
-        })?)
-    };
+    // 网关与 REST API 共用这一个端口。
+    let listener = TcpListener::bind(&listen)
+        .await
+        .map_err(|error| Error::Other(format!("cannot bind {listen}: {error}")))?;
 
     let gateway = Arc::new(Gateway::new(
         app.pool.clone(),
@@ -71,23 +57,12 @@ pub async fn run(config_path: Option<std::path::PathBuf>) -> Result<()> {
         },
     ));
 
+    // API 搭在网关的监听上：两类请求按形状分流。
     let api_state = Arc::new(ApiState::new(app.clone()));
-    let gateway = if shared_port {
-        // 共用端口时 API 搭在网关的监听上。
-        Arc::new((*gateway).clone().with_api(api::router(api_state.clone())))
-    } else {
-        gateway
-    };
+    let gateway = Arc::new((*gateway).clone().with_api(api::router(api_state.clone())));
 
-    let api_label = if shared_port {
-        proxy_address.clone()
-    } else {
-        api_address.clone()
-    };
     info!(
-        proxy = %proxy_address,
-        api = %api_label,
-        shared_port,
+        listen = %listen,
         config = ?app.config_path,
         proxies = app.pool.len(),
         alive = app.pool.stats().alive,
@@ -95,22 +70,14 @@ pub async fn run(config_path: Option<std::path::PathBuf>) -> Result<()> {
         ready = app.readiness().is_ready(),
         "proxygate is listening"
     );
-    info!(help = %format!("http://{api_label}/help"), "API documentation");
+    info!(help = %format!("http://{listen}/help"), "API documentation");
     if !app.readiness().is_ready() {
         info!("the pool is still being initialized; the REST API answers 503 until it is ready");
     }
-    if shared_port {
-        info!(
-            "the REST API shares the proxy port; `gateway.auth` covers proxy requests only, \
-             so the API itself stays open — keep it on a trusted interface"
-        );
-    }
-    if app.config.gateway.auth.is_none() && !shared_port {
-        info!(
-            "the gateway has no client authentication; set `gateway.auth` if this port is \
-             reachable by anything you do not trust"
-        );
-    }
+    info!(
+        "the REST API shares the proxy port; `gateway.auth` covers proxy requests only, \
+         so the API itself stays open — keep it on a trusted interface"
+    );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks: JoinSet<&'static str> = JoinSet::new();
@@ -119,30 +86,12 @@ pub async fn run(config_path: Option<std::path::PathBuf>) -> Result<()> {
         let gateway = gateway.clone();
         let shutdown = shutdown_rx.clone();
         async move {
-            if let Err(error) = gateway
-                .serve(proxy_listener, wait_for_shutdown(shutdown))
-                .await
-            {
+            if let Err(error) = gateway.serve(listener, wait_for_shutdown(shutdown)).await {
                 error!(error = %error, "HTTP proxy gateway stopped");
             }
             "gateway"
         }
     });
-
-    if let Some(api_listener) = api_listener {
-        tasks.spawn({
-            let state = api_state.clone();
-            let shutdown = shutdown_rx.clone();
-            async move {
-                if let Err(error) =
-                    api::serve(state, api_listener, wait_for_shutdown(shutdown)).await
-                {
-                    error!(error = %error, "REST API stopped");
-                }
-                "api"
-            }
-        });
-    }
 
     tasks.spawn({
         let app = app.clone();

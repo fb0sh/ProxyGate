@@ -1,7 +1,7 @@
 //! 进度事件：库只发事件，显示方式由调用方决定。
 //!
-//! 抓取订阅源和探测代理都可能跑几分钟（`freeproxy-gh` 那个 2.5 MB 的列表
-//! 一次要四分钟），中间什么都不打印是没法用的。但库不该自己往终端写东西，
+//! 跑一遍订阅源脚本、探测一轮代理池都可能花上几分钟，中间什么都不显示
+//! 是没法用的。但库不该自己往终端写东西，
 //! 所以这里只有事件和一个接收器 trait：
 //!
 //! * `serve` 把事件转成日志（[`crate::app::LogProgress`]），这也是唯一
@@ -10,31 +10,17 @@
 
 use std::time::Duration;
 
-use crate::config::Format;
 use crate::subscriber::FetchOutcome;
 
 /// 抓取订阅源过程中的事件。
 #[derive(Debug)]
 pub enum FetchEvent<'a> {
-    /// 开始拉取一个订阅源。
+    /// 开始运行一个订阅源的脚本。
     Started {
         /// 订阅源名称，与配置里写的 `name` 一致。
         name: &'a str,
-        /// 订阅源类型：`http`、`file`、`exec` 或 `lua`。
-        kind: &'static str,
-        /// 这次拉取使用的解析格式。
-        format: Format,
     },
-    /// 正在下载响应体，按固定间隔发出；只有 HTTP 来源会有。
-    Download {
-        /// 订阅源名称。
-        name: &'a str,
-        /// 已经读到的字节数。
-        bytes: u64,
-        /// 从开始拉起到现在的耗时。
-        elapsed: Duration,
-    },
-    /// 拉取结束。成功与失败都在这里，用 [`FetchOutcome::ok`] 区分。
+    /// 脚本跑完。成功与失败都在这里，用 [`FetchOutcome::ok`] 区分。
     Finished(&'a FetchOutcome),
 }
 

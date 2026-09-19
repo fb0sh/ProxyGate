@@ -1,73 +1,62 @@
 # ProxyGate configuration.
 #
-# Every key is optional: with no config file at all, the server starts
-# with an empty pool on 127.0.0.1:8080 (proxy) and 127.0.0.1:8081 (API).
-#
-# Durations accept `30s`, `10m`, `2h`, `1d`, `250ms`, `1h30m` or plain seconds.
+# Every key is optional: with no config file at all, the server starts with an
+# empty pool on 127.0.0.1:8080. Durations accept `30s`, `10m`, `2h`, `1d`,
+# `250ms`, `1h30m` or plain seconds.
 
 server:
-  # Address of the HTTP proxy gateway. Keep it on the loopback address unless
-  # you really mean to expose it: clients are not asked for credentials by
-  # default, so anyone who can reach this port can use your pool. See the
-  # "Security" section of README.md before changing this.
-  proxy: 127.0.0.1:8080
-  # Address of the REST API. `same` serves it on the proxy port: a proxy request
-  # is a CONNECT or an absolute-form target, an API call is `/api/v1/...`, so one
-  # listener can tell them apart. Client authentication applies to proxy requests
-  # only, so sharing the port leaves the API open.
-  api: 127.0.0.1:8081
-  # api: same
-
-# Where proxies come from.
-#
-# Four kinds of subscriber:
-#
-#   http   one URL, the payload parsed by `format`
-#   file   a local file, same formats
-#   exec   run a command, read proxy URLs from its stdout
-#   lua    run a Lua script; every line it `print`s is a candidate proxy
-#
-# `lua` is the general one: it can fetch, page through an API, sign a request
-# and reshape a response, so a source that needs custom logic no longer needs a
-# ProxyGate release. The full script API (`fetch`, `fetch_json`,
-# `json_encode`, `json_decode`, `log`, `print`, and the sandbox rules) is
-# documented in `GET /help` and in README.md.
-#
-# Everything below is free/public: expect most of what these return to fail the
-# health check (dead endpoints, and proxies that intercept TLS with their own
-# certificate — ProxyGate refuses those), and expect rate limits, so leave
-# `refresh.interval` at 10m or slower.
+  # The one port ProxyGate listens on: the HTTP proxy gateway and the REST API
+  # share it. They never collide because the request shapes differ — a proxy
+  # request is `CONNECT host:port` or an absolute-form `GET http://host/path`,
+  # an API call is an origin-form `/api/v1/...`.
+  #
+  # `gateway.auth` below protects proxy requests only, so the API on this port
+  # stays open. Keep it on the loopback address unless you mean to expose the
+  # pool itself.
+  listen: 127.0.0.1:8080
+  # listen: 0.0.0.0:8080
 
 subscribers:
-  # A small, fast JSON API. The built-in JSON reader already understands the
-  # envelope (`{"data":{"proxies":[...]}}`), so a script would add nothing.
-  - name: scdn
-    type: http
-    url: https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20
-    format: json
-
-  # ~120 entries, all HTTP, with country/region/anonymity per entry.
-  - name: freeproxy-cn
-    type: http
-    url: https://www.freeproxy.com.cn/proxy.json
-    format: json
-
-  # ~5,000 entries paginated 500 at a time. Written as Lua so that all ten
-  # pages arrive as one subscriber (the page count is read from the API's own
-  # `pagination.totalPages`), and so socks4-only entries are dropped instead of
-  # being handed out as HTTP proxies that cannot connect.
+  # A subscriber is a Lua script. It fetches whatever it wants and **returns** a
+  # list of proxy tables — one table per proxy:
   #
-  # `url` and `page_size` are not ProxyGate keys: unknown keys become globals
-  # in the script, which is how a script gets its parameters.
+  #   { type = "http" | "socks5" | "socks5h", ip = "1.2.3.4", port = 8080, auth = "user:pass" }
+  #
+  # `auth` is optional. `type = "socks4"` (or anything unknown) is dropped, and
+  # `socks5` becomes `socks5h` so the proxy resolves names — with poisoned local
+  # DNS a locally resolved address would be handed to the proxy as-is.
+  #
+  # Inside the script:
+  #
+  #   fetch(url)        one GET, returns the body as a string; raises on non-2xx
+  #   fetch_json(url)   same, decoded into a Lua table
+  #   json_encode(v) / json_decode(s)
+  #   log(...)          writes to ProxyGate's log; `print` is an alias for it
+  #
+  # The sandbox loads only string/table/math/coroutine: `io`, `os`, `package`
+  # and `debug` are absent, and `dofile`/`loadfile`/`load`/`require` are removed,
+  # so `fetch` is the only way out. `timeout` bounds the whole script, including
+  # `while true do end`. Every refresh builds a fresh Lua state.
+  #
+  # Any key that is not `name`/`script_name`, `lua_code`, `lua_file`, `timeout`,
+  # `limit` or `enabled` becomes a global in the script — that is how a script
+  # gets its parameters. `lua_code` and `lua_file` are mutually exclusive.
+
+  # ~5,000 proxies, 500 per page. The page count comes from the API's own
+  # `pagination.totalPages`, so a growing list needs no config change.
+  #
+  # `limit: 1000` keeps a fifth of it. Free proxies die at a brutal rate — one
+  # measured pool of 1,020 had 13 working — so probing 5,000 of them mostly buys
+  # five times the waiting, not five times the usable proxies. The health pass is
+  # the bottleneck here, not the script.
   - name: rola-ip
-    type: lua
-    url: https://rola-ip.co/proxy-api/api/v1/proxies
-    page_size: 500
     timeout: 60s
+    limit: 1000
     lua_code: |
       local page, pages = 1, 1
+      local result = {}
       repeat
-        local body = fetch_json(url .. "?page=" .. page .. "&pageSize=" .. page_size)
+        local body = fetch_json("https://rola-ip.co/proxy-api/api/v1/proxies?page=" .. page .. "&pageSize=500")
         pages = (body.pagination and body.pagination.totalPages) or 1
         for _, item in ipairs(body.data or {}) do
           local scheme = nil
@@ -81,64 +70,53 @@ subscribers:
             end
           end
           if scheme then
-            print(scheme .. "://" .. item.ip .. ":" .. item.port)
+            table.insert(result, {
+              type = scheme,
+              ip = item.ip,
+              port = item.port,
+              auth = item.auth or ""
+            })
           end
         end
         page = page + 1
       until page > pages
+      return result
 
-  # ~16k entries, 2.5 MB, ordered fastest-first, so the head of the list is the
-  # useful end. `limit` keeps the pool small enough that a health pass takes
-  # tens of seconds instead of minutes; set it to 0 to keep everything.
-  - name: freeproxy-gh
-    type: http
-    url: https://charlespikachu.github.io/freeproxy/proxies.json
-    format: json
-    timeout: 300s
-    limit: 1000
+  # A small, fast JSON API. The interesting bits of this one: the proxies sit
+  # under `data.proxies`, the payload carries no protocol (so these are HTTP
+  # proxies), and the endpoint caps `count` itself.
+  - name: scdn
+    timeout: 20s
+    lua_code: |
+      local body = fetch_json("https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20")
+      local result = {}
+      for _, entry in ipairs(body.data.proxies or {}) do
+        local host, port = entry:match("^(.+):(%d+)$")
+        if host then
+          table.insert(result, { type = "http", ip = host, port = tonumber(port), auth = "" })
+        end
+      end
+      return result
 
-  # Your own sources, with every key spelled out:
-  #
-  # - name: provider-a
-  #   type: http
-  #   url: https://example.com/proxies.txt
-  #   format: plaintext          # plaintext (default) | json | clash
-  #   timeout: 20s
-  #   limit: 200                 # keep at most this many (0 = no cap)
-  #   headers:                   # for endpoints that need a token
-  #     Authorization: Bearer <token>
-  #
+  # A local list, read by the script itself: a proxy file is just another thing
+  # a script can be pointed at while testing.
   # - name: local
-  #   type: file
-  #   path: ./proxies.txt
-  #   format: plaintext
-  #
-  # - name: custom
-  #   type: exec
-  #   command:
-  #     - python3
-  #     - ./subscribers/example.py
-  #     - --url
-  #     - https://example.com/weird-api
-  #   format: plaintext
-  #   timeout: 30s
-  #   env:
-  #     API_TOKEN: "..."
-  #
+  #   lua_file: ./scripts/local.lua
+
+  # Anything else: a script in its own file, with the endpoint injected as a
+  # global instead of hard-coded.
   # - name: my_scraper
-  #   type: lua
-  #   target_url: https://api.example.com/data.json   # extra keys -> globals
-  #   limit: 500
-  #   lua_code: |
-  #     local data = fetch_json(target_url)
-  #     for _, item in ipairs(data.items or {}) do
-  #       print(item.ip .. ":" .. item.port)
-  #     end
+  #   timeout: 30s
+  #   target_url: https://api.example.com/data.json
+  #   token: "..."                       # extra keys -> globals
+  #   limit: 500                         # keep at most this many (0 = no cap)
+  #   lua_file: ./scripts/my_scraper.lua
 
 refresh:
-  # How long a fetched subscriber result is reused before fetching again.
+  # How long a fetched subscriber result is reused before running the script
+  # again — i.e. how often new proxies are pulled in.
   interval: 10m
-  # Per-subscriber timeout.
+  # Per-subscriber timeout, when the subscriber does not set its own.
   timeout: 20s
 
 health:
@@ -159,13 +137,23 @@ health:
   #   - https://cp.cloudflare.com/generate_204      (global anycast, 204)
   #   - http://connect.rom.miui.com/generate_204    (domestic, very fast)
   # `target: <url>` (singular) is still accepted as an alias for a one-entry list.
-  # How long a health result is reused before probing again. Also the window
-  # that keeps a burst of `/api/v1/get` calls from re-probing the whole pool.
-  interval: 30s
-  # Per-proxy request timeout.
-  timeout: 5s
-  # Maximum number of proxies probed at the same time.
-  concurrency: 100
+  #
+  # NOT the same knob as `refresh.interval`: that one decides how often the
+  # subscriber scripts run and pull in new proxies, this one decides how often
+  # the *existing* pool is probed again. Re-probing several thousand proxies
+  # every 30s is too often, and the log fills with TLS errors; 5m is a good
+  # middle ground between noticing a proxy that just died and doing nothing.
+  interval: 5m
+  # Per-proxy request timeout. Free proxies are mostly dead connections, and 3s
+  # is enough to tell; waiting 5s only makes the whole pass slower.
+  timeout: 3s
+  # Maximum number of proxies probed at the same time — the single knob that
+  # decides how long the first check takes. On a measured 1,020-proxy pool
+  # against the real targets, 300 in flight finished in 14s and 100 in 30s (the
+  # gap depends on how quickly dead proxies fail, not only on the parallelism).
+  # A source that returns tens of thousands of entries should get a `limit` for
+  # the same reason.
+  concurrency: 300
   # Consecutive failures after which a proxy that was working is considered
   # dead. A proxy that never answered is dead after its first failure.
   max_failures: 3
@@ -195,8 +183,8 @@ gateway:
   connect_timeout: 10s
   # No client authentication: this file assumes the gateway stays reachable only
   # from this machine. Set `auth: user:password` to require credentials from
-  # gateway clients — note that the REST API stays open either way when
-  # `server.api` shares the proxy port.
+  # gateway clients — the REST API on the same port stays open either way,
+  # because it is not a proxy request.
 
 state:
   # Where state.json and cache.json live.

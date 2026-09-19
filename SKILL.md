@@ -9,14 +9,17 @@ ProxyGate keeps a pool of working upstream proxies and hands them out one at a
 time over HTTP. It fetches proxies from configured sources, normalizes them,
 probes them through health targets, and only hands over ones that passed.
 
-**There is no command-line client.** One process serves everything: this document
-is `GET /help`, the pool is `/api/v1/*`, and the proxy itself is a normal HTTP
-proxy on the gateway port.
+**There is no command-line client.** One process serves everything on one port
+(`server.listen`, default `127.0.0.1:8080`): this document is `GET /help`, the
+pool is `/api/v1/*`, and the proxy is a normal HTTP proxy. The gateway and the
+API share the port because their request shapes differ — `CONNECT host:port` and
+absolute-form `GET http://host/path` are proxy requests, `/api/v1/...` is an API
+call. `gateway.auth` covers proxy requests only, so the API stays open.
 
 ## Get a proxy
 
 ```bash
-curl -sf http://127.0.0.1:8081/api/v1/get
+curl -sf http://127.0.0.1:8080/api/v1/get
 # http://user:pass@1.2.3.4:8080
 ```
 
@@ -27,7 +30,7 @@ as if it were a proxy address.
 Compose it directly:
 
 ```bash
-curl -x "$(curl -sf http://127.0.0.1:8081/api/v1/get)" https://example.com
+curl -x "$(curl -sf http://127.0.0.1:8080/api/v1/get)" https://example.com
 ```
 
 The proxy is handed out **verified**: if the cached verdict for the chosen proxy
@@ -53,7 +56,7 @@ you which of the two `503`s you are in (`ready`, `initializing`,
 ## Get a user agent
 
 ```bash
-curl -sf http://127.0.0.1:8081/api/v1/getua
+curl -sf http://127.0.0.1:8080/api/v1/getua
 # Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ... Chrome/131.0.6778.86 Safari/537.36
 ```
 
@@ -63,8 +66,8 @@ rotation and no memory**: the same string can come up twice in a row. Pair it
 with a fresh proxy:
 
 ```bash
-curl -x "$(curl -sf http://127.0.0.1:8081/api/v1/get)" \
-     -A "$(curl -sf http://127.0.0.1:8081/api/v1/getua)" https://example.com
+curl -x "$(curl -sf http://127.0.0.1:8080/api/v1/get)" \
+     -A "$(curl -sf http://127.0.0.1:8080/api/v1/getua)" https://example.com
 ```
 
 ## Endpoints
@@ -104,19 +107,27 @@ The server reads `$PROXYGATE_CONFIG`, or `./config.yaml`, or
 that matter most:
 
 ```yaml
-subscribers:                 # where proxies come from
-  - name: provider
-    type: http               # http | file | exec | lua
-    url: https://example.com/proxies.txt
-    format: plaintext        # plaintext | json | clash
-    limit: 200               # keep at most this many (0 = no cap)
+server:
+  listen: 127.0.0.1:8080     # the gateway and the REST API share this port
+
+subscribers:                 # where proxies come from: Lua scripts
+  - name: rola-ip
+    timeout: 60s
+    limit: 1000              # keep at most this many (0 = no cap)
+    lua_code: |
+      local result = {}
+      -- fetch, page, reshape ...
+      table.insert(result, { type = "socks5h", ip = "1.2.3.4", port = 1080, auth = "" })
+      return result
 
 health:
   targets:                   # each is fetched *through* the proxy
     - https://www.google.com/generate_204
     - https://cn.bing.com/
   require: any               # any (default) or all targets must answer
-  concurrency: 100
+  interval: 5m               # how often the *existing* pool is probed again
+  timeout: 3s                # per-proxy probe timeout
+  concurrency: 300           # decides how long a first check takes
 
 selection:
   strategy: random           # random | latency
@@ -128,65 +139,69 @@ selection:
 
 gateway:
   auth: admin:secret         # require credentials from gateway clients
-
-server:
-  proxy: 127.0.0.1:8080      # the HTTP proxy
-  api: 127.0.0.1:8081        # the REST API; `same` shares the proxy port
 ```
 
 - Proxies already handed out in the current round are skipped; when every
   healthy proxy has been used the round resets immediately.
-- `type: lua` runs a Lua script; every line it `print`s is a candidate proxy,
-  parsed with `format`. It is the way to scrape an API that needs paging, a
-  signature, or field reshaping: `proxygate --example-config` ships a working
-  ten-page scraper. `exec` remains the escape hatch for running an external
-  program.
-- `type: exec` runs a command and reads proxy URLs from its stdout. It runs with
-  the same privileges as the server, so treat the config file as trusted input.
-- `https://` upstream proxies are not supported; they are rejected when a list is
-  loaded.
+- `https://` upstream proxies are not supported; they are rejected when a source
+  produces one.
 
-### Writing a Lua subscriber
+### Writing a subscriber
+
+A subscriber is a Lua script. It fetches whatever it wants and **returns a list
+of proxy tables**:
 
 ```yaml
 subscribers:
   - name: my_scraper
-    type: lua
     target_url: https://api.example.com/data.json   # extra keys -> globals
-    limit: 500
+    limit: 500                                      # keep at most this many
     timeout: 30s
     lua_code: |
+      local result = {}
       local page = 1
       while true do
         local data = fetch_json(target_url .. "?page=" .. page)
         for _, item in ipairs(data.items or {}) do
-          print(item.ip .. ":" .. item.port)
+          table.insert(result, {
+            type = item.protocol,      -- http | socks5 | socks5h (socks4 is dropped)
+            ip = item.ip,
+            port = item.port,
+            auth = item.auth or "",    -- optional "user:password"
+          })
         end
         if not data.next or page >= 10 then break end
         page = page + 1
       end
+      return result
 ```
 
-Every key that is not a ProxyGate key (`name`/`script_name`, `lua_code`,
-`lua_file`, `format`, `timeout`, `limit`, `enabled`, `type`) becomes a global in
+`lua_code` and `lua_file` are mutually exclusive; every other key
+(`name`/`script_name`, `timeout`, `limit`, `enabled` aside) becomes a global in
 the script, which is how a script gets its parameters. Available inside the
 script:
 
 | name | meaning |
 | ---- | ------- |
-| `print(...)` | one output line per call, arguments joined by a tab; **these lines are the payload** |
 | `fetch(url)` | one GET, returns the body as a string; raises on a non-2xx status |
 | `fetch_json(url)` | same, but decodes the body into a Lua table |
 | `json_encode(v)` / `json_decode(s)` | Lua value <-> JSON string |
-| `log(...)` | writes to ProxyGate's log at `info`; does not affect the output |
+| `log(...)` / `print(...)` | writes to ProxyGate's log at `info`; **not** a way to emit proxies |
+
+Entry rules: `type` of `http`/`https`/`ssl` becomes `http` (in a list, "https"
+means the proxy can CONNECT to HTTPS); `socks5`/`socks5h`/`socks` become
+`socks5h`, so the proxy resolves names — with poisoned local DNS a locally
+resolved address would be handed over as-is; `socks4` and unknown types are
+skipped. `ip` may also be spelled `host`/`hostname`/`server`/`address`/`addr`,
+`port` may be a string, and a bare string entry such as `"1.2.3.4:8080"` is
+accepted too. An entry that cannot be used is counted in `rejected` and does not
+kill the source.
 
 The script is sandboxed: `io`, `os`, `package` and `debug` are not loaded, and
 `dofile`, `loadfile`, `load` and `require` are removed. The only way out is
-`fetch`. Output is capped at 100,000 lines, and a single `print` argument is
-truncated past 4 KiB. `timeout` (or `refresh.timeout`) bounds the whole script, including
-`while true do end`. Each refresh builds a fresh Lua state, so scripts cannot
-see each other. `limit` caps how many usable proxies the source contributes
-after parsing, not how many lines it may print.
+`fetch`. `timeout` (or `refresh.timeout`) bounds the whole script, including
+`while true do end`. Each refresh builds a fresh Lua state, so scripts cannot see
+each other. `limit` caps how many usable proxies the source contributes.
 
 ## Gateway mode
 
@@ -197,17 +212,17 @@ GET/HEAD) and never reveals the upstream address or its credentials:
 curl -x http://admin:secret@127.0.0.1:8080 https://example.com
 ```
 
-Client auth (`gateway.auth`) and upstream auth are independent. With
-`server.api: same` both roles share one port: `CONNECT` and absolute-form
-requests go to the proxy, origin-form paths such as `/api/v1/get` go to the API.
-On a shared port `gateway.auth` still protects **proxy requests only** — the API
-itself stays open, so only do that on a trusted interface.
+Client auth (`gateway.auth`) and upstream auth are independent. The API shares
+the same port: `CONNECT` and absolute-form requests go to the proxy, origin-form
+paths such as `/api/v1/get` go to the API. `gateway.auth` protects **proxy
+requests only** — the API itself stays open, so keep the port on a trusted
+interface.
 
 ## Things to know before trusting the output
 
-* **Free proxy lists are mostly dead.** In a measured full run of the four
-  sources in the example config, 5,361 entries were fetched and 66 of the 5,157
-  pooled proxies passed the health check. Always request a new one for a new task instead of caching it.
+* **Free proxy lists are mostly dead.** In a measured full run of the example
+  config's sources, 4,499 proxies were pooled and only 61 of them passed the
+  health check. Always request a new one for a new task instead of caching it.
 * **Hand-out verification is a snapshot.** A proxy can die seconds after it was
   verified, and it was verified against *ProxyGate's* targets (Google and
   `cn.bing.com` by default), not against the site you are about to fetch. With

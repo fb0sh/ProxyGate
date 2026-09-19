@@ -24,10 +24,10 @@ pub const CACHE_DIR_ENV: &str = "PROXYGATE_CACHE_DIR";
 /// ProxyGate 的完整配置，对应 `config.yaml` 的顶层。
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Config {
-    /// `server` 段，配置 HTTP 代理网关与 REST API 的监听地址。
+    /// `server` 段，配置监听地址。
     #[serde(default)]
     pub server: ServerConfig,
-    /// `subscribers` 段，列出全部订阅源（lua、http、file、exec）。
+    /// `subscribers` 段，列出全部订阅源（都是 Lua 脚本）。
     #[serde(default)]
     pub subscribers: Vec<SubscriberConfig>,
     /// `refresh` 段，控制订阅源拉取的间隔与超时。
@@ -47,47 +47,26 @@ pub struct Config {
     pub state: StateConfig,
 }
 
-/// `server` 段的配置：网关与 REST API 的监听地址。
+/// `server` 段的配置。
+///
+/// 只有一个监听地址：HTTP 代理网关与 REST API **共用**它。两者不会冲突，
+/// 因为请求形状不同——代理请求是 `CONNECT host:port` 或绝对形式的
+/// `GET http://host/path`，API 请求是原始形式的 `/api/v1/...`；分流见
+/// [`crate::gateway::Gateway::with_api`]。
+///
+/// 注意 `gateway.auth` 只保护代理请求：API 与它同端口，因此始终对外开放，
+/// 请把这个端口留在受信任的网络上。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
-    /// HTTP 代理网关的监听地址，YAML 键 `server.proxy`，默认 `127.0.0.1:8080`。
-    #[serde(default = "default_proxy_addr")]
-    pub proxy: String,
-    /// REST API 的监听地址，YAML 键 `server.api`，默认 `127.0.0.1:8081`。
-    ///
-    /// 也可以填写字面值 `same`（或 `proxy`，或与 `server.proxy` 相同的地址），
-    /// 让 REST API 与代理共用同一个端口。注意 `gateway.auth` 只保护代理请求，
-    /// 因此 API 与该端口共用时仍然对外开放。
-    #[serde(default = "default_api_addr")]
-    pub api: String,
-}
-
-impl ServerConfig {
-    /// 实际用于绑定的 API 地址：字面值 `same`（或 `proxy`）表示与代理共用端口。
-    ///
-    /// 共用一个端口之所以可行，是因为两类请求可以区分：代理请求是 CONNECT 或
-    /// 绝对形式的请求目标，API 调用则是 `/api/v1/...`，参见
-    /// [`crate::gateway::Gateway::with_api`]。
-    pub fn api_address(&self) -> &str {
-        match self.api.trim() {
-            "same" | "proxy" => self.proxy.trim(),
-            other => other,
-        }
-    }
-
-    /// API 与代理是否服务于同一端口。
-    pub fn shares_port(&self) -> bool {
-        self.api.trim() == "same"
-            || self.api.trim() == "proxy"
-            || self.api.trim() == self.proxy.trim()
-    }
+    /// 监听地址，YAML 键 `server.listen`，默认 `127.0.0.1:8080`。
+    #[serde(default = "default_listen_addr")]
+    pub listen: String,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            proxy: default_proxy_addr(),
-            api: default_api_addr(),
+            listen: default_listen_addr(),
         }
     }
 }
@@ -132,13 +111,18 @@ pub struct HealthConfig {
     /// 一个目标应答（`any`）。
     #[serde(default)]
     pub require: HealthRequirement,
-    /// 健康检查结果保持新鲜的时间，YAML 键 `health.interval`，默认 30 秒。
+    /// 健康检查结果保持新鲜的时间，YAML 键 `health.interval`，默认 5 分钟。
+    ///
+    /// 注意它和 `refresh.interval` 不是一回事：那个决定多久重新跑一次订阅源
+    /// 脚本，这个决定多久把现有池子重探一遍。
     #[serde(default = "default_health_interval", deserialize_with = "de::duration")]
     pub interval: Duration,
-    /// 针对单个代理的单次请求超时，YAML 键 `health.timeout`，默认 5 秒。
+    /// 针对单个代理的单次请求超时，YAML 键 `health.timeout`，默认 3 秒。
     #[serde(default = "default_health_timeout", deserialize_with = "de::duration")]
     pub timeout: Duration,
-    /// 同时检查的代理数量上限，YAML 键 `health.concurrency`，默认 100。
+    /// 同时检查的代理数量上限，YAML 键 `health.concurrency`，默认 300。
+    ///
+    /// 这是首查速度的关键：健康检查要探完拿到的每一条，并发越高整轮越快。
     #[serde(default = "default_health_concurrency")]
     pub concurrency: usize,
     /// 连续失败多少次后代理被判定为死亡，YAML 键 `health.max_failures`，默认 3。
@@ -287,241 +271,100 @@ pub struct StateConfig {
     pub dir: Option<PathBuf>,
 }
 
-/// 一个代理来源。
+/// 一个代理来源：一段 Lua 脚本。
 ///
-/// `type` 标签决定使用哪个变体。`format` 描述如何读取原始响应内容，
-/// 默认为 `plaintext`（每行一个 URL）。
+/// ```yaml
+/// subscribers:
+///   - name: rola-ip
+///     timeout: 60s
+///     lua_code: |
+///       local result = {}
+///       -- 抓取、翻页、拼装……
+///       table.insert(result, { type = "socks5h", ip = "1.2.3.4", port = 1080, auth = "" })
+///       return result
+/// ```
+///
+/// 脚本**返回**一组代理表，`type`/`ip`/`port`/`auth` 四个字段见
+/// [`crate::subscriber`]；也可以整条写成一个字符串。`lua_code` 与
+/// `lua_file` 只能给一个。
+///
+/// 除下列键以外的任何键都会变成脚本里的全局变量，这是给脚本传参数的方式：
+///
+/// ```yaml
+///   - name: my_scraper
+///     target_url: https://api.example.com/data.json
+///     token: secret
+/// ```
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum SubscriberConfig {
-    /// 从一个 HTTP(S) URL 拉取代理列表，请求可以携带自定义头。
-    Http {
-        /// 订阅源名称，缺省时自动命名（如 `http-1`）。
-        #[serde(default)]
-        name: String,
-        /// 拉取代理列表的 URL。
-        url: String,
-        /// 响应内容的解析格式，默认 `plaintext`。
-        #[serde(default)]
-        format: Format,
-        /// 随请求发送的 HTTP 头，默认没有。
-        #[serde(default)]
-        headers: BTreeMap<String, String>,
-        /// 该订阅源的拉取超时，缺省时使用 `refresh.timeout`。
-        #[serde(default, deserialize_with = "de::opt_duration")]
-        timeout: Option<Duration>,
-        /// 最多保留多少个可用代理（`0` 表示全部保留），默认不限。
-        ///
-        /// 健康检查必须探测拿到的每一条，所以在默认并发下大型列表要跑很久；
-        /// 这个上限让池子的规模可控。
-        #[serde(default)]
-        limit: Option<usize>,
-        /// 是否启用该订阅源，默认 `true`。
-        #[serde(default = "default_true")]
-        enabled: bool,
-    },
-    /// 从本地文件读取代理列表。
-    File {
-        /// 订阅源名称，缺省时自动命名（如 `file-1`）。
-        #[serde(default)]
-        name: String,
-        /// 本地文件路径。
-        path: PathBuf,
-        /// 文件内容的解析格式，默认 `plaintext`。
-        #[serde(default)]
-        format: Format,
-        /// 最多保留多少个可用代理（`0` 表示全部保留），默认不限。
-        ///
-        /// 健康检查必须探测拿到的每一条，所以在默认并发下大型列表要跑很久；
-        /// 这个上限让池子的规模可控。
-        #[serde(default)]
-        limit: Option<usize>,
-        /// 是否启用该订阅源，默认 `true`。
-        #[serde(default = "default_true")]
-        enabled: bool,
-    },
-    /// 一段 Lua 脚本（`type: lua`）：脚本自己决定去哪里、怎么拿、输出什么。
+pub struct SubscriberConfig {
+    /// 订阅源名称，缺省时自动命名（如 `lua-1`）。`script_name` 也认。
+    #[serde(default, alias = "script_name")]
+    pub name: String,
+    /// 内联的 Lua 代码。与 `lua_file` 二选一。
+    #[serde(default)]
+    pub lua_code: Option<String>,
+    /// 一个 `.lua` 文件的路径。与 `lua_code` 二选一。
+    #[serde(default)]
+    pub lua_file: Option<PathBuf>,
+    /// 单次请求的超时；整段脚本也用它作为墙钟上限，缺省时用 `refresh.timeout`。
+    #[serde(default, deserialize_with = "de::opt_duration")]
+    pub timeout: Option<Duration>,
+    /// 最多保留多少个可用代理（`0` 表示全部保留），默认不限。
     ///
-    /// ```yaml
-    /// subscribers:
-    ///   - name: my_scraper
-    ///     type: lua
-    ///     target_url: https://api.example.com/data.json   # 额外键 -> 脚本全局变量
-    ///     lua_code: |
-    ///       local data = fetch_json(target_url)
-    ///       for _, item in ipairs(data.items) do
-    ///         print(item.ip .. ":" .. item.port)
-    ///       end
-    /// ```
-    ///
-    /// 脚本能用的东西见 [`crate::subscriber`]：`fetch` / `fetch_json`、
-    /// `json_encode` / `json_decode`、`log`，以及 `print`——**print 的每一行
-    /// 就是一条候选代理**，再按 `format` 解析（默认 `plaintext`）。
-    Lua {
-        /// 订阅源名称，缺省时自动命名（如 `lua-1`）。`script_name` 也认。
-        #[serde(default, alias = "script_name")]
-        name: String,
-        /// 内联的 Lua 代码。与 `lua_file` 二选一。
-        #[serde(default)]
-        lua_code: Option<String>,
-        /// 一个 `.lua` 文件的路径。与 `lua_code` 二选一。
-        #[serde(default)]
-        lua_file: Option<PathBuf>,
-        /// `print` 出来的内容按哪种格式解析，默认 `plaintext`。
-        #[serde(default)]
-        format: Format,
-        /// 单次请求的超时；整段脚本也用它作为墙钟上限。
-        #[serde(default, deserialize_with = "de::opt_duration")]
-        timeout: Option<Duration>,
-        /// 最多保留多少个可用代理（`0` 表示全部保留），默认不限。
-        #[serde(default)]
-        limit: Option<usize>,
-        /// 是否启用该订阅源，默认 `true`。
-        #[serde(default = "default_true")]
-        enabled: bool,
-        /// 其余所有键都会成为脚本里的全局变量（数字、布尔、字符串、表）。
-        #[serde(flatten)]
-        params: BTreeMap<String, serde_yaml::Value>,
-    },
-    /// 运行外部命令，并从其 stdout 读取代理 URL。
-    ///
-    /// 这是 ProxyGate 无法理解的任何格式的逃生通道：解析交给脚本完成，
-    /// ProxyGate 自身的代码保持简单。
-    Exec {
-        /// 订阅源名称，缺省时自动命名（如 `exec-1`）。
-        #[serde(default)]
-        name: String,
-        /// 要执行的命令及其参数，第一个元素是可执行文件。
-        command: Vec<String>,
-        /// 传给该命令的额外环境变量，默认没有。
-        #[serde(default)]
-        env: BTreeMap<String, String>,
-        /// stdout 内容的解析格式，默认 `plaintext`。
-        #[serde(default)]
-        format: Format,
-        /// 命令执行的超时，缺省时使用 `refresh.timeout`。
-        #[serde(default, deserialize_with = "de::opt_duration")]
-        timeout: Option<Duration>,
-        /// 最多保留多少个可用代理（`0` 表示全部保留），默认不限。
-        ///
-        /// 健康检查必须探测拿到的每一条，所以在默认并发下大型列表要跑很久；
-        /// 这个上限让池子的规模可控。
-        #[serde(default)]
-        limit: Option<usize>,
-        /// 是否启用该订阅源，默认 `true`。
-        #[serde(default = "default_true")]
-        enabled: bool,
-    },
+    /// 健康检查必须探测拿到的每一条，所以在默认并发下大型列表要跑很久；
+    /// 这个上限让池子的规模可控。
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// 是否启用该订阅源，默认 `true`。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 其余所有键都会成为脚本里的全局变量（数字、布尔、字符串、表）。
+    #[serde(flatten)]
+    pub params: BTreeMap<String, serde_yaml::Value>,
 }
 
 impl SubscriberConfig {
     /// 订阅源名称；未命名时由 [`Config::normalize`] 填充。
     pub fn name(&self) -> &str {
-        match self {
-            SubscriberConfig::Http { name, .. }
-            | SubscriberConfig::Lua { name, .. }
-            | SubscriberConfig::File { name, .. }
-            | SubscriberConfig::Exec { name, .. } => name,
-        }
-    }
-
-    /// 订阅源的种类字符串：`lua`、`http`、`file` 或 `exec`。
-    pub fn kind(&self) -> &'static str {
-        match self {
-            SubscriberConfig::Http { .. } => "http",
-            SubscriberConfig::Lua { .. } => "lua",
-            SubscriberConfig::File { .. } => "file",
-            SubscriberConfig::Exec { .. } => "exec",
-        }
+        &self.name
     }
 
     /// 该订阅源是否启用。
     pub fn enabled(&self) -> bool {
-        match self {
-            SubscriberConfig::Http { enabled, .. }
-            | SubscriberConfig::Lua { enabled, .. }
-            | SubscriberConfig::File { enabled, .. }
-            | SubscriberConfig::Exec { enabled, .. } => *enabled,
-        }
-    }
-
-    /// 响应内容的解析格式。
-    ///
-    /// `lua` 条目解析的是脚本 `print` 出来的内容，默认 `plaintext`。
-    pub fn format(&self) -> Format {
-        match self {
-            SubscriberConfig::Http { format, .. }
-            | SubscriberConfig::File { format, .. }
-            | SubscriberConfig::Exec { format, .. }
-            | SubscriberConfig::Lua { format, .. } => *format,
-        }
+        self.enabled
     }
 
     /// 生效的条数上限：`0` 表示不限，未设置时也不限。
     pub fn limit(&self) -> Option<usize> {
-        let limit = match self {
-            SubscriberConfig::Http { limit, .. }
-            | SubscriberConfig::Lua { limit, .. }
-            | SubscriberConfig::File { limit, .. }
-            | SubscriberConfig::Exec { limit, .. } => *limit,
-        };
-        match limit {
+        match self.limit {
             Some(0) | None => None,
             Some(explicit) => Some(explicit),
         }
     }
 
+    /// 脚本源码的来源：内联的 `lua_code`，或 `lua_file` 的路径。
+    pub fn source(&self) -> SubscriberSource<'_> {
+        match (self.lua_code.as_deref(), self.lua_file.as_deref()) {
+            (Some(code), _) => SubscriberSource::Inline(code),
+            (None, Some(path)) => SubscriberSource::File(path),
+            // `validate` 已经拒绝了这个组合，这里只是不让类型系统为难。
+            (None, None) => SubscriberSource::Inline(""),
+        }
+    }
+
     /// 覆盖订阅源名称。
     fn set_name(&mut self, name: String) {
-        match self {
-            SubscriberConfig::Http { name: n, .. }
-            | SubscriberConfig::Lua { name: n, .. }
-            | SubscriberConfig::File { name: n, .. }
-            | SubscriberConfig::Exec { name: n, .. } => *n = name,
-        }
+        self.name = name;
     }
 }
 
-/// 订阅源响应内容如何转换为代理 URL。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Format {
-    /// 每行一个代理；`#` 开始的行是注释。
-    #[default]
-    Plaintext,
-    /// 代理组成的 JSON 数组（或包含数组的对象）。
-    Json,
-    /// Clash / Clash.Meta 的 `proxies:` 列表。
-    Clash,
-}
-
-impl Format {
-    /// 全部格式，便于遍历与提示。
-    pub const ALL: [Format; 3] = [Format::Plaintext, Format::Json, Format::Clash];
-
-    /// 格式的小写名称，与 YAML 中使用的值一致。
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Format::Plaintext => "plaintext",
-            Format::Json => "json",
-            Format::Clash => "clash",
-        }
-    }
-}
-
-impl std::str::FromStr for Format {
-    type Err = Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "plaintext" | "plain" | "text" | "txt" | "list" => Ok(Format::Plaintext),
-            "json" => Ok(Format::Json),
-            "clash" | "yaml" | "yml" => Ok(Format::Clash),
-            other => Err(Error::Config(format!(
-                "unknown subscriber format `{other}` (expected one of plaintext, json, clash)"
-            ))),
-        }
-    }
+/// 一个订阅源脚本从哪里来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriberSource<'a> {
+    /// 配置里的 `lua_code`。
+    Inline(&'a str),
+    /// `lua_file` 指向的 `.lua` 文件。
+    File(&'a Path),
 }
 
 /// 配置了多个健康检查目标时，“存活”的含义。
@@ -582,12 +425,6 @@ impl std::fmt::Display for HealthRequirement {
     }
 }
 
-impl std::fmt::Display for Format {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 impl Config {
     /// 加载配置：显式路径优先，其次是 `$PROXYGATE_CONFIG`，然后是
     /// `./config.yaml`，最后是 `~/.config/proxygate/config.yaml`。
@@ -634,8 +471,15 @@ impl Config {
     /// 填充派生值，并拒绝无法工作的配置。
     pub fn normalize(&mut self) -> Result<()> {
         for (index, subscriber) in self.subscribers.iter_mut().enumerate() {
-            if subscriber.name().trim().is_empty() {
-                subscriber.set_name(format!("{}-{}", subscriber.kind(), index + 1));
+            if subscriber.name.trim().is_empty() {
+                subscriber.set_name(format!("lua-{}", index + 1));
+            }
+            // `type: lua` 是旧配置的习惯写法，收下但不再当参数，免得它变成
+            // 脚本里一个同名全局变量。
+            if let Some(kind) = subscriber.params.get("type").and_then(|v| v.as_str()) {
+                if kind.eq_ignore_ascii_case("lua") {
+                    subscriber.params.remove("type");
+                }
             }
         }
 
@@ -655,23 +499,13 @@ impl Config {
 
     /// 校验各字段的取值范围与地址格式。
     fn validate(&self) -> Result<()> {
-        if self.server.proxy.trim().is_empty() {
-            return Err(Error::Config("server.proxy must not be empty".into()));
+        if self.server.listen.trim().is_empty() {
+            return Err(Error::Config("server.listen must not be empty".into()));
         }
-        if self.server.proxy.trim().to_socket_addrs().is_err() {
+        if self.server.listen.trim().to_socket_addrs().is_err() {
             return Err(Error::Config(format!(
-                "server.proxy `{}` is not a valid `host:port` address",
-                self.server.proxy
-            )));
-        }
-        let api = self.server.api_address();
-        if api.is_empty() {
-            return Err(Error::Config("server.api must not be empty".into()));
-        }
-        if api.to_socket_addrs().is_err() {
-            return Err(Error::Config(format!(
-                "server.api `{}` is not a valid `host:port` address (or `same` to share the proxy port)",
-                self.server.api
+                "server.listen `{}` is not a valid `host:port` address",
+                self.server.listen
             )));
         }
 
@@ -732,67 +566,42 @@ impl Config {
         }
 
         for subscriber in &self.subscribers {
-            match subscriber {
-                SubscriberConfig::Http { url, .. } => {
-                    let parsed = url::Url::parse(url).map_err(|e| {
-                        Error::Config(format!(
-                            "subscriber `{}` has an invalid url `{url}`: {e}",
-                            subscriber.name()
-                        ))
-                    })?;
-                    if !matches!(parsed.scheme(), "http" | "https") {
-                        return Err(Error::Config(format!(
-                            "subscriber `{}` url must be http or https",
-                            subscriber.name()
-                        )));
-                    }
+            let name = subscriber.name();
+            match (
+                subscriber.lua_code.as_deref(),
+                subscriber.lua_file.as_deref(),
+            ) {
+                (Some(code), None) if code.trim().is_empty() => {
+                    return Err(Error::Config(format!(
+                        "subscriber `{name}` has an empty `lua_code`"
+                    )));
                 }
-                SubscriberConfig::File { path, .. } => {
-                    if path.as_os_str().is_empty() {
-                        return Err(Error::Config(format!(
-                            "subscriber `{}` needs a path",
-                            subscriber.name()
-                        )));
-                    }
+                (None, Some(path)) if path.as_os_str().is_empty() => {
+                    return Err(Error::Config(format!(
+                        "subscriber `{name}` has an empty `lua_file`"
+                    )));
                 }
-                SubscriberConfig::Lua {
-                    lua_code, lua_file, ..
-                } => match (lua_code.as_deref(), lua_file.as_deref()) {
-                    (Some(code), None) if code.trim().is_empty() => {
-                        return Err(Error::Config(format!(
-                            "subscriber `{}` has an empty `lua_code`",
-                            subscriber.name()
-                        )));
-                    }
-                    (None, Some(path)) if path.as_os_str().is_empty() => {
-                        return Err(Error::Config(format!(
-                            "subscriber `{}` has an empty `lua_file`",
-                            subscriber.name()
-                        )));
-                    }
-                    // 两个都给：`lua_code` 胜出（YAML 里同时写多半是复制粘贴），
-                    // 但这是配置错误，直接说清楚。
-                    (Some(_), Some(_)) => {
-                        return Err(Error::Config(format!(
-                            "subscriber `{}` sets both `lua_code` and `lua_file`; pick one",
-                            subscriber.name()
-                        )));
-                    }
-                    (None, None) => {
-                        return Err(Error::Config(format!(
-                            "subscriber `{}` needs `lua_code` or `lua_file`",
-                            subscriber.name()
-                        )));
-                    }
-                    _ => {}
-                },
-                SubscriberConfig::Exec { command, .. } => {
-                    if command.is_empty() || command[0].trim().is_empty() {
-                        return Err(Error::Config(format!(
-                            "subscriber `{}` needs a non-empty command",
-                            subscriber.name()
-                        )));
-                    }
+                (Some(_), Some(_)) => {
+                    return Err(Error::Config(format!(
+                        "subscriber `{name}` sets both `lua_code` and `lua_file`; pick one"
+                    )));
+                }
+                (None, None) => {
+                    return Err(Error::Config(format!(
+                        "subscriber `{name}` needs `lua_code` or `lua_file`"
+                    )));
+                }
+                (Some(_), None) | (None, Some(_)) => {}
+            }
+
+            // 订阅源现在是清一色的 Lua 脚本，`type:` 已经没有意义；旧配置里的
+            // `type: lua` 照收，其它值说明作者以为还有别的种类，直接指出来。
+            if let Some(kind) = subscriber.params.get("type") {
+                let kind = kind.as_str().unwrap_or("?");
+                if !kind.eq_ignore_ascii_case("lua") {
+                    return Err(Error::Config(format!(
+                        "subscriber `{name}` has `type: {kind}`; every subscriber is a Lua                          script now, so drop the key (or use `lua_code` / `lua_file`)"
+                    )));
                 }
             }
         }
@@ -1007,14 +816,9 @@ mod de {
     }
 }
 
-/// `server.proxy` 的默认值：`127.0.0.1:8080`。
-fn default_proxy_addr() -> String {
+/// `server.listen` 的默认值。
+fn default_listen_addr() -> String {
     "127.0.0.1:8080".to_string()
-}
-
-/// `server.api` 的默认值：`127.0.0.1:8081`。
-fn default_api_addr() -> String {
-    "127.0.0.1:8081".to_string()
 }
 
 /// `refresh.interval` 的默认值：10 分钟。
@@ -1040,19 +844,28 @@ fn default_health_targets() -> Vec<String> {
     ]
 }
 
-/// `health.interval` 的默认值：30 秒。
+/// `health.interval` 的默认值：5 分钟。
+///
+/// 别忘了它和 `refresh.interval` 是两件事：`refresh.interval` 决定多久重新
+/// 跑一次订阅源脚本、拿一批新代理；`health.interval` 决定多久把**现有池子**
+/// 重探一遍。30 秒就把几千条全探一遍太频繁了，日志会一直刷 TLS 错误。
 fn default_health_interval() -> Duration {
-    Duration::from_secs(30)
+    Duration::from_secs(300)
 }
 
-/// `health.timeout` 的默认值：5 秒。
+/// `health.timeout` 的默认值：3 秒。
+///
+/// 免费代理里大量是死连接，3 秒足够判定；再长只是把整轮首查拖慢。
 fn default_health_timeout() -> Duration {
-    Duration::from_secs(5)
+    Duration::from_secs(3)
 }
 
-/// `health.concurrency` 的默认值：100。
+/// `health.concurrency` 的默认值：300。
+///
+/// 这是首查速度的关键：按每个代理 3~5 秒算，100 并发探 5,000 条要
+/// 150~250 秒，300 并发压到 50~80 秒。
 fn default_health_concurrency() -> usize {
-    100
+    300
 }
 
 /// `health.max_failures` 的默认值：3。
@@ -1206,9 +1019,31 @@ health:
             2,
             "the example shows both probes"
         );
+        assert_eq!(
+            config.server.listen, "127.0.0.1:8080",
+            "the example keeps the default listen address visible"
+        );
+        // 示例配置必须带上调好的健康检查参数：它们决定首查要跑多久，
+        // 而且 rola-ip 必须限流，否则一遍探测要几分钟。
+        assert_eq!(config.health.concurrency, 300);
+        assert_eq!(config.health.timeout, Duration::from_secs(3));
+        assert_eq!(config.health.interval, Duration::from_secs(300));
+        let rola = config
+            .subscribers
+            .iter()
+            .find(|subscriber| subscriber.name() == "rola-ip")
+            .expect("the example subscribes to rola-ip");
+        assert_eq!(rola.limit(), Some(1000));
+        assert!(
+            config
+                .subscribers
+                .iter()
+                .all(|subscriber| subscriber.params.keys().all(|key| key != "type")),
+            "the example should not carry a legacy `type:` key"
+        );
         // 示例里必须真的出现一段脚本，否则「怎么用 lua 订阅源」就没地方看。
-        assert!(EXAMPLE_CONFIG.contains("type: lua"));
         assert!(EXAMPLE_CONFIG.contains("lua_code: |"));
+        assert!(EXAMPLE_CONFIG.contains("return result"));
 
         // 示例配置不得向客户端索取凭据：它应当可以直接用在回环地址上，而
         // 网关认证是部署时的决定，不该写进签入仓库的文件。在这里重新加回
@@ -1226,46 +1061,27 @@ health:
     }
 
     #[test]
-    fn the_api_can_share_the_proxy_port() {
-        let mut config: Config =
-            serde_yaml::from_str("server:\n  proxy: 127.0.0.1:8080\n  api: same\n").unwrap();
+    fn the_listen_address_is_validated() {
+        let mut config: Config = serde_yaml::from_str("server:\n  listen: 0.0.0.0:9000\n").unwrap();
         config.normalize().unwrap();
-        assert!(config.server.shares_port());
-        assert_eq!(config.server.api_address(), "127.0.0.1:8080");
+        assert_eq!(config.server.listen, "0.0.0.0:9000");
 
-        // `proxy` 被接受为同一个词，直接写出地址也一样。
-        for spelling in ["proxy", "127.0.0.1:8080"] {
-            let mut config: Config = serde_yaml::from_str(&format!(
-                "server:\n  proxy: 127.0.0.1:8080\n  api: {spelling}\n"
-            ))
-            .unwrap();
-            config.normalize().unwrap();
-            assert!(config.server.shares_port(), "{spelling}");
-            assert_eq!(config.server.api_address(), "127.0.0.1:8080");
+        for broken in ["not-an-address", "", "127.0.0.1"] {
+            let mut config: Config =
+                serde_yaml::from_str(&format!("server:\n  listen: \"{broken}\"\n")).unwrap();
+            let error = config.normalize().unwrap_err().to_string();
+            assert!(error.contains("server.listen"), "{broken}: {error}");
         }
-
-        // 分开的端口仍然分开，默认值也不共用端口。
-        let mut config: Config =
-            serde_yaml::from_str("server:\n  proxy: 127.0.0.1:8080\n  api: 127.0.0.1:8081\n")
-                .unwrap();
-        config.normalize().unwrap();
-        assert!(!config.server.shares_port());
-        assert!(!Config::default().server.shares_port());
-
-        // 格式错误的地址仍然会被拒绝，且错误信息会提到 `same`。
-        let mut broken: Config = serde_yaml::from_str("server:\n  api: not-an-address\n").unwrap();
-        let error = broken.normalize().unwrap_err().to_string();
-        assert!(
-            error.contains("same") || error.contains("not-an-address"),
-            "{error}"
-        );
     }
 
     #[test]
     fn defaults_are_usable() {
         let config = Config::default();
-        assert_eq!(config.server.proxy, "127.0.0.1:8080");
-        assert_eq!(config.server.api, "127.0.0.1:8081");
+        assert_eq!(config.server.listen, "127.0.0.1:8080");
+        // 这几个值是首查速度的关键，别让它们悄悄漂回去。
+        assert_eq!(config.health.interval, Duration::from_secs(300));
+        assert_eq!(config.health.timeout, Duration::from_secs(3));
+        assert_eq!(config.health.concurrency, 300);
         assert_eq!(config.selection.reuse_after, Duration::from_secs(1800));
         assert!(config.subscribers.is_empty());
     }
@@ -1274,20 +1090,14 @@ health:
     fn parses_the_documented_example() {
         let raw = r#"
 server:
-  proxy: 127.0.0.1:8080
-  api: 127.0.0.1:8081
+  listen: 127.0.0.1:8080
 
 subscribers:
   - name: provider
-    type: http
-    url: https://example.com/proxies.txt
+    lua_code: |
+      return { { type = "http", ip = "1.2.3.4", port = 8080 } }
   - name: local
-    type: file
-    path: ./proxies.txt
-    format: clash
-  - name: custom
-    type: exec
-    command: [python, ./subscribers/custom.py]
+    lua_file: ./proxies.lua
 
 refresh:
   interval: 10m
@@ -1309,9 +1119,18 @@ gateway:
         let mut config: Config = serde_yaml::from_str(raw).unwrap();
         config.normalize().unwrap();
 
-        assert_eq!(config.subscribers.len(), 3);
-        assert_eq!(config.subscribers[0].format(), Format::Plaintext);
-        assert_eq!(config.subscribers[1].format(), Format::Clash);
+        assert_eq!(config.server.listen, "127.0.0.1:8080");
+        assert_eq!(config.subscribers.len(), 2);
+        assert_eq!(
+            config.subscribers[0].source(),
+            SubscriberSource::Inline(
+                "return { { type = \"http\", ip = \"1.2.3.4\", port = 8080 } }\n"
+            )
+        );
+        assert_eq!(
+            config.subscribers[1].source(),
+            SubscriberSource::File(Path::new("./proxies.lua"))
+        );
         assert_eq!(config.refresh.interval, Duration::from_secs(600));
         assert_eq!(config.health.concurrency, 100);
         assert_eq!(
@@ -1326,23 +1145,17 @@ gateway:
 
     #[test]
     fn rejects_duplicate_and_invalid_entries() {
+        let subscriber = |name: &str| SubscriberConfig {
+            name: name.into(),
+            lua_code: Some("return {}".into()),
+            lua_file: None,
+            timeout: None,
+            limit: None,
+            enabled: true,
+            params: Default::default(),
+        };
         let mut config = Config {
-            subscribers: vec![
-                SubscriberConfig::File {
-                    name: "same".into(),
-                    path: "a.txt".into(),
-                    format: Format::Plaintext,
-                    limit: None,
-                    enabled: true,
-                },
-                SubscriberConfig::File {
-                    name: "same".into(),
-                    path: "b.txt".into(),
-                    format: Format::Plaintext,
-                    limit: None,
-                    enabled: true,
-                },
-            ],
+            subscribers: vec![subscriber("same"), subscriber("same")],
             ..Config::default()
         };
         assert!(config.normalize().is_err());
@@ -1363,22 +1176,22 @@ gateway:
     #[test]
     fn names_unnamed_subscribers() {
         let mut config: Config =
-            serde_yaml::from_str("subscribers:\n  - type: file\n    path: ./a.txt\n").unwrap();
+            serde_yaml::from_str("subscribers:\n  - lua_code: return {}\n").unwrap();
         config.normalize().unwrap();
-        assert_eq!(config.subscribers[0].name(), "file-1");
+        assert_eq!(config.subscribers[0].name(), "lua-1");
     }
 
     #[test]
-    fn a_lua_subscriber_takes_its_extra_keys_as_parameters() {
+    fn a_subscriber_takes_its_extra_keys_as_parameters() {
         let raw = r#"
 subscribers:
   - script_name: my_scraper
-    type: lua
     target_url: https://api.example.com/data.json
     page_size: 500
     debug: true
+    limit: 500
     lua_code: |
-      print("1.2.3.4:8080")
+      return {}
 "#;
         let mut config: Config = serde_yaml::from_str(raw).unwrap();
         config.normalize().unwrap();
@@ -1386,33 +1199,45 @@ subscribers:
         let subscriber = &config.subscribers[0];
         // `script_name` 是 `name` 的别名。
         assert_eq!(subscriber.name(), "my_scraper");
-        assert_eq!(subscriber.kind(), "lua");
-        assert_eq!(subscriber.format(), Format::Plaintext);
+        assert_eq!(subscriber.limit(), Some(500));
 
-        let SubscriberConfig::Lua { params, limit, .. } = subscriber else {
-            panic!("expected a lua subscriber");
-        };
-        assert_eq!(*limit, None);
-        let keys: Vec<&str> = params.keys().map(String::as_str).collect();
+        let keys: Vec<&str> = subscriber.params.keys().map(String::as_str).collect();
         assert_eq!(keys, vec!["debug", "page_size", "target_url"]);
         assert_eq!(
-            params["target_url"].as_str(),
+            subscriber.params["target_url"].as_str(),
             Some("https://api.example.com/data.json")
         );
-        assert_eq!(params["page_size"].as_u64(), Some(500));
-        assert_eq!(params["debug"].as_bool(), Some(true));
+        assert_eq!(subscriber.params["page_size"].as_u64(), Some(500));
+        assert_eq!(subscriber.params["debug"].as_bool(), Some(true));
     }
 
     #[test]
-    fn a_lua_subscriber_needs_exactly_one_source() {
+    fn a_legacy_type_lua_key_is_accepted_but_dropped() {
+        // 老配置里的 `type: lua` 照收，但它不该变成脚本里的全局变量。
+        let mut config: Config =
+            serde_yaml::from_str("subscribers:\n  - type: lua\n    lua_code: return {}\n").unwrap();
+        config.normalize().unwrap();
+        assert!(config.subscribers[0].params.is_empty());
+
+        // 别的 type 说明作者以为还有别的种类：直接拒绝，并说清楚。
+        let mut config: Config =
+            serde_yaml::from_str("subscribers:\n  - type: http\n    lua_code: return {}\n")
+                .unwrap();
+        let error = config.normalize().unwrap_err().to_string();
+        assert!(error.contains("type: http"), "{error}");
+        assert!(error.contains("lua_code"), "{error}");
+    }
+
+    #[test]
+    fn a_subscriber_needs_exactly_one_script_source() {
         // 两种都不给。
-        let mut config: Config = serde_yaml::from_str("subscribers:\n  - type: lua\n").unwrap();
+        let mut config: Config = serde_yaml::from_str("subscribers:\n  - name: x\n").unwrap();
         let error = config.normalize().unwrap_err().to_string();
         assert!(error.contains("needs `lua_code` or `lua_file`"), "{error}");
 
         // 两种都给：说清楚，不猜。
         let mut config: Config = serde_yaml::from_str(
-            "subscribers:\n  - type: lua\n    lua_code: print(1)\n    lua_file: ./a.lua\n",
+            "subscribers:\n  - name: x\n    lua_code: return {}\n    lua_file: ./a.lua\n",
         )
         .unwrap();
         let error = config.normalize().unwrap_err().to_string();
@@ -1420,30 +1245,26 @@ subscribers:
 
         // `lua_code` 是空白。
         let mut config: Config =
-            serde_yaml::from_str("subscribers:\n  - type: lua\n    lua_code: \"   \"\n").unwrap();
+            serde_yaml::from_str("subscribers:\n  - name: x\n    lua_code: \"   \"\n").unwrap();
         let error = config.normalize().unwrap_err().to_string();
         assert!(error.contains("empty `lua_code`"), "{error}");
 
         // 只有 `lua_file` 是合法的。
         let mut config: Config =
-            serde_yaml::from_str("subscribers:\n  - type: lua\n    lua_file: ./a.lua\n").unwrap();
+            serde_yaml::from_str("subscribers:\n  - lua_file: ./a.lua\n").unwrap();
         config.normalize().unwrap();
         assert_eq!(config.subscribers[0].name(), "lua-1");
     }
 
     #[test]
     fn a_limit_of_zero_means_no_limit() {
-        let mut config: Config = serde_yaml::from_str(
-            "subscribers:\n  - type: http\n    url: https://example.com/a.txt\n    limit: 0\n",
-        )
-        .unwrap();
+        let mut config: Config =
+            serde_yaml::from_str("subscribers:\n  - lua_code: return {}\n    limit: 0\n").unwrap();
         config.normalize().unwrap();
         assert_eq!(config.subscribers[0].limit(), None);
 
-        let mut config: Config = serde_yaml::from_str(
-            "subscribers:\n  - type: http\n    url: https://example.com/a.txt\n    limit: 25\n",
-        )
-        .unwrap();
+        let mut config: Config =
+            serde_yaml::from_str("subscribers:\n  - lua_code: return {}\n    limit: 25\n").unwrap();
         config.normalize().unwrap();
         assert_eq!(config.subscribers[0].limit(), Some(25));
     }

@@ -7,19 +7,18 @@
 #   docker build --build-arg CARGO_MIRROR=https://rsproxy.cn/index/ -t proxygate .
 #
 # Run (mount a config.yaml and a persistent state directory):
-#   docker run --rm -p 8080:8080 -p 8081:8081 \
+#   docker run --rm -p 8080:8080 \
 #     -v "$PWD/config.yaml:/home/proxygate/config.yaml:ro" \
 #     -v proxygate-cache:/home/proxygate/.cache/proxygate \
 #     proxygate
 #
 # The binary takes no arguments: it reads the config and serves. The image sets
 # PROXYGATE_CONFIG=/home/proxygate/config.yaml, so the mount above is all it
-# takes. That config has to bind `0.0.0.0` (the built-in defaults bind
+# takes. That config has to bind `0.0.0.0` (the built-in default binds
 # `127.0.0.1`, which is unreachable through a port mapping):
 #
 #   server:
-#     proxy: 0.0.0.0:8080
-#     api: 0.0.0.0:8081
+#     listen: 0.0.0.0:8080
 
 # ---------------------------------------------------------------------------
 # Build stage
@@ -92,11 +91,12 @@ RUN mkdir -p /home/proxygate/.cache/proxygate
 # state.json and cache.json live here (see the volume in the build notes above).
 VOLUME ["/home/proxygate/.cache/proxygate"]
 
-EXPOSE 8080 8081
+# One port: the HTTP proxy gateway and the REST API share it.
+EXPOSE 8080
 
-# Assumes the default API port (8081); override the health check if you move it.
+# Assumes the default listen address; override the health check if you move it.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8081/api/v1/health || exit 1
+    CMD curl -fsS http://127.0.0.1:8080/api/v1/health || exit 1
 
 # Where the mounted config lives. The binary takes no arguments, so this is the
 # only knob the image sets for it.

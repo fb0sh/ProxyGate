@@ -1,5 +1,7 @@
 //! REST API：整个程序的对外面。
 //!
+//! 它和 HTTP 代理网关**共用** `server.listen` 那一个端口：两类请求的
+//! 形状不同，网关按形状分流（见 [`crate::gateway::Gateway::with_api`]）。
 //! 没有命令行客户端，所以这里覆盖全部操作：
 //!
 //! ```text
@@ -17,7 +19,6 @@
 //! 默认只回一行 `host:port`。响应里的凭据一律脱敏（替换成 `***:***`）。
 //! 网关也可以把这个路由挂到代理端口上，二者按请求形状区分彼此。
 
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -29,7 +30,6 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::app::{App, Readiness};
-use crate::error::{Error, Result};
 use crate::state;
 
 /// 未就绪时 `/api/v1/get` 在 `Retry-After` 里给出的建议重试秒数。
@@ -77,22 +77,6 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/refresh", post(trigger_refresh))
         .route("/api/v1/check", post(trigger_check))
         .with_state(state)
-}
-
-/// 提供 API 服务，直到 `shutdown` 完成。
-pub async fn serve<S>(
-    state: Arc<ApiState>,
-    listener: tokio::net::TcpListener,
-    shutdown: S,
-) -> Result<()>
-where
-    S: Future<Output = ()> + Send + 'static,
-{
-    tracing::info!(address = ?listener.local_addr().ok(), "REST API listening");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown)
-        .await
-        .map_err(|error| Error::Other(format!("api server failed: {error}")))
 }
 
 /// `/api/v1/get` 与 `/api/v1/getua` 的查询参数。

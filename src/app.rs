@@ -526,7 +526,7 @@ impl App {
         }
 
         // 每个订阅源一完成就合并进池子并落盘，而不是等最慢的那个：
-        // `freeproxy-gh` 要四分钟，那期间已经拿到的代理不该只存在内存里。
+        // 慢的来源要几十秒，那期间已经拿到的代理不该只存在内存里。
         let mut fetched = 0;
         let mut rejected = 0;
         let mut truncated = 0;
@@ -852,34 +852,16 @@ impl App {
 
 /// 把进度事件转成日志的接收器：`serve` 用它。
 ///
-/// 命令行有更好看的终端进度（`commands::ConsoleProgress`），但后台循环没有
-/// 终端，所以这里按 `info` 写日志——`serve` 的日志里因此能看到每个来源拿到
-/// 了多少、慢的还在下多少。
+/// 库只发进度事件，这里把它们写成 `info` 级日志，所以服务端日志能看到每个
+/// 来源跑了多久、拿到多少，以及健康探测与发放验证的进行情况。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LogProgress;
 
 impl Progress for LogProgress {
     fn fetch(&self, event: FetchEvent<'_>) {
         match event {
-            FetchEvent::Started { name, kind, format } => {
-                info!(
-                    subscriber = %name,
-                    kind = %kind,
-                    format = %format.as_str(),
-                    "fetching subscriber"
-                );
-            }
-            FetchEvent::Download {
-                name,
-                bytes,
-                elapsed,
-            } => {
-                info!(
-                    subscriber = %name,
-                    kilobytes = bytes / 1024,
-                    elapsed_ms = elapsed.as_millis() as u64,
-                    "still downloading"
-                );
+            FetchEvent::Started { name } => {
+                info!(subscriber = %name, "running subscriber script");
             }
             FetchEvent::Finished(outcome) => {
                 if outcome.ok() {
@@ -1110,13 +1092,18 @@ mod tests {
         config
     }
 
-    fn file_subscriber(name: &str, path: std::path::PathBuf) -> SubscriberConfig {
-        SubscriberConfig::File {
+    /// 一个最短的订阅源脚本：直接返回 `host:port` 形式的代理。
+    fn lua_subscriber(name: &str, host: &str, port: u16) -> SubscriberConfig {
+        SubscriberConfig {
             name: name.to_string(),
-            path,
-            format: crate::config::Format::Plaintext,
+            lua_code: Some(format!(
+                "return {{ {{ type = 'http', ip = '{host}', port = {port} }} }}"
+            )),
+            lua_file: None,
+            timeout: None,
             limit: None,
             enabled: true,
+            params: BTreeMap::new(),
         }
     }
 
@@ -1124,17 +1111,13 @@ mod tests {
     async fn health_is_not_probed_again_once_there_are_results() {
         let (proxy, hits) = counting_proxy().await;
 
-        let dir =
-            std::env::temp_dir().join(format!("proxygate-app-pending-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let list = dir.join("list.txt");
-        std::fs::write(&list, format!("{proxy}\n")).expect("write list");
+        let (host, port) = (proxy.ip().to_string(), proxy.port());
 
         // 每次"命令行调用"都是一个新进程：这里就是新的 App，共用同一个缓存
         // 目录，所以下一次能从 `cache.json` 里拿到上一次的判定结果。
         // 目录只清一次——`scratch_config` 会删目录，不能每次调用都建。
         let mut base = scratch_config("missing");
-        base.subscribers = vec![file_subscriber("local", list.clone())];
+        base.subscribers = vec![lua_subscriber("local", &host, port)];
         base.health.target = Some("http://example.test/".to_string());
         base.health.targets = None;
         base.health.timeout = Duration::from_millis(500);
@@ -1231,25 +1214,25 @@ mod tests {
     async fn refresh_persists_each_subscriber_as_it_arrives() {
         let address = slow_http_server("9.9.9.9:9999\n", Duration::from_millis(1200)).await;
 
-        let dir =
-            std::env::temp_dir().join(format!("proxygate-app-incremental-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let list = dir.join("fast.txt");
-        std::fs::write(&list, "1.1.1.1:1111\n").expect("write list");
-
         let mut config = scratch_config("incremental");
-        config.subscribers = vec![
-            file_subscriber("fast", list),
-            SubscriberConfig::Http {
-                name: "slow".to_string(),
-                url: format!("http://{address}/list.txt"),
-                format: crate::config::Format::Plaintext,
-                headers: BTreeMap::new(),
-                timeout: Some(Duration::from_secs(10)),
-                limit: None,
-                enabled: true,
-            },
-        ];
+        // 慢源靠一次慢 `fetch` 拖住；Lua 里没有 sleep，所以用真实的网络等待。
+        let slow = SubscriberConfig {
+            name: "slow".to_string(),
+            lua_code: Some(
+                "local _ = fetch(slow_url)\n\
+                 return { { type = 'http', ip = '9.9.9.9', port = 9999 } }"
+                    .to_string(),
+            ),
+            lua_file: None,
+            timeout: Some(Duration::from_secs(10)),
+            limit: None,
+            enabled: true,
+            params: BTreeMap::from([(
+                "slow_url".to_string(),
+                serde_yaml::Value::from(format!("http://{address}/list.txt")),
+            )]),
+        };
+        config.subscribers = vec![lua_subscriber("fast", "1.1.1.1", 1111), slow];
         let cache = config.cache_dir().join("cache.json");
 
         let app = Arc::new(App::new(config, None).expect("app"));

@@ -45,15 +45,15 @@ cp config.example.yaml config.yaml
 proxygate
 
 # 3. 拿一个（已验证的）代理并用它
-curl -sf http://127.0.0.1:8081/api/v1/get
+curl -sf http://127.0.0.1:8080/api/v1/get
 http://user:pass@1.2.3.4:8080
-curl -x "$(curl -sf http://127.0.0.1:8081/api/v1/get)" https://example.com
+curl -x "$(curl -sf http://127.0.0.1:8080/api/v1/get)" https://example.com
 
-# 4. 也可以直接把网关当代理用
+# 4. 网关和 REST API 在同一个端口上，请求形状不同而已
 curl -x http://127.0.0.1:8080 https://example.com
 
 # 5. 手册就是这个端点，agent 和人都能读
-curl -s http://127.0.0.1:8081/help
+curl -s http://127.0.0.1:8080/help
 ```
 
 注意 `curl -sf`：池子空的时候 `/get` 会返回 `503` 和一段说明正文，不加 `-f`
@@ -72,7 +72,7 @@ install -m755 target/release/proxygate ~/.local/bin/proxygate
 
 ```bash
 docker build -t proxygate .
-docker run --rm -p 8080:8080 -p 8081:8081 \
+docker run --rm -p 8080:8080 \
   -v "$PWD/config.yaml:/home/proxygate/config.yaml:ro" \
   -v proxygate-cache:/home/proxygate/.cache/proxygate \
   proxygate
@@ -98,7 +98,7 @@ Windows 上缓存目录是 `%LOCALAPPDATA%\proxygate`（可用 `state.dir` 或
 
 配置文件查找顺序：
 
-1. `--config <path>`（或环境变量 `$PROXYGATE_CONFIG`）
+1. `$PROXYGATE_CONFIG`
 2. `./config.yaml`
 3. `~/.config/proxygate/config.yaml`
 
@@ -114,16 +114,15 @@ proxygate --example-config > config.yaml
 
 | 配置项 | 默认值 | 含义 |
 | --- | --- | --- |
-| `server.proxy` | `127.0.0.1:8080` | HTTP 代理网关地址 |
-| `server.api` | `127.0.0.1:8081` | REST API 地址；填 `same` 可与网关共用同一端口 |
-| `subscribers` | `[]` | 代理来源，见下一节 |
+| `server.listen` | `127.0.0.1:8080` | 唯一的监听地址：HTTP 代理网关与 REST API 共用它 |
+| `subscribers` | `[]` | 代理来源（Lua 脚本），见下一节 |
 | `refresh.interval` | `10m` | 拉取结果复用时⻓ |
 | `refresh.timeout` | `20s` | 单个 subscriber 超时 |
 | `health.targets` | Google 204 + `cn.bing.com` | **通过代理**去访问的探测目标，并发探测 |
 | `health.require` | `any` | 目标全部要通（`all`）还是通一个就算（`any`） |
-| `health.interval` | `30s` | 探测周期，同时也是健康结果缓存有效期 |
-| `health.timeout` | `5s` | 单个代理的探测超时 |
-| `health.concurrency` | `100` | 同时探测的代理数量 |
+| `health.interval` | `5m` | 重探**现有池子**的周期，同时也是健康结果缓存有效期（与 `refresh.interval` 无关：那个是多久重新跑一次订阅源脚本） |
+| `health.timeout` | `3s` | 单个代理的探测超时 |
+| `health.concurrency` | `300` | 同时探测的代理数量——首查速度的关键 |
 | `health.max_failures` | `3` | 原本可用的代理连续失败多少次后判死 |
 | `selection.strategy` | `random` | `random` 或 `latency` |
 | `selection.reuse_after` | `30m` | 优先避开这段时间内用过的代理 |
@@ -138,29 +137,23 @@ proxygate --example-config > config.yaml
 
 时⻓支持 `30s`、`10m`、`2h`、`1d`、`250ms`、`1h30m` 或纯秒数。
 
-> **示例配置的池子很大**：4 条订阅源一次冷启动能抓到 5,000 多条（实测：`scdn` 20 条、
-> `freeproxy-cn` 117 条、`rola-ip` 4,439 条——那 10 页现在是脚本里的一个循环，跑完约
-> 28s；`freeproxy-gh` 按 `limit` 截到 1000 条）。一遍健康探测要几分钟（早先一次全量
-> 实测：5,157 条约 3.5 分钟，66 条存活）。
-> `health.interval` 默认 30s，池子这么大时探测基本是连轴转的——想让它喘口气就把
-> `health.interval` 加到 `10m`，或者给来源加 `limit` 少抓一点。
+> **首查慢是因为健康探测，不是因为脚本**：`rola-ip` 一个源就有 4,400 多条（10 页在
+> 脚本里循环）。示例配置给它加了 `limit: 1000`：免费代理的存活率极低（实测一份 1,020
+> 条的池子只有 13 条通过），与其花 5 倍时间去探 5,000 条、换来多得有限的可用代理，不如
+> 把这 5 倍时间留给刷新。
+>
+> `health.concurrency` 就是决定首查要跑多久的那个旋钮：同一份 1,020 条的池子、同一组
+> 真实目标，实测 300 并发 14s、100 并发 30s（差距取决于死代理多快失败，不只是并发倍数）。
 
 > **注意 `health.targets` 的语义**：探测请求是**通过代理**发出的，所以「你本机连不上
 > Google」不是问题——要连上的是代理。默认两个目标里，Google 只有代理真的能出国才会
 > 应答，`cn.bing.com` 则证明这条隧道不是对所有站点都坏。默认 `require: any`，通一个
 > 就算可用；想只发放两边都通的代理就设成 `all`。
 
-### 让 API 和代理共用一个端口
+### 一个端口
 
-`server.api` 可以写成 `same`（也接受 `proxy`，或者直接把 `server.proxy` 的地址抄一遍）：
-
-```yaml
-server:
-  proxy: 127.0.0.1:8080
-  api: same          # REST API 和代理网关共用 127.0.0.1:8080
-```
-
-同一个监听端口上按**请求形状**分流：
+`server.listen` 只有一个地址，HTTP 代理网关和 REST API 共享它。两者不冲突，
+因为请求形状不同：
 
 | 收到的请求 | 判定 | 去向 |
 | --- | --- | --- |
@@ -168,49 +161,25 @@ server:
 | `GET http://host/path`（绝对形式） | 代理请求 | HTTP 网关 |
 | `GET /api/v1/get`（原始形式） | API 请求 | REST API |
 
-> **认证只覆盖代理请求。** `gateway.auth` 只拦代理请求，共用端口时 API 本身仍然是
-> 开放的——谁连上这个端口都能读 `/api/v1/proxies`。所以共用端口只适合监听在受信任的
-> 接口（默认就是 `127.0.0.1`）。服务启动时会为此打一条警告日志。要对外提供服务，就把 API 放回独立端口，或者用防火墙限制来源。
-
-分端口和共端口的选择没有功能差别，纯粹看部署习惯：容器里映射一个端口更省事，本地开发
-分开更好排查。
+> **认证只覆盖代理请求。** `gateway.auth` 只拦代理请求，API 是与它同端口的，
+> 因此始终开放——谁连上这个端口都能读 `/api/v1/proxies`。所以默认只监听
+> `127.0.0.1`；要对外开放就把 `listen` 改成 `0.0.0.0:8080` 并自己加一层防火墙，
+> 或者让 ProxyGate 只监听内网地址。
 
 ### Subscriber（代理来源）
 
-四种：`http`、`file`、`exec`、`lua`。前三者只是取回一段载荷，`lua` 能把「取回什么、
-怎么取、怎么拼」全都写进配置：
+每个订阅源就是**一段 Lua 脚本**：它自己决定去哪里取、怎么翻页、怎么拼装，最后
+**返回一组代理表**（`type` / `ip` / `port` / `auth`）。配置里只写脚本：
 
 ```yaml
 subscribers:
-  - name: provider-a
-    type: http
-    url: https://example.com/proxies.txt
-    format: plaintext        # plaintext（默认）| json | clash
-    timeout: 20s
-    limit: 200               # 最多保留多少个可用代理（0 = 不限）
-    headers:
-      Authorization: Bearer <token>
-
-  - name: local
-    type: file
-    path: ./proxies.txt
-    format: plaintext
-
-  - name: weird-provider
-    type: exec
-    command: [python3, ./subscribers/example.py, --url, https://example.com/weird-api]
-    env:
-      API_TOKEN: "..."
-
   - name: rola-ip
-    type: lua
-    url: https://rola-ip.co/proxy-api/api/v1/proxies   # 不是 ProxyGate 的键 -> 脚本全局变量
-    page_size: 500
     timeout: 60s
     lua_code: |
       local page, pages = 1, 1
+      local result = {}
       repeat
-        local body = fetch_json(url .. "?page=" .. page .. "&pageSize=" .. page_size)
+        local body = fetch_json("https://rola-ip.co/proxy-api/api/v1/proxies?page=" .. page .. "&pageSize=500")
         pages = (body.pagination and body.pagination.totalPages) or 1
         for _, item in ipairs(body.data or {}) do
           local scheme = nil
@@ -224,57 +193,65 @@ subscribers:
             end
           end
           if scheme then
-            print(scheme .. "://" .. item.ip .. ":" .. item.port)
+            table.insert(result, {
+              type = scheme,
+              ip = item.ip,
+              port = item.port,
+              auth = item.auth or ""
+            })
           end
         end
         page = page + 1
       until page > pages
+      return result
+
+  # 脚本也可以写在文件里，端点用额外键传进去
+  - name: my_scraper
+    timeout: 30s
+    target_url: https://api.example.com/data.json   # 不是 ProxyGate 的键 -> 脚本全局变量
+    token: "..."                                    # 同上
+    limit: 500                                      # 最多保留多少个可用代理（0 = 不限）
+    lua_file: ./scripts/my_scraper.lua
 ```
 
 `limit` 是给「一个源返回上万条」准备的：健康探测要把池子里每个代理都探一遍，
-16,000 条在默认并发下就是十二分钟一轮，示例配置里就给那个 2.5 MB 的大源设了
-1000（按返回顺序取，大列表基本是按速度从快到慢排的）。
+上万条在默认并发下就是十几分钟一轮。
 
-subscriber 的唯一职责是产出代理 URL：`exec` 在 stdout 上一行一个，`lua` 在 `print`
-上一行一个。内置解析器覆盖纯文本列表、JSON 接口（数组、裸 `host:port` 字符串、带
-`ip`/`host`/`server` + `port` + 凭据的对象，以及任意层数的包装，例如
-`{"code":200,"data":{"proxies":["1.2.3.4:8080"]}}`）和 Clash / Clash.Meta 的
-`proxies:` 列表。其他格式都交给脚本，见
-[`subscribers/README.md`](subscribers/README.md) 和
-[`subscribers/example.py`](subscribers/example.py)。
+### 用 Lua 写 subscriber
 
-### 用 Lua 写自定义 subscriber
-
-`lua` 订阅源里，凡是 ProxyGate 不认识的键（`name`/`script_name`、`lua_code`、
-`lua_file`、`format`、`timeout`、`limit`、`enabled`、`type` 之外）都会变成脚本里的
-全局变量——这就是脚本拿到参数的方式。脚本里能用的东西：
+脚本里能用的东西：
 
 | 名称 | 说明 |
 | --- | --- |
-| `print(...)` | 每次调用输出一行，多个参数用 tab 连接。**这些行就是候选代理**，再按 `format` 解析（默认 `plaintext`） |
 | `fetch(url)` | 发一次 GET，返回响应体字符串；非 2xx 抛错 |
 | `fetch_json(url)` | 同上，但把响应体解码成 Lua 表 |
 | `json_encode(v)` / `json_decode(s)` | Lua 值与 JSON 字符串互转 |
-| `log(...)` | 以 `info` 级别写进 ProxyGate 日志，不影响输出 |
+| `log(...)` / `print(...)` | 以 `info` 级别写进 ProxyGate 日志。**它们不是输出通道**，代理靠 `return` |
+
+`return` 的每个条目是一个代理表，字段与取值规则：
+
+| 字段 | 说明 |
+| --- | --- |
+| `type` | `http` / `https` / `ssl` → `http`；`socks5` / `socks5h` / `socks` → `socks5h`；`socks4` 或无法识别的名称会被**跳过** |
+| `ip` | 主机名或 IP，`host` / `hostname` / `server` / `address` / `addr` 也可以；IPv6 会自动套方括号 |
+| `port` | 端口，数字或字符串；不写就用协议的默认端口 |
+| `auth` | 可选，`user:password`（也可以只写 `user`），会做百分号编码 |
+
+`https` 归一成 `http`：列表里的 https 指「这个代理能 CONNECT 到 HTTPS」，不是
+「对代理做 TLS」。`socks5` 归一成 `socks5h` 是刻意的：让代理去解析域名，本机 DNS
+被污染时，`socks5://`（本地解析）会把假 IP 交给代理，探测和实际使用都会失败。
+条目也可以直接写成字符串（`"socks5h://user:pass@1.2.3.4:1080"`、`"1.2.3.4:8080"`）；
+既不是表也不是字符串、缺 `ip`、`port` 不是合法端口的条目会记进 `rejected`，不会
+把整个来源判死。
 
 脚本跑在**沙箱**里：不加载 `io`、`os`、`package`、`debug`，`dofile`、`loadfile`、
 `load`、`require` 也被摘掉了，唯一的出口是 `fetch`。`timeout`（缺省 `refresh.timeout`）
 限制整段脚本的墙钟时间，`while true do end` 也会被指令钩子掐断；每次刷新都新建一个
-Lua 状态，脚本之间互不影响。`lua_code` 和 `lua_file` 二选一。
+Lua 状态，脚本之间互不影响。`lua_code` 和 `lua_file` 二选一，两个都给或都不给都是
+配置错误。
 
-之所以用它替代原来的「内置源目录 + `builtin` 类型」：分页、签名、字段拼装这些事
-本来就是脚本的活，写进配置比写进 ProxyGate 更合适——加一个源不再需要发一个版本。
-
-subscriber 返回体里的协议字段也认：`protocol`（字符串）、`protocols`（数组）、
-`"socks4+socks5"` 这种拼接串都能识别。命名规则是：
-
-| 返回体里写的 | 归一化为 | 原因 |
-| --- | --- | --- |
-| `http` / `https` / `ssl` | `http://` | 列表里的 https 指「这个代理能 CONNECT 到 HTTPS」，不是「对代理做 TLS」 |
-| `socks5` / `socks5h` / `socks` | `socks5h://` | 让代理去解析域名：本机 DNS 被污染时，`socks5://`（本地解析）会把假 IP 交给代理，探测和实际使用都会失败 |
-| `socks4` / 其它 | 丢弃 | 无法隧穿 |
-
-同一行既写 `http` 又写 `socks5` 时优先 `http`。
+之所以把这件事交给脚本：分页、签名、字段拼装本来就是脚本的活，写进配置比写进
+ProxyGate 更合适——加一个源不再需要发一个版本。
 
 接受的 URL 写法：
 
@@ -301,18 +278,17 @@ user:pass@1.2.3.4:3128       socks5h://user:pass@[2001:db8::1]:1080
 
 ```console
 $ proxygate
-2026-09-18T10:51:02Z  INFO proxygate is listening proxy=127.0.0.1:8080 api=127.0.0.1:8081 ...
-2026-09-18T10:51:02Z  INFO API documentation help=http://127.0.0.1:8081/help
-2026-09-18T10:51:02Z  INFO fetching subscriber subscriber=scdn kind=http format=json
-2026-09-18T10:51:05Z  INFO subscriber fetched subscriber=scdn found=20 rejected=0 skipped=0 truncated=0 elapsed_ms=2423
-2026-09-18T10:54:20Z  INFO subscriber fetched subscriber=rola-ip found=4439 rejected=0 skipped=0 truncated=0 elapsed_ms=28400
-2026-09-18T10:54:28Z  INFO still downloading subscriber=freeproxy-gh kilobytes=1300 elapsed_ms=130000
-2026-09-18T10:54:50Z  INFO proxygate is ready proxies=5157 alive=66
-2026-09-18T10:55:01Z  INFO hand-out verification passed proxy=http://***:***@1.2.3.4:8080 elapsed_ms=312
+2026-09-18T10:51:02Z  INFO proxygate is listening listen=127.0.0.1:8080 config=Some("./config.yaml") proxies=0 alive=0 auth=false ready=false
+2026-09-18T10:51:02Z  INFO API documentation help=http://127.0.0.1:8080/help
+2026-09-18T10:51:02Z  INFO running subscriber script subscriber=rola-ip
+2026-09-18T10:51:02Z  INFO running subscriber script subscriber=scdn
+2026-09-18T10:51:04Z  INFO subscriber fetched subscriber=scdn found=20 rejected=0 skipped=0 truncated=0 elapsed_ms=1574
+2026-09-18T10:51:37Z  INFO subscriber fetched subscriber=rola-ip found=4479 rejected=0 skipped=0 truncated=0 elapsed_ms=35700
+2026-09-18T10:51:38Z  INFO hand-out verification passed proxy=http://***:***@1.2.3.4:8080 elapsed_ms=312
+2026-09-18T10:55:10Z  INFO proxygate is ready proxies=4499 alive=61
 ```
 
-* 每个订阅源一行：名字、拿到多少、跳过/拒绝/截断、耗时；慢下载每 10 秒报一次
-  字节数（那个 2.5 MB 的 GitHub 列表不会看起来像卡死）。
+* 每个订阅源两行：开始跑脚本，以及拿到多少、跳过/拒绝/截断、耗时。
 * 健康探测每 5 秒报一次进度与存活数。
 * 发放验证每次都会记一行（通过或失败+原因），所以"为什么这个代理没发出来"
   在日志里查得到。
@@ -333,11 +309,11 @@ $ proxygate
 | `GET /` | 以上端点的索引 |
 
 ```console
-$ curl http://127.0.0.1:8081/api/v1/get
+$ curl http://127.0.0.1:8080/api/v1/get
 http://user:pass@1.2.3.4:8080
 
-$ curl -s http://127.0.0.1:8081/api/v1/health
-{"status":"ok","version":"0.4.0","uptime_seconds":42,"generation":3,
+$ curl -s http://127.0.0.1:8080/api/v1/health
+{"status":"ok","version":"0.5.0","uptime_seconds":42,"generation":3,
  "strategy":"random","health_targets":["https://www.google.com/generate_204",
  "https://cn.bing.com/"],"health_require":"any",
  "ready":true,"initializing":false,"initialization_attempts":1,
@@ -346,7 +322,7 @@ $ curl -s http://127.0.0.1:8081/api/v1/health
 # 冷启动还没做完时 status 是 "initializing"，ready 是 false。
 ```
 
-`server.api: same` 时把上面的 `8081` 换成 `8080` 即可，路径不变。
+API 与代理网关同端口，所以上面这些路径和 `curl -x` 用的是同一个地址。
 
 `/get` 有两种 `503`，靠响应体区分：
 
@@ -407,7 +383,7 @@ REST API、HTTP 网关。
 循环——那时判定可能几分钟旧，发出去死代理的概率会明显上升。
 
 `refresh` 是**边抓边落盘**的：每个订阅源一完成就立刻合并进池并写 `cache.json`，
-不等最慢的那个（`freeproxy-gh` 要四分钟）。中途 Ctrl-C 或断电，已经拿到的代理仍
+不等最慢的那个（`rola-ip` 要 35 秒）。中途 Ctrl-C 或断电，已经拿到的代理仍
 然在磁盘上；因为整轮没有跑完，`fetched_at` 不会被更新，所以下次还会重新抓一遍补全。
 
 ## 选择与轮换规则
@@ -512,7 +488,6 @@ GET /api/v1/get  →  进入下一轮，A/B/C 重新可用
 
 ## 安全注意
 
-- **`exec` subscriber 会执行任意命令。** `config.yaml` 属于可信输入，不要加载你不会当
   脚本执行的配置。
 - **REST API 自身没有认证**，默认只监听 `127.0.0.1`——把它暴露出去，等于把你的可用代理
   公开给所有能访问该端口的人。
@@ -544,8 +519,7 @@ cargo build --release
 | --- | --- |
 | `tests/pool.rs` | 去重、使用状态持久化、健康阈值、state 往返 |
 | `tests/selector.rs` | 轮换契约、reuse 窗口、重启后继续轮换 |
-| `tests/subscriber.rs` | file/http/exec、三种格式、失败隔离 |
-| `tests/lua_subscriber.rs` | Lua 脚本：print 输出、参数全局变量、fetch_json、沙箱、超时 |
+| `tests/lua_subscriber.rs` | Lua 脚本：返回值、参数全局变量、翻页、凭据、沙箱、超时、失败隔离 |
 | `tests/gateway.rs` | CONNECT、纯 HTTP、认证、重试、SOCKS5 及 SOCKS5 认证 |
 
 ## 目录结构
@@ -564,7 +538,7 @@ src/
   progress.rs    抓取/探测/发放验证的进度事件
   config.rs      config.yaml 模型、默认值、校验
   model.rs       Proxy、稳定 ID、URL 归一化、小工具编解码
-  subscriber.rs  http/file/exec/lua subscriber、内置解析器、Lua 沙箱
+  subscriber.rs  订阅源脚本的执行、返回值转换、Lua 沙箱
   pool.rs        池子：合并、健康写入、选择（轮次）
   checker.rs     健康探测 + 共享上游 client 缓存
   selector.rs    候选过滤与 random/latency 策略
@@ -574,7 +548,6 @@ src/
   state.rs       state.json / cache.json、RFC 3339 时间戳
   error.rs       整个 crate 共用的错误类型
 assets/          编进二进制的数据（User-Agent 池）
-subscribers/     exec subscriber 契约 + example.py
 tests/           集成测试（进程内假上游）
 SKILL.md         面向 agent 与人的手册（`GET /help` 输出它）
 ```
@@ -589,16 +562,14 @@ SKILL.md         面向 agent 与人的手册（`GET /help` 输出它）
   说明里只有一个 `target`。默认目标是 Google 加 `cn.bing.com`。
 - **从未成功过的代理一次失败即判死**，`health.max_failures` 只对原本可用的代理生效。
 - `https://` 上游在加载列表时就被拒绝，而不是接受之后在 CONNECT 阶段失败。
-- 多了第四种 subscriber `lua`：设计说明只写了 http/file/exec，但免代理池的 API 常常要
-  分页或按字段拼串，把这段逻辑放进配置里的 Lua 脚本，比给每个源写一个 Rust 分支好维护。
-  脚本跑在沙箱里，只有 `fetch` 能出去。
-- 返回体里的协议字段会被归一化（上表），其中 `socks5` → `socks5h` 是刻意的：本机 DNS 被
-  污染时，本地解析会把假地址交给代理。
+- subscriber 只剩一种：Lua 脚本。设计说明写了 http/file/exec 三种，但每个来源的差别
+  本来就在「怎么取、怎么拼」上——那正是脚本擅长的事，写进配置比给每个源加一个 Rust 分支
+  好维护，也不必为了一个新来源发版。脚本跑在沙箱里，唯一的出口是 `fetch`。
+- 脚本的协议字段会被归一化（上表），其中 `socks5` → `socks5h` 是刻意的：本机 DNS 被污染
+  时，本地解析会把假地址交给代理。
 - 每个源都能写 `limit`，因为一次拉上万条代理会让健康探测循环跑不完（`0` = 不限）。
-- `server.api` 支持 `same`，让 REST API 和代理网关共用一个端口（按请求形状分流）。
-- 上一版有一个「内置来源目录 + `builtin` 类型 + `builtin-subscribers` 总开关」，现已删除：
-  分页靠脚本里的循环（页数也从 API 的 `pagination.totalPages` 读），一个源不再需要
-  ProxyGate 发版。同时删掉了 `GET /api/v1/providers`——目录不存在了。
+- `server.listen` 只有一个地址，REST API 和代理网关共用它（按请求形状分流）。分成两个
+  端口时 API 的认证问题并不存在，但同一个进程对外只开一个口更省事，容器里也少一个映射。
 - `serve` 先挂端口、再在后台初始化；未就绪时 REST API 返回 `503` + `Retry-After`，
   而不是假装池子是空的。
 - 文档注释一律写成中文，docs.rs 展示的就是它。`SKILL.md` 保持英文，因为它面向
