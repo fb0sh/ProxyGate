@@ -11,6 +11,7 @@
 //! GET  /api/v1/getua          一个内置 User-Agent（纯文本，或 ?format=json）
 //! GET  /api/v1/proxies        整个代理池，凭据已脱敏
 //! GET  /api/v1/health         存活状态、就绪状态与代理池计数
+//! GET  /metrics               Prometheus 指标
 //! POST /api/v1/refresh        让后台立刻抓取一轮订阅源
 //! POST /api/v1/check          让后台立刻探测一轮代理池
 //! ```
@@ -27,6 +28,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use metrics_exporter_prometheus::PrometheusHandle;
 use serde::{Deserialize, Serialize};
 
 use crate::app::{App, Readiness};
@@ -45,6 +47,8 @@ pub struct ApiState {
     pub app: Arc<App>,
     /// 进程启动时刻，用于计算 `uptime_seconds`。
     pub started: Instant,
+    /// 指标注册表的渲染句柄；没有安装指标时为 `None`，`/metrics` 会说明原因。
+    metrics: Option<PrometheusHandle>,
 }
 
 impl ApiState {
@@ -56,7 +60,16 @@ impl ApiState {
         Self {
             app,
             started: Instant::now(),
+            metrics: None,
         }
+    }
+
+    /// 挂上指标渲染句柄（[`crate::metrics::install`] 的返回值）。
+    ///
+    /// 服务端启动时调用；库的使用者不装指标也能跑，只是 `/metrics` 会是空的。
+    pub fn with_metrics(mut self, handle: PrometheusHandle) -> Self {
+        self.metrics = Some(handle);
+        self
     }
 
     /// 冷启动状态：未就绪时 `/api/v1/get` 返回 `503` 而不是空代理。
@@ -74,6 +87,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/v1/getua", get(get_user_agent))
         .route("/api/v1/proxies", get(list_proxies))
         .route("/api/v1/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/api/v1/refresh", post(trigger_refresh))
         .route("/api/v1/check", post(trigger_check))
         .with_state(state)
@@ -329,6 +343,37 @@ async fn list_proxies(State(state): State<Arc<ApiState>>) -> Json<Vec<ProxyEntry
     Json(proxies)
 }
 
+/// `GET /metrics` —— Prometheus 文本格式的指标。
+///
+/// 两个池子 gauge 在这里现取，所以它们总是和池子一致；其余计数器在各自的
+/// 事件点上累加。没有安装指标时给一段说明，而不是一个空响应。
+async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
+    let Some(handle) = &state.metrics else {
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "# metrics are not installed in this process\n",
+        )
+            .into_response();
+    };
+
+    crate::metrics::set_pool(&state.app.pool.stats());
+    (
+        StatusCode::OK,
+        [
+            // Prometheus 抓取端认这个 content type，`; version=0.0.4` 是它的
+            // 约定写法；charset 放在后面不影响解析。
+            (
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        handle.render(),
+    )
+        .into_response()
+}
+
 /// `GET /api/v1/health` —— 存活状态与代理池计数。
 async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
     let stats = state.app.pool.stats();
@@ -438,6 +483,7 @@ async fn index() -> Json<serde_json::Value> {
             "getua_json": "/api/v1/getua?format=json",
             "proxies": "/api/v1/proxies",
             "health": "/api/v1/health",
+            "metrics": "/metrics",
             "refresh": "POST /api/v1/refresh",
             "check": "POST /api/v1/check",
         },
@@ -465,6 +511,11 @@ mod tests {
         config.health.targets = Some(vec!["https://example.com/generate_204".to_string()]);
         config.health.require = HealthRequirement::All;
         Arc::new(App::new(config, None).expect("test app"))
+    }
+
+    /// 带上指标句柄的共享状态：`/metrics` 只有在装了指标之后才有内容。
+    fn state_with_metrics(app: Arc<App>) -> Arc<ApiState> {
+        Arc::new(ApiState::new(app).with_metrics(crate::metrics::install()))
     }
 
     /// 已就绪、池里有一个已判活代理的共享状态。
@@ -827,6 +878,58 @@ mod tests {
         let body = body_string(response).await;
         assert!(body.starts_with("---\n"), "frontmatter missing");
         assert!(body.contains("/api/v1/get"), "endpoints missing");
+    }
+
+    #[tokio::test]
+    async fn metrics_are_served_in_the_prometheus_format() {
+        let state = state_with_metrics(test_app());
+        // 走一次真实的发放路径，好让 get_total / get_latency_seconds 有数据。
+        crate::metrics::record_get("random", true, Duration::from_millis(42));
+        crate::metrics::record_check(2, 1);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; version=0.0.4; charset=utf-8")
+        );
+
+        let body = body_string(response).await;
+        // 池子 gauge 是抓取时现取的，所以空池子也该有两个 0。
+        assert!(body.contains("proxygate_pool_total 0"), "{body}");
+        assert!(body.contains("proxygate_pool_healthy 0"), "{body}");
+        assert!(body.contains("proxygate_get_total{"), "{body}");
+        assert!(
+            body.contains("proxygate_get_latency_seconds_count{"),
+            "{body}"
+        );
+        assert!(
+            body.contains("proxygate_check_total{result=\"ok\"}"),
+            "{body}"
+        );
+        assert!(body.contains("proxygate_build_info{version="), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_index_lists_the_metrics_endpoint() {
+        let response = router(initializing_state())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        assert!(body.contains("\"/metrics\""), "{body}");
     }
 
     #[tokio::test]

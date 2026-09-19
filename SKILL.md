@@ -82,6 +82,7 @@ curl -x "$(curl -sf http://127.0.0.1:8080/api/v1/get)" \
 | `GET /api/v1/getua?format=json` | `{"user_agent":"Mozilla/5.0 ..."}` |
 | `GET /api/v1/proxies` | the pool as JSON, credentials masked as `***:***` |
 | `GET /api/v1/health` | `{"status":"ok","ready":true,"proxies":{"total":2,"alive":2,"dead":0}, ...}` |
+| `GET /metrics` | Prometheus text: pool size, probe success ratio, hand-out latency |
 | `POST /api/v1/refresh` | `202` — fetch every subscriber now |
 | `POST /api/v1/check` | `202` — probe the whole pool now |
 
@@ -91,6 +92,14 @@ config to run in the first place):
 ```bash
 proxygate --example-config > config.yaml
 ```
+
+`/metrics` is the place to look when the pool is slow or empty: `proxygate_pool_total`
+/ `proxygate_pool_healthy` are gauges read at scrape time, `proxygate_check_total{result}`
+carries the probe success ratio (free proxies fail most probes), and
+`proxygate_get_latency_seconds` is how long a hand-out took *on the server*, including
+the pre-hand-out probe. Compare that with your own client latency: a large gap means
+requests are queueing, not computing. It shares the port with everything else and is
+not authenticated, like the rest of the API.
 
 The two `POST`s only wake the background loops (the server owns the work), so
 they return immediately: watch the logs for progress, then poll

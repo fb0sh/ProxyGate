@@ -271,6 +271,25 @@ user:pass@1.2.3.4:3128       socks5h://user:pass@[2001:db8::1]:1080
 代理（`invalid peer certificate`）——会重新签发流量的代理不是你要的代理，而且客户端只要
 校验证书也用不了它。
 
+## 指标
+
+`GET /metrics` 是 Prometheus 文本，和别的端点共用同一个端口：
+
+| 指标 | 类型 | 标签 | 说明 |
+| --- | --- | --- | --- |
+| `pool_total` / `pool_healthy` | gauge | – | 抓取时刻的池子规模与健康数 |
+| `check_total` | counter | `result=ok\|fail` | 健康探测成功/失败，**免费池子的成功率一眼可见** |
+| `verify_total` | counter | `result=ok\|fail\|fresh` | 发放前验证：通过、失败、判定够新跳过 |
+| `get_total` | counter | `strategy`、`result` | `/api/v1/get` 的分发次数 |
+| `get_latency_seconds` | histogram | `strategy` | 一次发放的服务端耗时（含现探） |
+| `subscriber_fetch_total` / `subscriber_proxies` | counter / histogram | `result` | 订阅源脚本跑得怎么样、一次贡献多少条 |
+| `state_save_total` | counter | `result` | 轮换状态落盘次数 |
+| `build_info` | gauge | `version` | 恒为 1，用来对齐版本 |
+
+名字都带 `proxygate_` 前缀。判断"慢在哪"的关键是比较**客户端延迟**和
+`get_latency_seconds`：两者差很多说明请求在排队，而不是在算。本机的实测基线、
+复现命令和结论都在 [`BENCHMARKS.md`](BENCHMARKS.md)。
+
 ## 日志与进度
 
 服务端没有 stdout 契约要保护，进度与结果都在 **stderr 日志**里（`RUST_LOG`
@@ -306,6 +325,7 @@ $ proxygate
 | `POST /api/v1/check` | `202`：让后台立刻重探一遍代理池 |
 | `GET /help` | 面向 agent 与人的手册（就是 `SKILL.md` 原文，`text/markdown`） |
 | `GET /api/v1/health` | `{"status": "initializing"\|"ok"\|"degraded"\|"empty", "ready": true, "proxies": {...}}` |
+| `GET /metrics` | Prometheus 文本：池子规模、探测成功率、发放延迟 |
 | `GET /` | 以上端点的索引 |
 
 ```console
@@ -508,6 +528,7 @@ GET /api/v1/get  →  进入下一轮，A/B/C 重新可用
 cargo fmt --check
 cargo clippy --all-targets
 cargo test              # 单元 + 集成（内置假上游，不依赖网络）
+python3 scripts/loadtest.py        # 打 /api/v1/get，打印 P50/P95/P99 与指标差值
 cargo doc --no-deps --open   # 中文文档注释，docs.rs 上就是这个
 cargo build --release
 ```
@@ -548,8 +569,10 @@ src/
   state.rs       state.json / cache.json、RFC 3339 时间戳
   error.rs       整个 crate 共用的错误类型
 assets/          编进二进制的数据（User-Agent 池）
+scripts/         开发用脚本（loadtest.py：/get 的延迟与指标基线）
 tests/           集成测试（进程内假上游）
 SKILL.md         面向 agent 与人的手册（`GET /help` 输出它）
+BENCHMARKS.md    性能基线与复现命令
 ```
 
 拆成库之后集成测试能直接驱动真实网关（`tests/common/mod.rs` 放那些假上游），不用起子

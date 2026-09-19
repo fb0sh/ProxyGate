@@ -57,6 +57,7 @@
 //! - [`config`]：`config.yaml` 的解析、默认值与校验。
 //! - [`error`]：全 crate 共用的错误类型及其退出码映射。
 //! - [`gateway`]：转发客户端请求的 HTTP 代理网关。
+//! - [`metrics`]：指标注册表与 `GET /metrics` 的内容。
 //! - [`model`]：代理 URL 的解析、归一化与渲染。
 //! - [`pool`]：进程内的代理池与轮换状态。
 //! - [`progress`]：抓取与探测的进度事件（库只发事件，显示由调用方决定）。
@@ -77,6 +78,7 @@ pub mod checker;
 pub mod config;
 pub mod error;
 pub mod gateway;
+pub mod metrics;
 pub mod model;
 pub mod pool;
 pub mod progress;

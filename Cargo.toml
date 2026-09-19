@@ -53,6 +53,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 rand = "0.10"
+# 指标：`metrics` 是门面，`metrics-exporter-prometheus` 把注册表渲染成
+# Prometheus 文本。默认特性会拖进它自带的 HTTP 监听器和 push gateway，两者
+# 都用不上——我们只借它的注册表，渲染在自己的 `GET /metrics` 上（axum 已经有）。
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+
 # subscribers 用 Lua 写：vendored 自带 Lua 源码（不要求系统装 Lua），
 # async 让脚本里能直接 fetch_json(url) 而不用写 await，send 让 Lua 状态
 # 能待在 tokio 任务里，serialize 用于 JSON <-> Lua 表。

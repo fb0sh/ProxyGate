@@ -537,6 +537,7 @@ impl App {
         let outcomes = self
             .subscribers
             .fetch_all_streaming(self.progress.as_ref(), |outcome| {
+                crate::metrics::record_subscriber(outcome.ok(), outcome.count());
                 if !outcome.ok() {
                     // 面向用户的失败报告由进度接收器负责（命令行的
                     // `✗ 名字 失败：…`、serve 的 LogProgress 警告）。
@@ -640,6 +641,8 @@ impl App {
             .checker
             .check_and_apply_reporting(&self.pool, &proxies, self.progress.as_ref())
             .await;
+        // 探测的成功/失败比是判断"这个池子值不值得留着"的第一手数据。
+        crate::metrics::record_check(report.alive, report.dead);
         self.checked_at.store(
             state::unix_secs(SystemTime::now()).max(0) as u64,
             Ordering::SeqCst,
@@ -695,6 +698,15 @@ impl App {
     /// 顺带一个副作用：每次验证都会把结果写回池子，所以代理池是被"用"干净
     /// 的，而不是只靠周期性的全量探测。
     pub async fn select_for_handout(&self, strategy: Strategy) -> Option<Selection> {
+        // `/api/v1/get` 是最高频的端点，所以它的耗时（含现探）单独记一条。
+        let started = Instant::now();
+        let result = self.select_for_handout_inner(strategy).await;
+        crate::metrics::record_get(strategy.as_str(), result.is_some(), started.elapsed());
+        result
+    }
+
+    /// [`App::select_for_handout`] 的主体，指标在调用方记，失败路径也一样。
+    async fn select_for_handout_inner(&self, strategy: Strategy) -> Option<Selection> {
         let attempts = if self.config.selection.verify {
             self.config.selection.verify_attempts.max(1)
         } else {
@@ -709,6 +721,7 @@ impl App {
                     proxy = %selection.proxy.to_masked_string(),
                     "handing out a proxy with a fresh verdict"
                 );
+                crate::metrics::record_verify("fresh");
                 return Some(selection);
             }
 
@@ -717,6 +730,7 @@ impl App {
             let now = SystemTime::now();
 
             if result.alive {
+                crate::metrics::record_verify("ok");
                 self.pool
                     .record_success(&selection.proxy.id, result.latency, now);
                 self.progress.verify(VerifyEvent {
@@ -731,6 +745,7 @@ impl App {
             }
 
             let error = result.error.unwrap_or_else(|| "unknown error".to_string());
+            crate::metrics::record_verify("fail");
             self.pool
                 .record_failure(&selection.proxy.id, self.config.health.max_failures);
             self.progress.verify(VerifyEvent {
@@ -765,12 +780,24 @@ impl App {
     /// 写入轮换状态，可选择绕过节流。
     pub fn persist(&self, force: bool) -> Result<bool> {
         let now = SystemTime::now();
-        if force {
-            self.store.persist(&self.pool, now)?;
-            Ok(true)
+        let result = if force {
+            self.store.persist(&self.pool, now).map(|_| true)
         } else {
             self.store
                 .persist_throttled(&self.pool, now, PERSIST_INTERVAL)
+        };
+        match result {
+            Ok(wrote) => {
+                // `false` 表示被节流跳过：那不是一次写盘，不计数。
+                if wrote {
+                    crate::metrics::record_state_save(true);
+                }
+                Ok(wrote)
+            }
+            Err(error) => {
+                crate::metrics::record_state_save(false);
+                Err(error)
+            }
         }
     }
 

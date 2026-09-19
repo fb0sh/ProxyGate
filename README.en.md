@@ -300,6 +300,26 @@ themselves. ProxyGate rejects those (`invalid peer certificate`) — a proxy tha
 re-signs traffic is not a proxy you want, and a client that verifies
 certificates could not use it anyway.
 
+## Metrics
+
+`GET /metrics` serves Prometheus text on the same port as everything else. Names carry
+a `proxygate_` prefix:
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `pool_total` / `pool_healthy` | gauge | – | pool size and healthy count, read at scrape time |
+| `check_total` | counter | `result=ok\|fail` | health probes — the probe success ratio of a free pool, in one number |
+| `verify_total` | counter | `result=ok\|fail\|fresh` | pre-hand-out verification: passed, failed, or skipped because the verdict was fresh |
+| `get_total` | counter | `strategy`, `result` | hand-outs |
+| `get_latency_seconds` | histogram | `strategy` | server-side time to hand out one proxy, including the probe |
+| `subscriber_fetch_total` / `subscriber_proxies` | counter / histogram | `result` | how the subscriber scripts went |
+| `state_save_total` | counter | `result` | rotation-state writes |
+| `build_info` | gauge | `version` | always 1; useful for aligning versions |
+
+Compare your client latency with `get_latency_seconds`: a large gap means requests are
+queueing rather than computing. The measured baseline for this machine, with the exact
+commands to reproduce it and what it implies, is in [`BENCHMARKS.md`](BENCHMARKS.md).
+
 ## Logs and progress
 
 There is no stdout contract to protect, so progress and results go to the
@@ -333,6 +353,7 @@ from the log.
 | `POST /api/v1/check`            | `202` — probe the whole pool now                             |
 | `GET /help`                     | this project's manual (`SKILL.md`), as `text/markdown`       |
 | `GET /api/v1/health`            | `{"status": "ok", "proxies": {"total": 2, "alive": 2, ...}}` |
+| `GET /metrics`                  | Prometheus text: pool size, probe success ratio, hand-out latency |
 | `GET /`                         | a small index of the above                                   |
 
 ```console
@@ -554,6 +575,7 @@ selection by geolocation.
 cargo fmt --check
 cargo clippy --all-targets
 cargo test              # unit + integration (fake upstreams, no network)
+python3 scripts/loadtest.py        # hammer /api/v1/get, print P50/P95/P99 + metric deltas
 cargo doc --no-deps --open   # the Chinese API docs, as published on docs.rs
 cargo build --release
 ```
@@ -593,11 +615,14 @@ src/
   gateway.rs     HTTP proxy gateway: CONNECT tunnels, forwarding, auth
   api.rs         axum REST API
   useragent.rs   the built-in user agent pool (100 agents)
+  metrics.rs     the metrics registry behind GET /metrics
   state.rs       state.json / cache.json, RFC 3339 timestamps
   error.rs       error type shared by every module
 assets/          data embedded in the binary (user agent pool)
+scripts/         developer scripts (loadtest.py: /get latency and metric baseline)
 tests/           integration tests with in-process fake upstreams
 SKILL.md         the manual served by `GET /help`
+BENCHMARKS.md    the measured performance baseline and how to reproduce it
 ```
 
 Splitting out the library lets the integration tests drive the real gateway

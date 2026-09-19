@@ -57,8 +57,11 @@ pub async fn run(config_path: Option<std::path::PathBuf>) -> Result<()> {
         },
     ));
 
+    // 指标先装：装得越早，越早开始的计数才不会被丢掉。
+    let metrics = crate::metrics::install();
+
     // API 搭在网关的监听上：两类请求按形状分流。
-    let api_state = Arc::new(ApiState::new(app.clone()));
+    let api_state = Arc::new(ApiState::new(app.clone()).with_metrics(metrics));
     let gateway = Arc::new((*gateway).clone().with_api(api::router(api_state.clone())));
 
     info!(
@@ -70,7 +73,11 @@ pub async fn run(config_path: Option<std::path::PathBuf>) -> Result<()> {
         ready = app.readiness().is_ready(),
         "proxygate is listening"
     );
-    info!(help = %format!("http://{listen}/help"), "API documentation");
+    info!(
+        help = %format!("http://{listen}/help"),
+        metrics = %format!("http://{listen}/metrics"),
+        "API documentation"
+    );
     if !app.readiness().is_ready() {
         info!("the pool is still being initialized; the REST API answers 503 until it is ready");
     }
