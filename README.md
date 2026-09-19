@@ -120,11 +120,14 @@ proxygate --example-config > config.yaml
 | `refresh.timeout` | `20s` | 单个 subscriber 超时 |
 | `health.targets` | Google 204 + `cn.bing.com` | **通过代理**去访问的探测目标，并发探测 |
 | `health.require` | `any` | 目标全部要通（`all`）还是通一个就算（`any`） |
-| `health.interval` | `5m` | 重探**现有池子**的周期，同时也是健康结果缓存有效期（与 `refresh.interval` 无关：那个是多久重新跑一次订阅源脚本） |
+| `health.interval` | `5m` | **可用**代理的重探周期，同时也是健康结果缓存有效期（与 `refresh.interval` 无关：那个是多久重新跑一次订阅源脚本） |
 | `health.timeout` | `3s` | 单个代理的探测超时 |
 | `health.concurrency` | `300` | 同时探测的代理数量——首查速度的关键 |
 | `health.max_failures` | `3` | 原本可用的代理连续失败多少次后判死 |
-| `selection.strategy` | `random` | `random` 或 `latency` |
+| `health.backoff_base` | `5s` | 失败后第一次重试的等待时间，之后每次翻倍 |
+| `health.backoff_max` | `30m` | 失败退避的上限；也是"死代理复活多久被发现"的上限 |
+| `selection.strategy` | `random` | `random`、`latency` 或 `score` |
+| `selection.sample_size` | `32` | `score` 每次发放看多少个候选（`0` = 全部） |
 | `selection.reuse_after` | `30m` | 优先避开这段时间内用过的代理 |
 | `selection.verify` | `true` | 发放前现探选中的代理（判定够新则跳过） |
 | `selection.max_age` | `60s` | 判定比这新就直接用；`0s` 表示每次都探 |
@@ -438,7 +441,27 @@ GET /api/v1/get  →  进入下一轮，A/B/C 重新可用
 
 每个代理都会去访问全部 `health.targets`，同一代理的多个目标**并发**探测（所以多一个目标
 不会让一轮探测时间翻倍），并发上限是 `health.concurrency`。探测期间**不持有任何池子锁**：
-健康事实直接写进条目的原子量，`GET /api/v1/get` 照旧无锁读快照。`health.require` 决定结论：
+健康事实直接写进条目的原子量，`GET /api/v1/get` 照旧无锁读快照。
+
+后台上不是"每轮全量重探"，而是**每个代理有自己的下一次探测时间**：可用的按
+`health.interval`（默认 5m）保鲜，失败的按 `health.backoff_base` 起指数退避
+（5s → 10s → 20s → 40s → … → `health.backoff_max`，默认 30m）。免费池子里 99% 的条目
+是死的——实测一份 1,019 条的池子只有 9 条可用——按可用代理的节奏去重探它们纯属浪费
+带宽和 fd。
+
+算一下探测量（1,010 条死代理 + 9 条活代理）：
+
+| 时间窗 | 旧版（每 5m 全量） | 现在 | 变化 |
+| --- | --- | --- | --- |
+| 头 5 分钟 | 1,019 次 | ~5,059 次 | **+4 倍**（10s/30s/70s/150s 各重试一轮） |
+| 头 1 小时 | 12,228 次 | ~8,188 次 | **-33%** |
+| 退避饱和之后（>1 小时） | 12,228 次/小时 | ~2,128 次/小时 | **-83%** |
+
+前几分钟更勤快是**故意的**：新抓来的死代理值得多确认几次（万一是瞬时故障），
+而确认"它就是死的"之后就不该再按分钟去骚扰它。`POST /api/v1/check` 不看退避，
+立刻全量重探一遍。
+
+`health.require` 决定结论：
 
 | `require` | 判定为可用的条件 | 适用 |
 | --- | --- | --- |
@@ -563,7 +586,7 @@ src/
   subscriber.rs  订阅源脚本的执行、返回值转换、Lua 沙箱
   pool.rs        池子：ArcSwap 不可变快照（无锁读）、合并、健康写入、轮换选择
   checker.rs     健康探测 + 共享上游 client 缓存
-  selector.rs    候选过滤与 random/latency 策略
+  selector.rs    候选过滤与 random/latency/score 策略（含采样打分）
   gateway.rs     HTTP 代理网关：CONNECT 隧道、转发、认证
   api.rs         axum REST API
   useragent.rs   内置 User-Agent 池（100 个桌面 UA）

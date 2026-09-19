@@ -4,8 +4,19 @@ use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
 use proxygate::model::{self, Proxy};
-use proxygate::pool::{HealthRestore, HealthUpdate, ProxyPool};
+use proxygate::pool::{HealthPolicy, HealthRestore, HealthUpdate, ProxyPool};
+use proxygate::selector::{SelectionOptions, Strategy};
 use proxygate::state::StateStore;
+
+/// 测试用的健康策略：判死阈值 3，成功 5 分钟后再探，失败退避 5s 起。
+fn policy() -> HealthPolicy {
+    HealthPolicy {
+        max_failures: 3,
+        ok_delay: Duration::from_secs(300),
+        backoff_base: Duration::from_secs(5),
+        backoff_max: Duration::from_secs(1800),
+    }
+}
 
 fn url(raw: &str) -> url::Url {
     model::normalize(raw).expect("valid proxy url")
@@ -33,7 +44,7 @@ fn mark_alive(pool: &ProxyPool, latency_ms: u64) {
             )
         })
         .collect();
-    pool.apply_health_pass(&updates, 3);
+    pool.apply_health_pass(&updates, &policy());
 }
 
 #[test]
@@ -127,16 +138,21 @@ fn health_pass_counts_failures_up_to_the_threshold() {
         )]
     };
 
-    pool.apply_health_pass(&failure(&id), 3);
+    pool.apply_health_pass(&failure(&id), &policy());
     assert!(pool.get(&id).unwrap().alive, "1 of 3 failures is not fatal");
-    pool.apply_health_pass(&failure(&id), 3);
+    pool.apply_health_pass(&failure(&id), &policy());
     assert!(pool.get(&id).unwrap().alive, "2 of 3 failures is not fatal");
-    pool.apply_health_pass(&failure(&id), 3);
+    pool.apply_health_pass(&failure(&id), &policy());
     let proxy = pool.get(&id).unwrap();
     assert!(!proxy.alive);
     assert_eq!(proxy.failures, 3);
 
-    pool.record_success(&id, Some(Duration::from_millis(5)), SystemTime::now());
+    pool.record_success(
+        &id,
+        Some(Duration::from_millis(5)),
+        SystemTime::now(),
+        &policy(),
+    );
     let proxy = pool.get(&id).unwrap();
     assert!(proxy.alive);
     assert_eq!(proxy.failures, 0);
@@ -147,28 +163,31 @@ fn cached_health_is_restored_verbatim() {
     let pool = proxies(&["1.2.3.4:8080", "5.6.7.8:8080"]);
     let snapshot = pool.snapshot();
 
-    pool.restore_health(&[
-        (
-            snapshot[0].id.clone(),
-            HealthRestore {
-                alive: true,
-                latency: Some(Duration::from_millis(12)),
-                failures: 0,
-                checked_at: Some(SystemTime::now()),
-                probes: Vec::new(),
-            },
-        ),
-        (
-            snapshot[1].id.clone(),
-            HealthRestore {
-                alive: false,
-                latency: None,
-                failures: 2,
-                checked_at: Some(SystemTime::now()),
-                probes: Vec::new(),
-            },
-        ),
-    ]);
+    pool.restore_health(
+        &[
+            (
+                snapshot[0].id.clone(),
+                HealthRestore {
+                    alive: true,
+                    latency: Some(Duration::from_millis(12)),
+                    failures: 0,
+                    checked_at: Some(SystemTime::now()),
+                    probes: Vec::new(),
+                },
+            ),
+            (
+                snapshot[1].id.clone(),
+                HealthRestore {
+                    alive: false,
+                    latency: None,
+                    failures: 2,
+                    checked_at: Some(SystemTime::now()),
+                    probes: Vec::new(),
+                },
+            ),
+        ],
+        &policy(),
+    );
 
     let stats = pool.stats();
     assert_eq!(stats.alive, 1);
@@ -216,8 +235,11 @@ fn empty_pool_has_no_candidates() {
     assert!(pool.is_empty());
     assert!(
         pool.select(
-            proxygate::selector::Strategy::Random,
-            Duration::from_secs(60),
+            SelectionOptions {
+                strategy: Strategy::Random,
+                reuse_after: Duration::from_secs(60),
+                ..Default::default()
+            },
             SystemTime::now()
         )
         .is_none()

@@ -207,7 +207,19 @@ impl StateStore {
     pub fn persist(&self, pool: &ProxyPool, now: SystemTime) -> Result<StateFile> {
         // `usage()` only ever lists proxies that are currently in the pool, so
         // entries for departed proxies disappear by construction.
-        let usage = pool.usage();
+        self.persist_usage(pool.usage(), pool.generation(), now)
+    }
+
+    /// 与 [`StateStore::persist`] 相同，但使用事实由调用方先取好。
+    ///
+    /// 请求路径上的落盘走这条：`usage()` 是无锁快照、很快，而真正的文件 I/O
+    /// 可以搬到阻塞线程池里去做（`App::persist_after_rotation` 就是这么做的）。
+    pub fn persist_usage(
+        &self,
+        usage: Vec<(ProxyId, u64, Option<SystemTime>)>,
+        generation: u64,
+        now: SystemTime,
+    ) -> Result<StateFile> {
         let mut proxies: HashMap<ProxyId, ProxyUsageFile> = HashMap::new();
         for (id, generation, last_used_at) in usage {
             if generation == 0 && last_used_at.is_none() {
@@ -229,7 +241,7 @@ impl StateStore {
         }
 
         let state = StateFile {
-            generation: pool.generation(),
+            generation,
             proxies,
         };
         self.save_state(&state)?;
@@ -246,24 +258,30 @@ impl StateStore {
         now: SystemTime,
         min_interval: Duration,
     ) -> Result<bool> {
+        if !self.claim_write(now, min_interval) {
+            return Ok(false);
+        }
+        self.persist(pool, now)?;
+        Ok(true)
+    }
+
+    /// 抢占一次写入名额：距离上一次写入不足 `min_interval`（或已有别的任务
+    /// 在写）时返回 `false`。
+    ///
+    /// 和写入本身分开，是为了让请求路径能"先占位、再把 I/O 丢给阻塞线程池"，
+    /// 而节流判断仍然留在原地、原子完成。
+    pub fn claim_write(&self, now: SystemTime, min_interval: Duration) -> bool {
         use std::sync::atomic::Ordering;
 
         let seconds = unix_secs(now).max(0) as u64;
         let interval = min_interval.as_secs().max(1);
         let last = self.last_write.load(Ordering::Relaxed);
         if last != 0 && seconds.saturating_sub(last) < interval {
-            return Ok(false);
+            return false;
         }
-        if self
-            .last_write
+        self.last_write
             .compare_exchange(last, seconds, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            // Another task is already writing.
-            return Ok(false);
-        }
-        self.persist(pool, now)?;
-        Ok(true)
+            .is_ok()
     }
 }
 

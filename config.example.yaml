@@ -157,10 +157,22 @@ health:
   # Consecutive failures after which a proxy that was working is considered
   # dead. A proxy that never answered is dead after its first failure.
   max_failures: 3
+  # A failing proxy is retried with exponential backoff: after the first failure
+  # come 10s, 20s, 40s ... up to `backoff_max`, while a *working* proxy is
+  # re-probed every `health.interval`. Free pools are ~99% dead, so retrying them
+  # at the healthy cadence is pure waste — one measured pool had 9 working out of
+  # 1,019. `backoff_max` is also the worst case for noticing that a dead proxy
+  # came back, so keep it within the outage you can tolerate.
+  backoff_base: 5s
+  backoff_max: 30m
 
 selection:
-  # random (spread the load) or latency (prefer the fastest probe).
+  # random (spread the load), latency (prefer the fastest probe), or score
+  # (sample a few candidates and take the best mix of latency, failure count and
+  # how long ago it was last used).
   strategy: random
+  # How many candidates `strategy: score` looks at. 0 scores every candidate.
+  sample_size: 32
   # Prefer proxies that were not handed out within this window.
   reuse_after: 30m
   # Probe the chosen proxy before handing it out, so `/api/v1/get` returns one

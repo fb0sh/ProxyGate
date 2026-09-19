@@ -36,8 +36,8 @@ use tokio_socks::tcp::Socks5Stream;
 use crate::checker::{ClientMode, ProxyClients};
 use crate::error::{Error, Result};
 use crate::model::{self, Proxy, ProxyScheme};
-use crate::pool::{ProxyPool, Selection};
-use crate::selector::Strategy;
+use crate::pool::{HealthPolicy, ProxyPool, Selection};
+use crate::selector::SelectionOptions;
 
 /// 隧道端点使用的 supertrait 别名。
 ///
@@ -58,16 +58,14 @@ type ProxyResult = std::result::Result<ProxyResponse, Infallible>;
 /// 网关除代理池之外需要的全部配置。
 #[derive(Debug, Clone)]
 pub struct GatewayOptions {
-    /// 挑选上游时所使用的选择器策略。
-    pub strategy: Strategy,
-    /// 距上次使用超过该时长后，允许再次选中同一个上游。
-    pub reuse_after: Duration,
     /// 首个上游失败之后额外尝试的次数。
     pub retries: u32,
     /// 连接上游的超时时间。
     pub connect_timeout: Duration,
-    /// 连续失败多少次之后认为上游已失效。
-    pub max_failures: u32,
+    /// 判死与退避规则，透传给代理池。
+    pub policy: HealthPolicy,
+    /// 挑选上游的参数（策略、复用窗口、采样大小）。
+    pub selection: SelectionOptions,
     /// 要求客户端提供的可选 `(用户名, 密码)` 凭据。
     pub credentials: Option<(String, String)>,
 }
@@ -76,11 +74,10 @@ impl Default for GatewayOptions {
     /// 返回内置的默认网关配置。
     fn default() -> Self {
         Self {
-            strategy: Strategy::default(),
-            reuse_after: Duration::from_secs(1800),
             retries: 2,
             connect_timeout: Duration::from_secs(10),
-            max_failures: 3,
+            policy: HealthPolicy::default(),
+            selection: SelectionOptions::default(),
             credentials: None,
         }
     }
@@ -240,11 +237,9 @@ impl Gateway {
 
     /// 按配置的策略挑选一个上游。
     fn select(&self) -> Option<Selection> {
-        let selection = self.pool.select(
-            self.options.strategy,
-            self.options.reuse_after,
-            SystemTime::now(),
-        )?;
+        let selection = self
+            .pool
+            .select(self.options.selection, SystemTime::now())?;
         tracing::debug!(
             upstream = %selection.proxy.to_masked_string(),
             round = selection.round,
@@ -286,6 +281,7 @@ impl Gateway {
                     let pool = self.pool.clone();
                     let id = upstream.id.clone();
                     let latency = upstream.latency;
+                    let policy = self.options.policy;
                     let peer_target = format!("{host}:{port}");
                     tokio::spawn(async move {
                         match on_upgrade.await {
@@ -294,11 +290,21 @@ impl Gateway {
                                 match relay(&mut client, stream, &leftover).await {
                                     Ok((from_client, from_upstream)) => {
                                         tracing::debug!(target = %peer_target, bytes_up = from_client, bytes_down = from_upstream, "tunnel closed");
-                                        pool.record_success(&id, latency, SystemTime::now());
+                                        pool.record_success(
+                                            &id,
+                                            latency,
+                                            SystemTime::now(),
+                                            &policy,
+                                        );
                                     }
                                     Err(error) => {
                                         tracing::debug!(target = %peer_target, error = %error, "tunnel ended with an error");
-                                        pool.record_success(&id, latency, SystemTime::now());
+                                        pool.record_success(
+                                            &id,
+                                            latency,
+                                            SystemTime::now(),
+                                            &policy,
+                                        );
                                     }
                                 }
                             }
@@ -321,9 +327,11 @@ impl Gateway {
                 }
                 Err(error) => {
                     last_error = error.to_string();
-                    let alive = self
-                        .pool
-                        .record_failure(&upstream.id, self.options.max_failures);
+                    let alive = self.pool.record_failure(
+                        &upstream.id,
+                        &self.options.policy,
+                        SystemTime::now(),
+                    );
                     tracing::warn!(
                         upstream = %upstream.to_masked_string(),
                         target = %format!("{host}:{port}"),
@@ -423,8 +431,12 @@ impl Gateway {
             match outgoing.body(body).send().await {
                 Ok(response) => {
                     let latency = started.elapsed();
-                    self.pool
-                        .record_success(&upstream.id, Some(latency), SystemTime::now());
+                    self.pool.record_success(
+                        &upstream.id,
+                        Some(latency),
+                        SystemTime::now(),
+                        &self.options.policy,
+                    );
                     tracing::debug!(
                         upstream = %upstream.to_masked_string(),
                         method = %method,
@@ -450,9 +462,11 @@ impl Gateway {
                             "retrying on another upstream"
                         );
                     } else {
-                        let alive = self
-                            .pool
-                            .record_failure(&upstream.id, self.options.max_failures);
+                        let alive = self.pool.record_failure(
+                            &upstream.id,
+                            &self.options.policy,
+                            SystemTime::now(),
+                        );
                         tracing::warn!(
                             upstream = %upstream.to_masked_string(),
                             url = %uri,

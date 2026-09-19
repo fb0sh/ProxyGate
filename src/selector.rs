@@ -30,6 +30,8 @@ pub trait Candidate {
     fn latency(&self) -> Option<Duration>;
     /// 上一次被分发的时间；`None` 表示从未分发过。
     fn last_used_at(&self) -> Option<SystemTime>;
+    /// 连续失败次数（打分用）。
+    fn failures(&self) -> u32;
 }
 
 impl Candidate for Proxy {
@@ -48,6 +50,10 @@ impl Candidate for Proxy {
     fn last_used_at(&self) -> Option<SystemTime> {
         self.last_used_at
     }
+
+    fn failures(&self) -> u32 {
+        self.failures
+    }
 }
 
 /// 从候选集合中挑选代理的方式。
@@ -59,17 +65,23 @@ pub enum Strategy {
     Random,
     /// 选择测量延迟最低的代理。
     Latency,
+    /// 在采样出的一小批候选里挑分数最低的：延迟 + 失败惩罚 + 闲置时长。
+    ///
+    /// 池子几千条时，全量挑"最快"既慢又容易把负载压到少数几条上；采样
+    /// （[`SelectionOptions::sample_size`]）之后按分数挑，代价是 O(K)。
+    Score,
 }
 
 impl Strategy {
     /// 所有可用的选择策略。
-    pub const ALL: [Strategy; 2] = [Strategy::Random, Strategy::Latency];
+    pub const ALL: [Strategy; 3] = [Strategy::Random, Strategy::Latency, Strategy::Score];
 
     /// 策略的规范小写名称。
     pub const fn as_str(self) -> &'static str {
         match self {
             Strategy::Random => "random",
             Strategy::Latency => "latency",
+            Strategy::Score => "score",
         }
     }
 }
@@ -83,7 +95,7 @@ impl std::str::FromStr for Strategy {
             "random" => Ok(Strategy::Random),
             "latency" | "fastest" => Ok(Strategy::Latency),
             other => Err(Error::Config(format!(
-                "unknown selection strategy `{other}` (expected random or latency)"
+                "unknown selection strategy `{other}` (expected random, latency or score)"
             ))),
         }
     }
@@ -93,6 +105,59 @@ impl std::fmt::Display for Strategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// 一次选择需要的全部参数。
+///
+/// 打包在一起是因为它同时被 [`crate::pool::ProxyPool::select`]、
+/// [`crate::pool::ProxyPool::plan`] 和 [`claim_order`] 用到，而且
+/// [`Strategy::Score`] 的采样大小只有在这里才说得清。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionOptions {
+    /// 用什么策略挑。
+    pub strategy: Strategy,
+    /// 优先避开这段时间内分发过的代理。
+    pub reuse_after: Duration,
+    /// [`Strategy::Score`] 采样多少个候选；`0` 表示不采样（全量打分）。
+    pub sample_size: usize,
+}
+
+impl Default for SelectionOptions {
+    fn default() -> Self {
+        Self {
+            strategy: Strategy::default(),
+            reuse_after: Duration::from_secs(1800),
+            sample_size: DEFAULT_SAMPLE_SIZE,
+        }
+    }
+}
+
+/// [`SelectionOptions::sample_size`] 的默认值。
+pub const DEFAULT_SAMPLE_SIZE: usize = 32;
+
+/// 延迟未知时的惩罚（毫秒）。比任何真实延迟都差，但不是无穷大——真没别的
+/// 可用时它仍然会被选中。
+const UNKNOWN_LATENCY_MS: u64 = 5_000;
+
+/// 每失败一次的惩罚（毫秒）。
+const FAILURE_PENALTY_MS: u64 = 500;
+
+/// [`Strategy::Score`] 的打分：**越小越好**。
+///
+/// 三项：延迟、失败次数、以及距上次分发的时长（越久没被用过、越可能要重新
+/// 验证，所以久一点的排后面）。轮换与 `reuse_after` 已经负责把负载摊开，
+/// 这里只回答"这一批候选里先试谁"。
+pub fn score<C: Candidate>(candidate: &C, now: SystemTime) -> u64 {
+    let latency = candidate
+        .latency()
+        .map(|latency| latency.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(UNKNOWN_LATENCY_MS);
+    let failures = u64::from(candidate.failures()) * FAILURE_PENALTY_MS;
+    let idle = candidate
+        .last_used_at()
+        .map(|last| elapsed(last, now).as_secs() / 10)
+        .unwrap_or(0);
+    latency + failures + idle
 }
 
 /// 对代理池快照应用轮换规则的结果。
@@ -183,6 +248,14 @@ pub fn pick<C: Candidate>(candidates: &[&C], strategy: Strategy) -> Option<usize
             .enumerate()
             .min_by_key(|(_, proxy)| proxy.latency().unwrap_or(Duration::MAX))
             .map(|(index, _)| index),
+        Strategy::Score => {
+            let now = SystemTime::now();
+            candidates
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, proxy): &(usize, &&C)| score::<C>(proxy, now))
+                .map(|(index, _)| index)
+        }
     }
 }
 
@@ -191,9 +264,13 @@ pub fn pick<C: Candidate>(candidates: &[&C], strategy: Strategy) -> Option<usize
 /// 池子用 CAS 认领一个候选：抢不到就试下一个，所以除了"选谁"，还需要"接下来
 /// 试谁"。随机策略从一个随机位置开始往后走（不重复、每个候选都可能排第一），
 /// 延迟策略按延迟从低到高。
-pub fn claim_order<C: Candidate>(candidates: &[&C], strategy: Strategy) -> Vec<usize> {
+pub fn claim_order<C: Candidate>(
+    candidates: &[&C],
+    options: SelectionOptions,
+    now: SystemTime,
+) -> Vec<usize> {
     let mut order: Vec<usize> = (0..candidates.len()).collect();
-    match strategy {
+    match options.strategy {
         Strategy::Random => {
             if candidates.len() > 1 {
                 order.rotate_left(rand::rng().random_range(0..candidates.len()));
@@ -202,8 +279,41 @@ pub fn claim_order<C: Candidate>(candidates: &[&C], strategy: Strategy) -> Vec<u
         Strategy::Latency => {
             order.sort_by_key(|index| candidates[*index].latency().unwrap_or(Duration::MAX))
         }
+        Strategy::Score => {
+            // 先采样 K 个：池子几千条时，全量打分（还带排序）的代价换不来
+            // 等比例的收益。采样之外的候选排在后面，CAS 抢不到时还能继续试。
+            let (mut sampled, rest) = sample_indices(candidates.len(), options.sample_size);
+            sampled.sort_by_key(|index| score(candidates[*index], now));
+            sampled.extend(rest);
+            order = sampled;
+        }
     }
     order
+}
+
+/// 蓄水池采样出 `size` 个下标，返回（采样、其余）。
+///
+/// `size` 为 0 或不小于总数时不采样：直接全量打分（`其余` 为空）。
+fn sample_indices(total: usize, size: usize) -> (Vec<usize>, Vec<usize>) {
+    if size == 0 || size >= total {
+        return ((0..total).collect(), Vec::new());
+    }
+
+    let mut rng = rand::rng();
+    let mut sampled: Vec<usize> = (0..size).collect();
+    for index in size..total {
+        let pick = rng.random_range(0..=index);
+        if pick < size {
+            sampled[pick] = index;
+        }
+    }
+
+    let mut chosen = vec![false; total];
+    for index in &sampled {
+        chosen[*index] = true;
+    }
+    let rest = (0..total).filter(|index| !chosen[*index]).collect();
+    (sampled, rest)
 }
 
 #[cfg(test)]
@@ -216,6 +326,64 @@ mod tests {
         proxy.alive = alive;
         proxy.latency = latency_ms.map(Duration::from_millis);
         proxy
+    }
+
+    #[test]
+    fn score_prefers_fast_proven_and_recently_seen_proxies() {
+        let now = SystemTime::now();
+        let mut slow = proxy("1.1.1.1", true, Some(500));
+        let fast = proxy("2.2.2.2", true, Some(20));
+        let mut failing = proxy("3.3.3.3", true, Some(10));
+        failing.failures = 4;
+        let mut stale = proxy("4.4.4.4", true, Some(10));
+        stale.last_used_at = Some(now - Duration::from_secs(3600));
+        slow.last_used_at = Some(now);
+
+        // 延迟占主导：10ms 的两个里，失败次数少的那个赢。
+        assert!(score(&fast, now) < score(&failing, now));
+        assert!(score(&fast, now) < score(&slow, now));
+        // 闲置时长是第三项：同样 10ms、都没失败过，闲置 1 小时的排后面。
+        let mut recent = proxy("5.5.5.5", true, Some(10));
+        recent.last_used_at = Some(now);
+        assert!(score(&recent, now) < score(&stale, now));
+
+        // 延迟未知的排在任何有测量值的后面，但不是无穷大。
+        let unknown = proxy("6.6.6.6", true, None);
+        assert!(score(&slow, now) < score(&unknown, now));
+    }
+
+    #[test]
+    fn score_sampling_keeps_the_order_a_prefix_of_the_candidates() {
+        // 采样只是"先看这么多"，其余候选仍然在后面排队等 CAS 重试。
+        let proxies: Vec<Proxy> = (1..=100)
+            .map(|i| proxy(&format!("10.0.0.{i}"), true, Some(i)))
+            .collect();
+        let refs: Vec<&Proxy> = proxies.iter().collect();
+        let options = SelectionOptions {
+            strategy: Strategy::Score,
+            reuse_after: Duration::from_secs(1800),
+            sample_size: 8,
+        };
+        let order = claim_order(&refs, options, SystemTime::now());
+        assert_eq!(order.len(), refs.len(), "每个候选都要能轮到");
+        let mut seen = order.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..refs.len()).collect::<Vec<_>>());
+
+        // 前 8 个是从采样里按分数挑的，全在池子最"快"的那一档附近。
+        let best: usize = order[0];
+        assert!(proxies[best].latency.unwrap() <= Duration::from_millis(32));
+
+        // sample_size = 0 表示不采样：第一个就是全局最优。
+        let all = claim_order(
+            &refs,
+            SelectionOptions {
+                sample_size: 0,
+                ..options
+            },
+            SystemTime::now(),
+        );
+        assert_eq!(all[0], 0, "10.0.0.1 的延迟最低");
     }
 
     #[test]

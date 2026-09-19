@@ -125,9 +125,33 @@ pub struct HealthConfig {
     /// 这是首查速度的关键：健康检查要探完拿到的每一条，并发越高整轮越快。
     #[serde(default = "default_health_concurrency")]
     pub concurrency: usize,
+    /// 探测失败后第一次重试的等待时间，YAML 键 `health.backoff_base`，默认 5 秒。
+    ///
+    /// 之后每次失败翻倍，直到 [`HealthConfig::backoff_max`]。免费代理池里绝大多数
+    /// 条目是死的，按成功代理的节奏重探它们纯属浪费带宽和 fd。
+    #[serde(default = "default_backoff_base", deserialize_with = "de::duration")]
+    pub backoff_base: Duration,
+    /// 失败重试的等待上限，YAML 键 `health.backoff_max`，默认 30 分钟。
+    ///
+    /// 这也是"一个死掉的代理多久之后会被重新发现"的上限——所以别设得比
+    /// 你能接受的中断时间更长。
+    #[serde(default = "default_backoff_max", deserialize_with = "de::duration")]
+    pub backoff_max: Duration,
     /// 连续失败多少次后代理被判定为死亡，YAML 键 `health.max_failures`，默认 3。
     #[serde(default = "default_max_failures")]
     pub max_failures: u32,
+}
+
+impl HealthConfig {
+    /// 翻译成代理池认识的健康策略（退避与判死规则）。
+    pub fn policy(&self) -> crate::pool::HealthPolicy {
+        crate::pool::HealthPolicy {
+            max_failures: self.max_failures,
+            ok_delay: self.interval,
+            backoff_base: self.backoff_base,
+            backoff_max: self.backoff_max,
+        }
+    }
 }
 
 impl Default for HealthConfig {
@@ -139,6 +163,8 @@ impl Default for HealthConfig {
             interval: default_health_interval(),
             timeout: default_health_timeout(),
             concurrency: default_health_concurrency(),
+            backoff_base: default_backoff_base(),
+            backoff_max: default_backoff_max(),
             max_failures: default_max_failures(),
         }
     }
@@ -178,6 +204,10 @@ pub struct SelectionConfig {
     /// 选择代理所用的策略，YAML 键 `selection.strategy`，默认 `random`。
     #[serde(default)]
     pub strategy: crate::selector::Strategy,
+    /// `strategy: score` 时一次采样多少个候选再打分，YAML 键
+    /// `selection.sample_size`，默认 32；`0` 表示不采样（全部候选都打分）。
+    #[serde(default = "default_sample_size")]
+    pub sample_size: usize,
     /// 优先选择在该时间窗口内没有被分发过的代理，YAML 键
     /// `selection.reuse_after`，默认 30 分钟。
     #[serde(default = "default_reuse_after", deserialize_with = "de::duration")]
@@ -213,6 +243,7 @@ impl Default for SelectionConfig {
     fn default() -> Self {
         Self {
             strategy: crate::selector::Strategy::default(),
+            sample_size: default_sample_size(),
             reuse_after: default_reuse_after(),
             verify: true,
             max_age: default_verify_max_age(),
@@ -220,6 +251,11 @@ impl Default for SelectionConfig {
             verify_attempts: default_verify_attempts(),
         }
     }
+}
+
+/// `selection.sample_size` 的默认值。
+fn default_sample_size() -> usize {
+    crate::selector::DEFAULT_SAMPLE_SIZE
 }
 
 /// `selection.max_age` 的默认值：判定比这新就直接用。
@@ -541,6 +577,17 @@ impl Config {
                 "health.timeout must be greater than zero".into(),
             ));
         }
+        if self.health.backoff_base.is_zero() {
+            return Err(Error::Config(
+                "health.backoff_base must be greater than zero".into(),
+            ));
+        }
+        if self.health.backoff_max < self.health.backoff_base {
+            return Err(Error::Config(format!(
+                "health.backoff_max ({:?}) must not be smaller than health.backoff_base ({:?})",
+                self.health.backoff_max, self.health.backoff_base
+            )));
+        }
         if self.refresh.interval.is_zero() {
             return Err(Error::Config(
                 "refresh.interval must be greater than zero".into(),
@@ -625,6 +672,15 @@ impl Config {
             }
         }
         platform_cache_dir().unwrap_or_else(|| PathBuf::from(".proxygate"))
+    }
+
+    /// 选择器需要的参数。
+    pub fn selection_options(&self) -> crate::selector::SelectionOptions {
+        crate::selector::SelectionOptions {
+            strategy: self.selection.strategy,
+            reuse_after: self.selection.reuse_after,
+            sample_size: self.selection.sample_size,
+        }
     }
 
     /// 解析后的网关凭据（如果有）。
@@ -866,6 +922,16 @@ fn default_health_timeout() -> Duration {
 /// 150~250 秒，300 并发压到 50~80 秒。
 fn default_health_concurrency() -> usize {
     300
+}
+
+/// `health.backoff_base` 的默认值：5 秒。
+fn default_backoff_base() -> Duration {
+    Duration::from_secs(5)
+}
+
+/// `health.backoff_max` 的默认值：30 分钟。
+fn default_backoff_max() -> Duration {
+    Duration::from_secs(1800)
 }
 
 /// `health.max_failures` 的默认值：3。

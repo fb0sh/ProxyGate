@@ -21,7 +21,7 @@ use tokio::task::JoinSet;
 use crate::config::{HealthConfig, HealthRequirement};
 use crate::error::{Error, Result};
 use crate::model::{ProbeOutcome, Proxy, ProxyId};
-use crate::pool::{HealthUpdate, PoolStats, ProxyPool};
+use crate::pool::{HealthPolicy, HealthUpdate, PoolStats, ProxyPool};
 use crate::progress::{CheckEvent, Progress};
 
 /// 上游客户端用于什么用途；两种用途需要不同的超时与重定向行为。
@@ -213,7 +213,8 @@ pub struct HealthChecker {
     /// 同时在途的检查数量上限。
     concurrency: usize,
     /// 连续失败多少次后判定为失效。
-    max_failures: u32,
+    /// 判死与退避规则，由健康检查统一使用（池子按它安排下一次探测）。
+    policy: HealthPolicy,
     /// 与网关共享的上游客户端缓存。
     clients: Arc<ProxyClients>,
 }
@@ -234,7 +235,7 @@ impl HealthChecker {
                 .collect(),
             require: config.require,
             concurrency: config.concurrency.max(1),
-            max_failures: config.max_failures,
+            policy: config.policy(),
             clients,
         }
     }
@@ -265,7 +266,7 @@ impl HealthChecker {
 
     /// 连续失败多少次后判定为失效。
     pub fn max_failures(&self) -> u32 {
-        self.max_failures
+        self.policy.max_failures
     }
 
     /// 检查所有代理，同时在途的请求不超过 `concurrency` 个。
@@ -387,7 +388,7 @@ impl HealthChecker {
                 )
             })
             .collect();
-        let _stats: PoolStats = pool.apply_health_pass(&updates, self.max_failures);
+        let _stats: PoolStats = pool.apply_health_pass(&updates, &self.policy);
         report
     }
 
@@ -660,7 +661,12 @@ mod tests {
         let pool = ProxyPool::new();
         let (id, _) = pool.insert(normalize("127.0.0.1:1").unwrap());
         // Pretend the proxy was alive before the first pass.
-        pool.record_success(&id, Some(Duration::from_millis(5)), SystemTime::now());
+        pool.record_success(
+            &id,
+            Some(Duration::from_millis(5)),
+            SystemTime::now(),
+            &HealthPolicy::default(),
+        );
 
         let proxies = pool.snapshot();
         checker.check_and_apply(&pool, &proxies).await;

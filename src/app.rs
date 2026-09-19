@@ -255,6 +255,12 @@ pub struct App {
     refresh_now: Notify,
     /// `POST /api/v1/check` 用它把探测循环提前叫醒。
     check_now: Notify,
+    /// "池子里的探测计划变了，重新算一下该睡多久"。
+    ///
+    /// 健康循环睡多久是**算出来的**（最近一个到期探测还差多久）。如果它先睡
+    /// 下、池子随后才被填上（初始化或刷新），那一觉就睡错了——所以任何改变
+    /// 计划的地方都会敲一下这个通知。
+    health_reschedule: Notify,
 }
 
 impl std::fmt::Debug for App {
@@ -359,7 +365,7 @@ impl App {
                     )
                 })
                 .collect();
-            pool.restore_health(&entries);
+            pool.restore_health(&entries, &config.health.policy());
         }
 
         let app = Self {
@@ -389,6 +395,7 @@ impl App {
             verify_checker,
             refresh_now: Notify::new(),
             check_now: Notify::new(),
+            health_reschedule: Notify::new(),
         };
 
         // The cache is the only source of freshness left once `initialize`
@@ -609,12 +616,35 @@ impl App {
     }
 
     /// 探测全部（或仅存活的）代理，并把结果写回代理池。
+    ///
+    /// "全量"只用在两处：首次初始化，以及 `POST /api/v1/check` 这样的显式请求。
+    /// 后台循环走 [`App::check_due`]，只探到点的那些。
     pub async fn check(&self, alive_only: bool) -> Result<CheckReport> {
         if alive_only {
             self.check_where(|proxy| proxy.alive).await
         } else {
             self.check_where(|_| true).await
         }
+    }
+
+    /// 只探测到点的代理（`health.backoff_*` 决定谁到点了）。
+    ///
+    /// 这是后台循环用的版本：免费代理池里绝大多数条目是死的，按成功代理的
+    /// 节奏重探它们只是浪费带宽和 fd。失败退避、成功按 `health.interval`。
+    pub async fn check_due(&self) -> Result<CheckReport> {
+        let now = SystemTime::now();
+        let due = self.pool.due(now);
+        if due.is_empty() {
+            return Ok(CheckReport::default());
+        }
+        self.check_proxies(due).await
+    }
+
+    /// 距离下一个到期探测还有多久；池子为空时返回 `None`。
+    ///
+    /// 健康循环用它决定睡多久，而不是固定按 `health.interval` 醒来。
+    pub fn next_check_in(&self) -> Option<Duration> {
+        self.pool.next_check_in(SystemTime::now())
     }
 
     /// 只探测还没有任何判定结果的代理——`refresh` 新抓到的那批。
@@ -628,10 +658,14 @@ impl App {
 
     /// 探测满足 `keep` 的代理，并把结果写回代理池。
     async fn check_where(&self, keep: impl Fn(&Proxy) -> bool) -> Result<CheckReport> {
-        let _guard = self.busy.lock().await;
-
         let mut proxies = self.pool.snapshot();
         proxies.retain(|proxy| keep(proxy));
+        self.check_proxies(proxies).await
+    }
+
+    /// 探测给定的一批代理，并把结果写回代理池。
+    async fn check_proxies(&self, proxies: Vec<Proxy>) -> Result<CheckReport> {
+        let _guard = self.busy.lock().await;
         if proxies.is_empty() {
             debug!("nothing to check");
             return Ok(CheckReport::default());
@@ -648,16 +682,17 @@ impl App {
             Ordering::SeqCst,
         );
         self.save_cache();
+        // 这一轮改写了每个代理的下次探测时间，唤醒循环重算。
+        self.reschedule_health();
         Ok(report)
     }
 
     /// 挑选一个代理，并记录本次使用。
     pub fn select(&self, strategy: Strategy) -> Option<Selection> {
-        let selection = self.pool.select(
-            strategy,
-            self.config.selection.reuse_after,
-            SystemTime::now(),
-        )?;
+        let mut options = self.config.selection_options();
+        // `App::select` 的调用方（API、发放验证的候选轮换）只关心策略本身。
+        options.strategy = strategy;
+        let selection = self.pool.select(options, SystemTime::now())?;
 
         tracing::debug!(
             proxy = %selection.proxy.to_masked_string(),
@@ -667,10 +702,16 @@ impl App {
             "selected proxy"
         );
 
-        if let Err(error) = self.persist(false) {
-            warn!(error = %error, "cannot persist rotation state");
-        }
+        self.persist_after_rotation();
         Some(selection)
+    }
+
+    /// 让健康循环重新计算下一次唤醒时间。
+    ///
+    /// 由任何改动"谁该在什么时候被探"的地方调用：初始化、刷新、以及每完成
+    /// 一轮探测。
+    fn reschedule_health(&self) {
+        self.health_reschedule.notify_one();
     }
 
     /// 请求后台立刻抓取一轮订阅源。
@@ -731,8 +772,12 @@ impl App {
 
             if result.alive {
                 crate::metrics::record_verify("ok");
-                self.pool
-                    .record_success(&selection.proxy.id, result.latency, now);
+                self.pool.record_success(
+                    &selection.proxy.id,
+                    result.latency,
+                    now,
+                    &self.config.health.policy(),
+                );
                 self.progress.verify(VerifyEvent {
                     proxy: &selection.proxy.to_masked_string(),
                     ok: true,
@@ -746,8 +791,11 @@ impl App {
 
             let error = result.error.unwrap_or_else(|| "unknown error".to_string());
             crate::metrics::record_verify("fail");
-            self.pool
-                .record_failure(&selection.proxy.id, self.config.health.max_failures);
+            self.pool.record_failure(
+                &selection.proxy.id,
+                &self.config.health.policy(),
+                SystemTime::now(),
+            );
             self.progress.verify(VerifyEvent {
                 proxy: &selection.proxy.to_masked_string(),
                 ok: false,
@@ -777,7 +825,45 @@ impl App {
         }
     }
 
+    /// `/get` 与网关在轮换之后调用：把轮换状态写盘，但**不在请求线程上写**。
+    ///
+    /// 节流判断留在原地（原子、纳秒级），真正的文件 I/O 交给阻塞线程池——
+    /// `std::fs::write` 是同步的，池子大时一次几毫秒到几十毫秒，堵在异步任务
+    /// 里就等于堵住 reactor。没有 tokio 运行时（库的使用者直接调 `select`）
+    /// 时退回同步写，行为与以前一致。
+    fn persist_after_rotation(&self) {
+        let now = SystemTime::now();
+        if !self.store.claim_write(now, PERSIST_INTERVAL) {
+            return;
+        }
+
+        let usage = self.pool.usage();
+        let generation = self.pool.generation();
+        let store = self.store.clone();
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || match store.persist_usage(usage, generation, now) {
+                    Ok(_) => crate::metrics::record_state_save(true),
+                    Err(error) => {
+                        crate::metrics::record_state_save(false);
+                        warn!(error = %error, "cannot persist rotation state");
+                    }
+                });
+            }
+            Err(_) => match store.persist_usage(usage, generation, now) {
+                Ok(_) => crate::metrics::record_state_save(true),
+                Err(error) => {
+                    crate::metrics::record_state_save(false);
+                    warn!(error = %error, "cannot persist rotation state");
+                }
+            },
+        }
+    }
+
     /// 写入轮换状态，可选择绕过节流。
+    ///
+    /// 同步版本：关机和缓存写入用它，那里需要一个确定的结果。
     pub fn persist(&self, force: bool) -> Result<bool> {
         let now = SystemTime::now();
         let result = if force {
@@ -1028,24 +1114,55 @@ pub(crate) async fn refresh_loop(
     }
 }
 
-/// 按健康检查间隔重新探测健康状态。
+/// 睡多久就得醒一次的上限。
+///
+/// 池子里最近的一个到期探测可能还在 30 分钟后；睡那么久会让"空转醒来看看"
+/// 变得不灵敏（`POST /api/v1/check` 走的是另一条通知路径，不受影响）。30 秒
+/// 醒来扫一遍几千个条目是微秒级的开销。
+const HEALTH_MAX_SLEEP: Duration = Duration::from_secs(30);
+
+/// 两次唤醒之间的最短间隔，防止退避到 0 时把 CPU 打满。
+const HEALTH_MIN_SLEEP: Duration = Duration::from_millis(50);
+
+/// 按每个代理自己的退避计划重新探测健康状态。
+///
+/// 旧版按 `health.interval` 固定唤醒并**全量重探**：1,019 条池子里只有 9 条
+/// 可能成功，剩下 99.1% 的探测是白花的（实测数据见 `BENCHMARKS.md`）。现在
+/// 每次醒来只探"到点"的那些——成功的按 `health.interval` 保鲜，失败的按
+/// `health.backoff_*` 指数退避，稳定之后每小时探测量降一个数量级。
 pub(crate) async fn health_loop(app: Arc<App>, shutdown: watch::Receiver<bool>) {
-    let mut ticker = tokio::time::interval(app.config.health.interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await;
-
     loop {
-        tokio::select! {
-            _ = wait_for_shutdown(shutdown.clone()) => return,
-            _ = ticker.tick() => {}
-            // `POST /api/v1/check`：客户端要求现在就来一轮。
-            _ = app.check_now.notified() => {
-                info!("health check requested through the API");
-            }
-        }
+        let wait = app
+            .next_check_in()
+            .unwrap_or(HEALTH_MAX_SLEEP)
+            .clamp(HEALTH_MIN_SLEEP, HEALTH_MAX_SLEEP);
 
-        match app.check(false).await {
-            Ok(report) => info!(report = %report.summary(), "health check complete"),
+        let forced = tokio::select! {
+            _ = wait_for_shutdown(shutdown.clone()) => return,
+            _ = tokio::time::sleep(wait) => false,
+            // `POST /api/v1/check`：客户端要求现在就来一轮（全量，不看退避）。
+            _ = app.check_now.notified() => true,
+            // 计划变了（初始化完成、刷新进了新代理、上一轮刚写完下次探测时间）：
+            // 别继续睡那个已经过时的时长，回去重算。
+            _ = app.health_reschedule.notified() => continue,
+        };
+
+        let result = if forced {
+            info!("health check requested through the API");
+            app.check(false).await
+        } else {
+            app.check_due().await
+        };
+
+        match result {
+            // 全量轮次值得一行 info；到点的那种每几秒就有一次，记 debug。
+            Ok(report) if forced => {
+                info!(report = %report.summary(), "health check complete")
+            }
+            Ok(report) if report.checked > 0 => {
+                debug!(report = %report.summary(), "due health checks complete")
+            }
+            Ok(_) => {}
             Err(error) => warn!(error = %error, "health check failed"),
         }
     }
@@ -1292,5 +1409,106 @@ mod tests {
         assert_eq!(summary.added, 2);
         let text = std::fs::read_to_string(&cache).expect("cache");
         assert!(text.contains("9.9.9.9:9999"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+    use crate::config::SubscriberConfig;
+
+    /// 一个订阅源脚本，返回一条指向本地死端口的代理。
+    fn dead_subscriber() -> SubscriberConfig {
+        SubscriberConfig {
+            name: "one".into(),
+            lua_code: Some("return { { type = 'http', ip = '127.0.0.1', port = 1 } }".into()),
+            lua_file: None,
+            timeout: None,
+            limit: None,
+            enabled: true,
+            params: Default::default(),
+        }
+    }
+
+    fn scratch(name: &str) -> Config {
+        let dir = std::env::temp_dir().join(format!("proxygate-app-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = Config::default();
+        config.state.dir = Some(dir);
+        config.health.targets = Some(vec!["http://127.0.0.1:1/".into()]);
+        config.health.timeout = Duration::from_millis(200);
+        config.subscribers = vec![dead_subscriber()];
+        config
+    }
+
+    #[tokio::test]
+    async fn a_failing_proxy_is_only_probed_when_it_is_due() {
+        let mut config = scratch("due");
+        config.health.interval = Duration::from_secs(60);
+        config.health.backoff_base = Duration::from_millis(200);
+        config.health.backoff_max = Duration::from_millis(800);
+
+        let app = Arc::new(App::new(config, None).expect("app"));
+        app.refresh().await.expect("refresh");
+        let first = app.check(false).await.expect("first pass");
+        assert_eq!(first.checked, 1, "the first pass probes everything");
+
+        // 刚探完：立刻再来一次"到点探测"应该是空的。
+        assert!(app.pool.due(SystemTime::now()).is_empty());
+        assert_eq!(app.check_due().await.expect("due").checked, 0);
+        let wait = app.next_check_in().expect("scheduled");
+        // 第一次退避 = base × 2^1 = 400ms（毫秒精度，留点余量）。
+        assert!(wait <= Duration::from_millis(450), "{wait:?}");
+
+        // 等过第一次退避。
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            app.check_due().await.expect("due").checked,
+            1,
+            "the failing proxy must be retried once its backoff elapses"
+        );
+
+        // 第二次退避更长（800ms 上限）：300ms 后还不该到点。
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(app.check_due().await.expect("due").checked, 0);
+    }
+
+    #[tokio::test]
+    async fn a_healthy_proxy_waits_for_the_plain_interval() {
+        let mut config = scratch("healthy");
+        config.health.interval = Duration::from_secs(600);
+        config.health.backoff_base = Duration::from_millis(100);
+        config.subscribers = vec![SubscriberConfig {
+            name: "ok".into(),
+            lua_code: Some("return {}".into()),
+            lua_file: None,
+            timeout: None,
+            limit: None,
+            enabled: true,
+            params: Default::default(),
+        }];
+        let app = Arc::new(App::new(config, None).expect("app"));
+        app.refresh().await.expect("refresh");
+        app.pool
+            .insert(crate::model::normalize("http://127.0.0.1:1").expect("proxy url"));
+
+        let stats = app.pool.apply_health_pass(
+            &[(
+                app.pool.snapshot()[0].id.clone(),
+                crate::pool::HealthUpdate {
+                    alive: true,
+                    latency: Some(Duration::from_millis(5)),
+                    checked_at: SystemTime::now(),
+                    probes: Vec::new(),
+                },
+            )],
+            &app.config.health.policy(),
+        );
+        assert_eq!(stats.alive, 1);
+
+        // 健康的代理按 `health.interval` 排期，而不是退避的几百毫秒。
+        let wait = app.next_check_in().expect("scheduled");
+        assert!(wait > Duration::from_secs(500), "{wait:?}");
+        assert!(app.pool.due(SystemTime::now()).is_empty());
     }
 }

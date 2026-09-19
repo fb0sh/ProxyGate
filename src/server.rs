@@ -48,11 +48,10 @@ pub async fn run(config_path: Option<std::path::PathBuf>) -> Result<()> {
         app.pool.clone(),
         app.clients.clone(),
         GatewayOptions {
-            strategy: app.config.selection.strategy,
-            reuse_after: app.config.selection.reuse_after,
+            selection: app.config.selection_options(),
             retries: app.config.gateway.retries,
             connect_timeout: app.config.gateway.connect_timeout,
-            max_failures: app.config.health.max_failures,
+            policy: app.config.health.policy(),
             credentials: credentials.clone(),
         },
     ));

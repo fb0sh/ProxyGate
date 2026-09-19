@@ -134,12 +134,15 @@ health:
     - https://www.google.com/generate_204
     - https://cn.bing.com/
   require: any               # any (default) or all targets must answer
-  interval: 5m               # how often the *existing* pool is probed again
+  interval: 5m               # how often a *working* proxy is re-probed
   timeout: 3s                # per-proxy probe timeout
   concurrency: 300           # decides how long a first check takes
+  backoff_base: 5s           # a failing proxy is retried 10s, 20s, 40s ...
+  backoff_max: 30m           # ...up to this; also the worst case for noticing a revival
 
 selection:
-  strategy: random           # random | latency
+  strategy: random           # random | latency | score
+  sample_size: 32            # `score` looks at this many candidates per hand-out
   reuse_after: 30m           # prefer proxies not used recently
   verify: true               # probe the chosen proxy before handing it out
   max_age: 60s               # ...unless its verdict is newer than this
@@ -244,6 +247,13 @@ interface.
 * **Health results are per target.** `GET /api/v1/proxies` shows which target
   each proxy reached, and `health.require` decides how many must pass before a
   proxy counts as alive.
+* **Failing proxies back off.** A working proxy is re-probed every
+  `health.interval` (5m); a failing one is retried after `backoff_base` (10s, then
+  20s, 40s … up to `backoff_max`, 30m). Expect *more* probes than a fixed sweep in
+  the first few minutes and about 83% fewer once the backoff saturates; in a free
+  pool ~99% of proxies never recover. `POST /api/v1/check` ignores the schedule and
+  probes everything now. `proxygate_check_total{result="fail"}` is the ratio to
+  watch.
 * **The server needs a writable cache directory** (`~/.cache/proxygate`, or
   `%LOCALAPPDATA%\proxygate` on Windows, or `state.dir` /
   `$PROXYGATE_CACHE_DIR`). If it cannot write, it keeps serving but stops

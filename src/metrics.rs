@@ -192,6 +192,12 @@ mod tests {
         let first = install();
         let second = install();
 
+        // 池子 gauge 由抓取方现取；这里自己记一次，测试就不依赖别的用例先跑。
+        set_pool(&PoolStats {
+            total: 12,
+            alive: 5,
+            ..PoolStats::default()
+        });
         record_check(3, 1);
         record_verify("fresh");
         record_get("random", true, std::time::Duration::from_millis(250));
@@ -210,6 +216,7 @@ mod tests {
             "# HELP proxygate_pool_total",
             "# TYPE proxygate_pool_total gauge",
             "# HELP proxygate_get_latency_seconds",
+            "# TYPE proxygate_get_latency_seconds histogram",
         ] {
             assert!(
                 rendered.contains(needle),

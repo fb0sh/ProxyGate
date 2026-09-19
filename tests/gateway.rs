@@ -15,7 +15,8 @@ use proxygate::checker::ProxyClients;
 use proxygate::config::Config;
 use proxygate::gateway::{Gateway, GatewayOptions};
 use proxygate::model::{self, normalize};
-use proxygate::pool::{HealthUpdate, ProxyPool};
+use proxygate::pool::{HealthPolicy, HealthUpdate, ProxyPool};
+use proxygate::selector::SelectionOptions;
 use proxygate::selector::Strategy;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -41,7 +42,7 @@ fn populate(pool: &ProxyPool, upstreams: &[(String, Duration)]) {
             },
         ));
     }
-    pool.apply_health_pass(&updates, 3);
+    pool.apply_health_pass(&updates, &HealthPolicy::default());
 }
 
 /// Builds a pool whose proxies are already marked alive.
@@ -528,10 +529,16 @@ async fn retries_another_upstream_when_the_first_is_dead() {
     let gateway = start_gateway(
         pool,
         GatewayOptions {
-            strategy: Strategy::Latency,
+            selection: SelectionOptions {
+                strategy: Strategy::Latency,
+                ..SelectionOptions::default()
+            },
             retries: 1,
             connect_timeout: Duration::from_secs(2),
-            max_failures: 1,
+            policy: HealthPolicy {
+                max_failures: 1,
+                ..HealthPolicy::default()
+            },
             ..GatewayOptions::default()
         },
     )

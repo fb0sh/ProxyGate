@@ -123,11 +123,14 @@ but not much else. Start from [`config.example.yaml`](config.example.yaml).
 | `refresh.timeout`     | `20s`                                     | Per-subscriber timeout                                |
 | `health.targets`      | Google 204 + `cn.bing.com`                | URLs fetched *through* each proxy, probed concurrently |
 | `health.require`      | `any`                                     | `any` target may answer, or `all` of them must          |
-| `health.interval`     | `5m`                                      | How often the *existing* pool is probed again, and the verdict cache lifetime |
+| `health.interval`     | `5m`                                      | How often a *working* proxy is re-probed, and the verdict cache lifetime |
 | `health.timeout`      | `3s`                                      | Per-proxy probe timeout                               |
 | `health.concurrency`  | `300`                                     | Proxies probed in parallel — what decides how long the first check takes |
 | `health.max_failures` | `3`                                       | Consecutive failures tolerated for a working proxy    |
-| `selection.strategy`  | `random`                                  | `random` or `latency`                                 |
+| `health.backoff_base` | `5s`                                      | First retry delay for a failing proxy; doubles each time |
+| `health.backoff_max`  | `30m`                                     | Ceiling for that backoff — also the worst case for noticing a revival |
+| `selection.strategy`  | `random`                                  | `random`, `latency` or `score`                        |
+| `selection.sample_size` | `32`                                    | How many candidates `score` looks at (0 = all)        |
 | `selection.reuse_after` | `30m`                                   | Prefer proxies unused in this window                  |
 | `selection.verify`    | `true`                                    | Probe the chosen proxy before handing it out          |
 | `selection.max_age`   | `60s`                                     | Use its verdict if newer than this; `0s` = always probe |
@@ -483,6 +486,26 @@ flight: the checker works on a snapshot and writes the results straight into the
 entries' atomics, so `GET /api/v1/get` keeps reading the pool without waiting for
 it.
 
+The background loop is not a fixed full sweep either: **every proxy carries its
+own next-check time**. A working proxy is re-probed every `health.interval`
+(5m); a failing one backs off from `health.backoff_base` (5s → 10s → 20s → 40s …
+up to `health.backoff_max`, 30m). Free pools run ~99% dead — one measured pool
+had 9 working proxies out of 1,019 — so re-probing them at the healthy cadence is
+bandwidth and file descriptors spent on nothing.
+
+The arithmetic for that pool (1,010 dead + 9 working):
+
+| Window | Before (full sweep every 5m) | Now | Change |
+| --- | --- | --- | --- |
+| First 5 minutes | 1,019 probes | ~5,059 | **4x more** (a round at 10s, 30s, 70s, 150s) |
+| First hour | 12,228 | ~8,188 | **-33%** |
+| After the backoff saturates (>1h) | 12,228/hour | ~2,128/hour | **-83%** |
+
+The extra probing up front is deliberate: a freshly fetched dead proxy is worth
+confirming a few times in case the failure was transient, and once it is clearly
+dead it should not be poked every few minutes. `POST /api/v1/check` ignores the
+schedule and sweeps everything now.
+
 Every target is probed through the proxy, and the targets of one proxy are
 probed **concurrently**, so a second endpoint costs no extra wall clock time.
 `health.require` decides what the results mean:
@@ -612,7 +635,7 @@ src/
   subscriber.rs  subscriber script execution, return-value mapping, Lua sandbox
   pool.rs        the pool: an ArcSwap snapshot (lock-free reads), merges, health updates, rotation
   checker.rs     health checker + shared upstream client cache
-  selector.rs    candidate filtering and the random/latency strategies
+  selector.rs    candidate filtering and the random/latency/score strategies
   gateway.rs     HTTP proxy gateway: CONNECT tunnels, forwarding, auth
   api.rs         axum REST API
   useragent.rs   the built-in user agent pool (100 agents)

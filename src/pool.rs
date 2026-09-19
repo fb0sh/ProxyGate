@@ -27,7 +27,7 @@ use arc_swap::ArcSwap;
 use url::Url;
 
 use crate::model::{ProbeOutcome, Proxy, ProxyId};
-use crate::selector::{self, Candidate, Plan, Strategy};
+use crate::selector::{self, Candidate, Plan, SelectionOptions};
 
 /// 轮次编号从 1 开始，这样新插入的代理（`generation` 为 0）
 /// 会被视为“尚未使用”。
@@ -126,6 +126,8 @@ pub struct Entry {
     round: AtomicU64,
     /// 最近一次被分发的时间（Unix 毫秒，`0` 表示从未分发）。
     used_at_ms: AtomicU64,
+    /// 下一次该被探测的时间（Unix 毫秒，`0` 表示随时可探）。
+    next_check_at_ms: AtomicU64,
     /// 最近一轮健康检查里每个目标的探测结果。写（健康检查）与读（API、持久化）
     /// 都很稀少，用一把小锁比继续塞原子量清楚。
     probes: Mutex<Vec<ProbeOutcome>>,
@@ -133,6 +135,52 @@ pub struct Entry {
 
 /// [`Entry::latency_ms`] 里表示"未知"的值。
 const UNKNOWN_LATENCY_MS: u64 = u64::MAX;
+
+/// 健康探测的节奏：什么时候重探一个代理，以及连续失败几次算死。
+///
+/// 由 `config.health` 翻译而来（[`crate::config::HealthConfig::policy`]），
+/// 池子只负责照着它给每个条目算下一次探测时间。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthPolicy {
+    /// 原本可用的代理连续失败多少次后判死。
+    pub max_failures: u32,
+    /// 探测成功之后隔多久再探（就是 `health.interval`）。
+    pub ok_delay: Duration,
+    /// 失败后退避的起点，之后每次翻倍。
+    pub backoff_base: Duration,
+    /// 失败退避的上限。
+    pub backoff_max: Duration,
+}
+
+impl Default for HealthPolicy {
+    fn default() -> Self {
+        Self {
+            max_failures: 3,
+            ok_delay: Duration::from_secs(300),
+            backoff_base: Duration::from_secs(5),
+            backoff_max: Duration::from_secs(1800),
+        }
+    }
+}
+
+impl HealthPolicy {
+    /// 一次探测之后，隔多久再探它。
+    ///
+    /// 成功就按 [`HealthPolicy::ok_delay`]（判定要保鲜）；失败按 2 的幂退避：
+    /// 死代理第一次失败后 5s 再看一眼，然后 10s、20s……一直退到
+    /// [`HealthPolicy::backoff_max`]。免费池子里 99% 的条目是死的，让它们
+    /// 按成功代理的节奏重探纯属浪费（见 `BENCHMARKS.md`）。
+    pub fn next_delay(&self, alive: bool, failures: u32) -> Duration {
+        if alive {
+            return self.ok_delay;
+        }
+        let shift = failures.min(16);
+        let factor = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
+        self.backoff_base
+            .saturating_mul(factor)
+            .min(self.backoff_max)
+    }
+}
 
 impl Entry {
     /// 从一个普通代理构造条目。
@@ -149,6 +197,9 @@ impl Entry {
             checked_at_ms: AtomicU64::new(millis(proxy.last_checked_at)),
             round: AtomicU64::new(proxy.generation),
             used_at_ms: AtomicU64::new(millis(proxy.last_used_at)),
+            // 从缓存/持久化恢复出来的代理按"立刻可探"处理；真正决定要不要探的是
+            // `restore_health` 之后的退避计划。
+            next_check_at_ms: AtomicU64::new(0),
             probes: Mutex::new(proxy.probes),
         }
     }
@@ -185,35 +236,65 @@ impl Entry {
         from_millis(self.checked_at_ms.load(Ordering::Relaxed))
     }
 
-    /// 重新探测的结果：`alive`、延迟与判定时间，并按规则更新失败计数。
+    /// 重新探测的结果：`alive`、延迟、判定时间与下一次探测时间。
     fn apply_probe(
         &self,
         alive: bool,
         latency: Option<Duration>,
         checked_at: SystemTime,
         probes: Option<&Vec<ProbeOutcome>>,
-        max_failures: u32,
+        policy: &HealthPolicy,
     ) {
         self.checked_at_ms
             .store(millis(Some(checked_at)), Ordering::Relaxed);
         if let Some(probes) = probes {
             *self.probes.lock().unwrap_or_else(PoisonError::into_inner) = probes.clone();
         }
-        if alive {
+
+        let failures = if alive {
             self.alive.store(true, Ordering::Release);
             self.failures.store(0, Ordering::Relaxed);
             if let Some(latency) = latency {
                 self.set_latency(latency);
             }
-            return;
-        }
+            0
+        } else {
+            let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+            // 从未成功过的代理一次失败即判死；原本可用的按 `max_failures` 容忍。
+            let threshold = policy.max_failures.max(1);
+            let was_alive = self.alive.load(Ordering::Acquire);
+            self.alive
+                .store(was_alive && failures < threshold, Ordering::Release);
+            failures
+        };
 
-        let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
-        // 从未成功过的代理一次失败即判死；原本可用的按 `max_failures` 容忍。
-        let threshold = max_failures.max(1);
-        let was_alive = self.alive.load(Ordering::Acquire);
-        self.alive
-            .store(was_alive && failures < threshold, Ordering::Release);
+        self.schedule_next_check(checked_at, alive, failures, policy);
+    }
+
+    /// 记下"下一次该探它"的时刻。
+    fn schedule_next_check(
+        &self,
+        from: SystemTime,
+        alive: bool,
+        failures: u32,
+        policy: &HealthPolicy,
+    ) {
+        let delay = policy.next_delay(alive, failures);
+        self.next_check_at_ms
+            .store(millis(Some(from + delay)), Ordering::Relaxed);
+    }
+
+    /// 下一次该探测的时间；`None` 表示从没安排过（随时可探）。
+    pub fn next_check_at(&self) -> Option<SystemTime> {
+        from_millis(self.next_check_at_ms.load(Ordering::Relaxed))
+    }
+
+    /// 现在是否到了该探测它的时间。
+    pub fn is_due(&self, now: SystemTime) -> bool {
+        match self.next_check_at() {
+            Some(at) => at <= now,
+            None => true,
+        }
     }
 
     fn set_latency(&self, latency: Duration) {
@@ -224,7 +305,12 @@ impl Entry {
     }
 
     /// 记一次成功（健康检查之外，网关在请求成功时也会调）。
-    fn record_success(&self, latency: Option<Duration>, checked_at: SystemTime) {
+    fn record_success(
+        &self,
+        latency: Option<Duration>,
+        checked_at: SystemTime,
+        policy: &HealthPolicy,
+    ) {
         self.alive.store(true, Ordering::Release);
         self.failures.store(0, Ordering::Relaxed);
         if let Some(latency) = latency {
@@ -232,20 +318,24 @@ impl Entry {
         }
         self.checked_at_ms
             .store(millis(Some(checked_at)), Ordering::Relaxed);
+        self.schedule_next_check(checked_at, true, 0, policy);
     }
 
     /// 记一次失败，返回更新后的存活标志。
-    fn record_failure(&self, max_failures: u32) -> bool {
+    fn record_failure(&self, policy: &HealthPolicy, now: SystemTime) -> bool {
         let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
-        let threshold = max_failures.max(1);
+        let threshold = policy.max_failures.max(1);
         let was_alive = self.alive.load(Ordering::Acquire);
         let alive = was_alive && failures < threshold;
         self.alive.store(alive, Ordering::Release);
+        self.schedule_next_check(now, alive, failures, policy);
         alive
     }
 
     /// 还原持久化/缓存里的健康事实（文件里的值就是权威，不做失败计数推断）。
-    fn restore_health(&self, restore: &HealthRestore) {
+    ///
+    /// 同时按退避计划算出下一次探测时间，这样重启不会把所有死代理一次性重探。
+    fn restore_health(&self, restore: &HealthRestore, policy: &HealthPolicy) {
         self.alive.store(restore.alive, Ordering::Release);
         match restore.latency {
             Some(latency) => self.set_latency(latency),
@@ -255,6 +345,9 @@ impl Entry {
         self.checked_at_ms
             .store(millis(restore.checked_at), Ordering::Relaxed);
         *self.probes.lock().unwrap_or_else(PoisonError::into_inner) = restore.probes.clone();
+        if let Some(checked_at) = restore.checked_at {
+            self.schedule_next_check(checked_at, restore.alive, restore.failures, policy);
+        }
     }
 
     /// 还原轮换信息。
@@ -298,6 +391,10 @@ impl Candidate for Arc<Entry> {
 
     fn last_used_at(&self) -> Option<SystemTime> {
         Entry::last_used_at(self)
+    }
+
+    fn failures(&self) -> u32 {
+        self.failures.load(Ordering::Relaxed)
     }
 }
 
@@ -510,7 +607,7 @@ impl ProxyPool {
     pub fn apply_health_pass(
         &self,
         updates: &[(ProxyId, HealthUpdate)],
-        max_failures: u32,
+        policy: &HealthPolicy,
     ) -> PoolStats {
         for (id, update) in updates {
             let Some(entry) = self.entry(id) else {
@@ -523,7 +620,7 @@ impl ProxyPool {
                 update.latency,
                 update.checked_at,
                 Some(&update.probes),
-                max_failures,
+                policy,
             );
         }
         self.stats()
@@ -531,11 +628,15 @@ impl ProxyPool {
 
     /// 从缓存文件恢复健康事实，
     /// 不改变失败计数的语义（文件中的值就是权威）。
-    pub fn restore_health(&self, entries: &[(ProxyId, HealthRestore)]) -> usize {
+    pub fn restore_health(
+        &self,
+        entries: &[(ProxyId, HealthRestore)],
+        policy: &HealthPolicy,
+    ) -> usize {
         let mut applied = 0;
         for (id, restore) in entries {
             if let Some(entry) = self.entry(id) {
-                entry.restore_health(restore);
+                entry.restore_health(restore, policy);
                 applied += 1;
             }
         }
@@ -544,9 +645,15 @@ impl ProxyPool {
 
     /// 记录一次在健康检查器之外的成功使用：
     /// 网关在客户端请求成功时会这样做。
-    pub fn record_success(&self, id: &ProxyId, latency: Option<Duration>, checked_at: SystemTime) {
+    pub fn record_success(
+        &self,
+        id: &ProxyId,
+        latency: Option<Duration>,
+        checked_at: SystemTime,
+        policy: &HealthPolicy,
+    ) {
         if let Some(entry) = self.entry(id) {
-            entry.record_success(latency, checked_at);
+            entry.record_success(latency, checked_at, policy);
         }
     }
 
@@ -555,9 +662,14 @@ impl ProxyPool {
     /// 返回新的存活标志。
     ///
     /// 从未成功过的代理在一次失败后即判为死亡。
-    pub fn record_failure(&self, id: &ProxyId, max_failures: u32) -> Option<bool> {
+    pub fn record_failure(
+        &self,
+        id: &ProxyId,
+        policy: &HealthPolicy,
+        now: SystemTime,
+    ) -> Option<bool> {
         self.entry(id)
-            .map(|entry| entry.record_failure(max_failures))
+            .map(|entry| entry.record_failure(policy, now))
     }
 
     /// 在当前轮次中把代理标记为已使用。
@@ -594,6 +706,28 @@ impl ProxyPool {
             }
             None => false,
         }
+    }
+
+    /// 到点该重探的代理（`next_check_at` 已过或从未安排过）。
+    ///
+    /// 这是健康循环的输入：**不再每轮全量重探**，死代理按退避计划越探越稀。
+    pub fn due(&self, now: SystemTime) -> Vec<Proxy> {
+        self.snapshot
+            .load()
+            .iter()
+            .filter(|entry| entry.is_due(now))
+            .map(|entry| entry.to_proxy())
+            .collect()
+    }
+
+    /// 距离下一个到期探测还有多久；池子为空时返回 `None`。
+    pub fn next_check_in(&self, now: SystemTime) -> Option<Duration> {
+        self.snapshot
+            .load()
+            .iter()
+            .filter_map(|entry| entry.next_check_at())
+            .map(|at| at.duration_since(now).unwrap_or(Duration::ZERO))
+            .min()
     }
 
     /// 使用信息，用于持久化 `state.json`。
@@ -635,12 +769,7 @@ impl ProxyPool {
     /// 分发"依然成立。
     ///
     /// 代理池中没有健康代理时返回 `None`。
-    pub fn select(
-        &self,
-        strategy: Strategy,
-        reuse_after: Duration,
-        now: SystemTime,
-    ) -> Option<Selection> {
+    pub fn select(&self, options: SelectionOptions, now: SystemTime) -> Option<Selection> {
         // 每一轮循环都可能因为"别人刚抢走/刚推进轮次"而重来；上限只是防御，
         // 正常情况下第一次就成。
         const MAX_ROUNDS: usize = 8;
@@ -650,7 +779,7 @@ impl ProxyPool {
             let generation = self.generation.load(Ordering::SeqCst);
             let entries = self.snapshot.load_full();
             let plan: Plan<'_, Arc<Entry>> =
-                selector::plan(entries.as_slice(), generation, reuse_after, now);
+                selector::plan(entries.as_slice(), generation, options.reuse_after, now);
 
             if plan.candidates.is_empty() {
                 return None;
@@ -674,7 +803,7 @@ impl ProxyPool {
                 reset_round = true;
             }
 
-            if let Some(entry) = self.claim(&plan.candidates, strategy, plan.generation, now) {
+            if let Some(entry) = self.claim(&plan.candidates, options, plan.generation, now) {
                 return Some(Selection {
                     proxy: entry.to_proxy(),
                     round: plan.generation,
@@ -695,11 +824,11 @@ impl ProxyPool {
     fn claim(
         &self,
         candidates: &[&Arc<Entry>],
-        strategy: Strategy,
+        options: SelectionOptions,
         round: u64,
         now: SystemTime,
     ) -> Option<Arc<Entry>> {
-        for index in selector::claim_order(candidates, strategy) {
+        for index in selector::claim_order(candidates, options, now) {
             let entry = candidates[index];
             let seen = entry.round.load(Ordering::SeqCst);
             // `round` 之前的轮次才算"这一轮还没发过"；相等说明并发请求先抢到了。
@@ -774,9 +903,99 @@ pub struct OwnedPlan {
 }
 
 #[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    fn policy() -> HealthPolicy {
+        HealthPolicy {
+            max_failures: 3,
+            ok_delay: Duration::from_secs(300),
+            backoff_base: Duration::from_secs(5),
+            backoff_max: Duration::from_secs(1800),
+        }
+    }
+
+    #[test]
+    fn a_successful_probe_is_rescheduled_at_the_plain_interval() {
+        assert_eq!(policy().next_delay(true, 0), Duration::from_secs(300));
+        // 失败次数对成功的调度没有影响（成功会把它清零）。
+        assert_eq!(policy().next_delay(true, 7), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn a_failing_probe_backs_off_geometrically_up_to_the_cap() {
+        let policy = policy();
+        let delays: Vec<u64> = (1..=12)
+            .map(|failures| policy.next_delay(false, failures).as_secs())
+            .collect();
+        assert_eq!(
+            delays,
+            vec![10, 20, 40, 80, 160, 320, 640, 1280, 1800, 1800, 1800, 1800]
+        );
+        // 巨大失败次数不会溢出或回绕。
+        assert_eq!(
+            policy.next_delay(false, u32::MAX),
+            Duration::from_secs(1800)
+        );
+    }
+
+    #[test]
+    fn a_proxy_is_due_immediately_until_it_is_scheduled() {
+        let entry = Entry::from_proxy(Proxy::new(crate::model::normalize("1.1.1.1:8080").unwrap()));
+        let now = SystemTime::now();
+        assert!(entry.is_due(now), "never-checked proxies are due at once");
+        assert!(entry.next_check_at().is_none());
+
+        entry.apply_probe(true, Some(Duration::from_millis(12)), now, None, &policy());
+        assert!(!entry.is_due(now), "just checked: not due again right away");
+        assert!(entry.is_due(now + Duration::from_secs(301)));
+    }
+
+    /// 下一次探测距现在多久（毫秒精度，所以断言都给一点余量）。
+    fn scheduled_in(entry: &Entry, now: SystemTime) -> Duration {
+        entry
+            .next_check_at()
+            .expect("a probe was just applied, so it is scheduled")
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    fn assert_scheduled(entry: &Entry, now: SystemTime, expected: Duration) {
+        let actual = scheduled_in(entry, now);
+        assert!(
+            actual.abs_diff(expected) < Duration::from_millis(5),
+            "expected ~{expected:?} from now, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn a_failing_proxy_gets_retried_more_and_more_slowly() {
+        let entry = Entry::from_proxy(Proxy::new(crate::model::normalize("1.1.1.1:8080").unwrap()));
+        let policy = policy();
+        let mut now = SystemTime::now();
+
+        // 第一次失败：10 秒后再探（base 5s × 2^1）。
+        entry.apply_probe(false, None, now, None, &policy);
+        assert_scheduled(&entry, now, Duration::from_secs(10));
+
+        // 第二次：20 秒。
+        now += Duration::from_secs(10);
+        entry.apply_probe(false, None, now, None, &policy);
+        assert_scheduled(&entry, now, Duration::from_secs(20));
+
+        // 成功一次就回到 ok_delay，失败计数清零。
+        now += Duration::from_secs(20);
+        entry.apply_probe(true, Some(Duration::from_millis(9)), now, None, &policy);
+        assert_scheduled(&entry, now, Duration::from_secs(300));
+        assert_eq!(entry.failures.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::normalize;
+    use crate::selector::Strategy;
 
     fn url(host: &str) -> Url {
         normalize(&format!("{host}:8080")).unwrap()
@@ -833,21 +1052,43 @@ mod tests {
     fn failures_mark_dead_after_threshold() {
         let pool = ProxyPool::new();
         let (id, _) = pool.insert(url("1.1.1.1"));
-        pool.record_success(&id, Some(Duration::from_millis(5)), SystemTime::now());
+        pool.record_success(
+            &id,
+            Some(Duration::from_millis(5)),
+            SystemTime::now(),
+            &HealthPolicy::default(),
+        );
 
-        assert_eq!(pool.record_failure(&id, 3), Some(true));
-        assert_eq!(pool.record_failure(&id, 3), Some(true));
-        assert_eq!(pool.record_failure(&id, 3), Some(false));
+        assert_eq!(
+            pool.record_failure(&id, &HealthPolicy::default(), SystemTime::now()),
+            Some(true)
+        );
+        assert_eq!(
+            pool.record_failure(&id, &HealthPolicy::default(), SystemTime::now()),
+            Some(true)
+        );
+        assert_eq!(
+            pool.record_failure(&id, &HealthPolicy::default(), SystemTime::now()),
+            Some(false)
+        );
         assert_eq!(pool.get(&id).unwrap().failures, 3);
 
-        pool.record_success(&id, Some(Duration::from_millis(5)), SystemTime::now());
+        pool.record_success(
+            &id,
+            Some(Duration::from_millis(5)),
+            SystemTime::now(),
+            &HealthPolicy::default(),
+        );
         let proxy = pool.get(&id).unwrap();
         assert!(proxy.alive);
         assert_eq!(proxy.failures, 0);
 
         // A proxy that never answered is dead after its first failure.
         let (fresh, _) = pool.insert(url("2.2.2.2"));
-        assert_eq!(pool.record_failure(&fresh, 3), Some(false));
+        assert_eq!(
+            pool.record_failure(&fresh, &HealthPolicy::default(), SystemTime::now()),
+            Some(false)
+        );
         assert!(!pool.get(&fresh).unwrap().alive);
     }
 
@@ -879,8 +1120,11 @@ mod tests {
 
         let selection = pool
             .select(
-                Strategy::Random,
-                Duration::from_secs(1800),
+                SelectionOptions {
+                    strategy: Strategy::Random,
+                    reuse_after: Duration::from_secs(1800),
+                    ..Default::default()
+                },
                 SystemTime::now(),
             )
             .unwrap();
@@ -892,8 +1136,11 @@ mod tests {
         // returning nothing.
         let again = pool
             .select(
-                Strategy::Random,
-                Duration::from_secs(1800),
+                SelectionOptions {
+                    strategy: Strategy::Random,
+                    reuse_after: Duration::from_secs(1800),
+                    ..Default::default()
+                },
                 SystemTime::now(),
             )
             .unwrap();
@@ -907,8 +1154,11 @@ mod tests {
         assert!(
             empty
                 .select(
-                    Strategy::Random,
-                    Duration::from_secs(1800),
+                    SelectionOptions {
+                        strategy: Strategy::Random,
+                        reuse_after: Duration::from_secs(1800),
+                        ..Default::default()
+                    },
                     SystemTime::now()
                 )
                 .is_none()

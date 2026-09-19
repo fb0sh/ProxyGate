@@ -14,10 +14,28 @@ use std::time::{Duration, SystemTime};
 
 use proxygate::model::{self};
 use proxygate::pool::{HealthUpdate, ProxyPool, Selection};
-use proxygate::selector::Strategy;
+use proxygate::selector::{SelectionOptions, Strategy};
 use proxygate::state::StateStore;
 
 const REUSE: Duration = Duration::from_secs(30 * 60);
+
+/// 判死阈值 1 的策略：一次失败就算死，用来测"判死之后立刻不再分发"。
+fn strict_policy() -> proxygate::pool::HealthPolicy {
+    proxygate::pool::HealthPolicy {
+        max_failures: 1,
+        ..policy()
+    }
+}
+
+/// 测试用的健康策略：判死阈值 3，成功 5 分钟后再探，失败退避 5s 起。
+fn policy() -> proxygate::pool::HealthPolicy {
+    proxygate::pool::HealthPolicy {
+        max_failures: 3,
+        ok_delay: Duration::from_secs(300),
+        backoff_base: Duration::from_secs(5),
+        backoff_max: Duration::from_secs(1800),
+    }
+}
 
 fn pool_of(hosts: &[&str]) -> ProxyPool {
     let pool = ProxyPool::new();
@@ -34,7 +52,7 @@ fn pool_of(hosts: &[&str]) -> ProxyPool {
             },
         ));
     }
-    pool.apply_health_pass(&updates, 3);
+    pool.apply_health_pass(&updates, &policy());
     pool
 }
 
@@ -49,8 +67,15 @@ fn hosts_of(pool: &ProxyPool) -> Vec<String> {
 }
 
 fn pick(pool: &ProxyPool, now: SystemTime) -> Selection {
-    pool.select(Strategy::Random, REUSE, now)
-        .expect("a healthy proxy is available")
+    pool.select(
+        SelectionOptions {
+            strategy: Strategy::Random,
+            reuse_after: REUSE,
+            ..Default::default()
+        },
+        now,
+    )
+    .expect("a healthy proxy is available")
 }
 
 #[test]
@@ -133,7 +158,7 @@ fn recently_used_proxies_come_back_once_everything_else_is_gone() {
 fn dead_proxies_are_never_selected() {
     let pool = pool_of(&["1.1.1.1:8080", "2.2.2.2:8080"]);
     let dead = pool.snapshot()[0].id.clone();
-    pool.record_failure(&dead, 1);
+    pool.record_failure(&dead, &strict_policy(), SystemTime::now());
 
     for _ in 0..5 {
         let selection = pick(&pool, SystemTime::now());
@@ -146,10 +171,17 @@ fn dead_proxies_are_never_selected() {
         .into_iter()
         .find(|proxy| proxy.alive)
         .unwrap();
-    pool.record_failure(&last_alive.id, 1);
+    pool.record_failure(&last_alive.id, &strict_policy(), SystemTime::now());
     assert!(
-        pool.select(Strategy::Random, REUSE, SystemTime::now())
-            .is_none()
+        pool.select(
+            SelectionOptions {
+                strategy: Strategy::Random,
+                reuse_after: REUSE,
+                ..Default::default()
+            },
+            SystemTime::now()
+        )
+        .is_none()
     );
 }
 
@@ -173,17 +205,31 @@ fn latency_strategy_picks_the_fastest_alive_proxy() {
             },
         ));
     }
-    pool.apply_health_pass(&updates, 3);
+    pool.apply_health_pass(&updates, &policy());
 
     // Fastest first, then the fastest of what is left.
     let now = SystemTime::now();
     let first = pool
-        .select(Strategy::Latency, REUSE, now)
+        .select(
+            SelectionOptions {
+                strategy: Strategy::Latency,
+                reuse_after: REUSE,
+                ..Default::default()
+            },
+            now,
+        )
         .expect("a healthy proxy");
     assert_eq!(first.proxy.host(), "2.2.2.2");
 
     let second = pool
-        .select(Strategy::Latency, REUSE, now)
+        .select(
+            SelectionOptions {
+                strategy: Strategy::Latency,
+                reuse_after: REUSE,
+                ..Default::default()
+            },
+            now,
+        )
         .expect("a healthy proxy");
     assert_eq!(second.proxy.host(), "1.1.1.1");
 }
@@ -278,7 +324,7 @@ fn concurrent_hand_outs_never_repeat_within_a_round() {
 fn a_proxy_marked_dead_disappears_from_selection_immediately() {
     let pool = pool_of(&["1.1.1.1:8080", "2.2.2.2:8080"]);
     let dead = pool.snapshot()[0].id.clone();
-    pool.record_failure(&dead, 1);
+    pool.record_failure(&dead, &strict_policy(), SystemTime::now());
 
     for _ in 0..5 {
         let selection = pick(&pool, SystemTime::now());
@@ -305,7 +351,7 @@ fn merged_proxies_are_visible_to_selection() {
                 probes: Vec::new(),
             },
         )],
-        3,
+        &policy(),
     );
 
     let selection = pick(&pool, SystemTime::now());
