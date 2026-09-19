@@ -119,14 +119,9 @@ pub struct Egress {
 impl Egress {
     /// 从池子里挑一个健康代理；池子空或全死时返回 `None`。
     fn pick(&self) -> Option<Url> {
-        let selection = self.pool.select(self.options, SystemTime::now())?;
-        // 日志里能看出"这次抓取是从哪个代理出去的"——排查某源为何慢/失败时
-        // 这是第一个要看的线索。
-        tracing::debug!(
-            proxy = %selection.proxy.to_masked_string(),
-            "fetching through a pooled proxy"
-        );
-        Some(selection.proxy.url.clone())
+        self.pool
+            .select(self.options, SystemTime::now())
+            .map(|selection| selection.proxy.url.clone())
     }
 
     /// 该代理对应的客户端，按需创建并缓存。
@@ -616,12 +611,16 @@ fn egress_attempts(
                 return;
             };
             // `select` 的轮换本来就会换一个，这里再兜一次底：同一个代理试两遍没意义。
-            if !attempts
+            if attempts
                 .iter()
                 .any(|attempt| attempt.as_ref() == Some(&proxy))
             {
-                attempts.push(Some(proxy));
+                // 又拿到已经排好的代理，说明池子里没别的可选了（只有一个健康代理，
+                // 或者能用的都被排进来了）。再问下去只会重复认领、重复打日志，
+                // 所以就此收工。
+                return;
             }
+            attempts.push(Some(proxy));
         }
     };
 
@@ -681,13 +680,18 @@ async fn fetch_body(
     for attempt in attempts {
         let request_client = match &attempt {
             None => client.clone(),
-            Some(proxy) => match egress.expect("a proxy implies an egress").client(proxy) {
-                Ok(client) => client,
-                Err(error) => {
-                    last_error = format!("{url}: cannot use proxy {proxy}: {error}");
-                    continue;
+            Some(proxy) => {
+                // 日志里能看出"这次抓取真的从哪个代理出去了"——排查某源为何慢或
+                // 失败时，这是第一个要看的线索。排在候选里但没试到的不记。
+                tracing::debug!(proxy = %crate::model::render_url(proxy, false), "fetching through a pooled proxy");
+                match egress.expect("a proxy implies an egress").client(proxy) {
+                    Ok(client) => client,
+                    Err(error) => {
+                        last_error = format!("{url}: cannot use proxy {proxy}: {error}");
+                        continue;
+                    }
                 }
-            },
+            }
         };
 
         let mut request = request_client.get(url).timeout(timeout);
@@ -1074,30 +1078,37 @@ mod tests {
 
     #[test]
     fn the_egress_order_prefers_the_pool_or_direct_as_configured() {
-        // 池子里三条健康代理（借本地假上游指代），分别验证三种策略的顺序。
-        let pool = Arc::new(ProxyPool::new());
-        for port in [18081, 18082, 18083] {
-            let (id, _) =
-                pool.insert(crate::model::normalize(&format!("127.0.0.1:{port}")).unwrap());
-            pool.apply_health_pass(
-                &[(
-                    id,
-                    crate::pool::HealthUpdate {
-                        alive: true,
-                        latency: Some(Duration::from_millis(1)),
-                        checked_at: SystemTime::now(),
-                        probes: Vec::new(),
-                    },
-                )],
-                &crate::pool::HealthPolicy::default(),
-            );
+        // 建一个装着指定数量健康代理的池子（借本地假上游的地址指代）。
+        fn healthy_pool(ports: &[u16]) -> Arc<ProxyPool> {
+            let pool = Arc::new(ProxyPool::new());
+            for port in ports {
+                let (id, _) =
+                    pool.insert(crate::model::normalize(&format!("127.0.0.1:{port}")).unwrap());
+                pool.apply_health_pass(
+                    &[(
+                        id,
+                        crate::pool::HealthUpdate {
+                            alive: true,
+                            latency: Some(Duration::from_millis(1)),
+                            checked_at: SystemTime::now(),
+                            probes: Vec::new(),
+                        },
+                    )],
+                    &crate::pool::HealthPolicy::default(),
+                );
+            }
+            pool
         }
-        let egress = Egress {
-            pool,
-            options: crate::selector::SelectionOptions::default(),
-            timeout: Duration::from_secs(1),
-            clients: Mutex::new(HashMap::new()),
-        };
+        fn egress_with(pool: Arc<ProxyPool>) -> Egress {
+            Egress {
+                pool,
+                options: crate::selector::SelectionOptions::default(),
+                timeout: Duration::from_secs(1),
+                clients: Mutex::new(HashMap::new()),
+            }
+        }
+
+        let egress = egress_with(healthy_pool(&[18081, 18082, 18083]));
 
         // `direct` 只有一条直连。
         assert_eq!(
@@ -1116,13 +1127,22 @@ mod tests {
             assert!(url.host_str() == Some("127.0.0.1"), "{url}");
         }
         // 三个代理互不相同。
-        let mut proxies: Vec<String> = attempts
+        let proxies: Vec<String> = attempts
             .iter()
             .filter_map(|attempt| attempt.as_ref().map(|url| url.to_string()))
             .collect();
-        let before = proxies.len();
-        proxies.dedup();
-        assert_eq!(proxies.len(), before, "不该重复试同一个代理");
+        let mut unique = proxies.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), proxies.len(), "不该重复试同一个代理");
+
+        // 池子里只有一个健康代理时，排一条代理就够了——不该为了凑满三条反复
+        // 向池子认领（那只会白占轮换名额、白打日志）。
+        let single = egress_with(healthy_pool(&[18081]));
+        let attempts = egress_attempts(EgressPolicy::Pool, Some(&single), false);
+        assert_eq!(attempts.len(), 2, "{attempts:?}");
+        assert!(attempts[0].is_some());
+        assert_eq!(attempts[1], None);
 
         // `fallback` 先直连，再借代理。
         let attempts = egress_attempts(EgressPolicy::Fallback, Some(&egress), false);
