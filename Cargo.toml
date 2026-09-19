@@ -53,6 +53,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 rand = "0.10"
+# 代理池的读路径用不可变快照：`/get` 和网关只 load 一次 Arc，不拿锁也不克隆
+# 整个池子（5,000 条时那是每次请求 1.7ms 的持锁时间，实测见 BENCHMARKS.md）。
+arc-swap = "1"
+
 # 指标：`metrics` 是门面，`metrics-exporter-prometheus` 把注册表渲染成
 # Prometheus 文本。默认特性会拖进它自带的 HTTP 监听器和 push gateway，两者
 # 都用不上——我们只借它的注册表，渲染在自己的 `GET /metrics` 上（axum 已经有）。

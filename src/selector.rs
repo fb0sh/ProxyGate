@@ -16,6 +16,40 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::model::Proxy;
 
+/// 选择器需要知道的、关于一个候选代理的**只读事实**。
+///
+/// 之所以抽这层：选择在热点路径上跑，池子里的条目把可变事实存在原子量里
+/// （[`crate::pool::Entry`]），而 API、持久化和测试用的是普通的 [`Proxy`]
+/// 副本。选择逻辑只关心下面这四个问题，两边都答得上来就够了。
+pub trait Candidate {
+    /// 当前是否健康。
+    fn is_alive(&self) -> bool;
+    /// 上一次被分发到的轮次；`0` 表示从未分发过。
+    fn round(&self) -> u64;
+    /// 最近一次测量到的延迟；`None` 表示未知。
+    fn latency(&self) -> Option<Duration>;
+    /// 上一次被分发的时间；`None` 表示从未分发过。
+    fn last_used_at(&self) -> Option<SystemTime>;
+}
+
+impl Candidate for Proxy {
+    fn is_alive(&self) -> bool {
+        self.alive
+    }
+
+    fn round(&self) -> u64 {
+        self.generation
+    }
+
+    fn latency(&self) -> Option<Duration> {
+        self.latency
+    }
+
+    fn last_used_at(&self) -> Option<SystemTime> {
+        self.last_used_at
+    }
+}
+
 /// 从候选集合中挑选代理的方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -63,9 +97,9 @@ impl std::fmt::Display for Strategy {
 
 /// 对代理池快照应用轮换规则的结果。
 #[derive(Debug)]
-pub struct Plan<'a> {
+pub struct Plan<'a, C: Candidate> {
     /// 可以被分发的代理，优先级最高的在最前。
-    pub candidates: Vec<&'a Proxy>,
+    pub candidates: Vec<&'a C>,
     /// 该选择所属的轮次（可能是当前轮次加一）。
     pub generation: u64,
     /// 调用方是否必须推进代理池的轮次。
@@ -77,23 +111,23 @@ pub struct Plan<'a> {
 }
 
 /// 应用轮换规则。纯函数：不加锁，也不读取时钟。
-pub fn plan<'a>(
-    proxies: &'a [Proxy],
+pub fn plan<'a, C: Candidate>(
+    proxies: &'a [C],
     generation: u64,
     reuse_after: Duration,
     now: SystemTime,
-) -> Plan<'a> {
-    let healthy: Vec<&Proxy> = proxies.iter().filter(|proxy| proxy.alive).collect();
-    let unused_this_round: Vec<&Proxy> = healthy
+) -> Plan<'a, C> {
+    let healthy: Vec<&C> = proxies.iter().filter(|proxy| proxy.is_alive()).collect();
+    let unused_this_round: Vec<&C> = healthy
         .iter()
         .copied()
-        .filter(|proxy| proxy.generation < generation)
+        .filter(|proxy| proxy.round() < generation)
         .collect();
 
     let healthy_count = healthy.len();
     let used_this_round = healthy_count - unused_this_round.len();
 
-    let (generation, reset_round, pool): (u64, bool, Vec<&Proxy>) =
+    let (generation, reset_round, pool): (u64, bool, Vec<&C>) =
         if unused_this_round.is_empty() && !healthy.is_empty() {
             // Every healthy proxy has been handed out: start the next round right
             // away, even if `reuse_after` has not elapsed yet.
@@ -103,10 +137,10 @@ pub fn plan<'a>(
         };
 
     // Second tier: proxies that were not used within the reuse window.
-    let not_recent: Vec<&Proxy> = pool
+    let not_recent: Vec<&C> = pool
         .iter()
         .copied()
-        .filter(|proxy| !used_recently(proxy, reuse_after, now))
+        .filter(|proxy| !used_recently(*proxy, reuse_after, now))
         .collect();
 
     let candidates = if not_recent.is_empty() {
@@ -125,9 +159,9 @@ pub fn plan<'a>(
 }
 
 /// 代理是否在复用时间窗内被分发过。
-pub fn used_recently(proxy: &Proxy, reuse_after: Duration, now: SystemTime) -> bool {
+pub fn used_recently<C: Candidate>(proxy: &C, reuse_after: Duration, now: SystemTime) -> bool {
     proxy
-        .last_used_at
+        .last_used_at()
         .map(|last| elapsed(last, now) < reuse_after)
         .unwrap_or(false)
 }
@@ -138,7 +172,7 @@ fn elapsed(from: SystemTime, now: SystemTime) -> Duration {
 }
 
 /// 从候选集合中挑选一个下标。
-pub fn pick(candidates: &[&Proxy], strategy: Strategy) -> Option<usize> {
+pub fn pick<C: Candidate>(candidates: &[&C], strategy: Strategy) -> Option<usize> {
     if candidates.is_empty() {
         return None;
     }
@@ -147,9 +181,29 @@ pub fn pick(candidates: &[&Proxy], strategy: Strategy) -> Option<usize> {
         Strategy::Latency => candidates
             .iter()
             .enumerate()
-            .min_by_key(|(_, proxy)| proxy.latency.unwrap_or(Duration::MAX))
+            .min_by_key(|(_, proxy)| proxy.latency().unwrap_or(Duration::MAX))
             .map(|(index, _)| index),
     }
+}
+
+/// 按策略给出**认领顺序**（下标）。
+///
+/// 池子用 CAS 认领一个候选：抢不到就试下一个，所以除了"选谁"，还需要"接下来
+/// 试谁"。随机策略从一个随机位置开始往后走（不重复、每个候选都可能排第一），
+/// 延迟策略按延迟从低到高。
+pub fn claim_order<C: Candidate>(candidates: &[&C], strategy: Strategy) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    match strategy {
+        Strategy::Random => {
+            if candidates.len() > 1 {
+                order.rotate_left(rand::rng().random_range(0..candidates.len()));
+            }
+        }
+        Strategy::Latency => {
+            order.sort_by_key(|index| candidates[*index].latency().unwrap_or(Duration::MAX))
+        }
+    }
+    order
 }
 
 #[cfg(test)]
@@ -175,7 +229,8 @@ mod tests {
 
     #[test]
     fn empty_pool_yields_no_candidates_and_no_reset() {
-        let plan = plan(&[], 1, Duration::from_secs(1800), SystemTime::now());
+        let empty: [Proxy; 0] = [];
+        let plan = plan(&empty, 1, Duration::from_secs(1800), SystemTime::now());
         assert!(plan.candidates.is_empty());
         assert!(!plan.reset_round);
         assert_eq!(plan.generation, 1);
@@ -257,7 +312,8 @@ mod tests {
 
     #[test]
     fn pick_of_nothing_is_none() {
-        assert_eq!(pick(&[], Strategy::Random), None);
-        assert_eq!(pick(&[], Strategy::Latency), None);
+        let empty: [&Proxy; 0] = [];
+        assert_eq!(pick(&empty, Strategy::Random), None);
+        assert_eq!(pick(&empty, Strategy::Latency), None);
     }
 }

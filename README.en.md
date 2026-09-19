@@ -478,9 +478,10 @@ handed out first — new proxies get exercised instead of gathering dust.
 
 For every proxy the checker asks three questions: can a request be made through
 it, did the request succeed, and how long did it take. Concurrency is bounded by
-a semaphore (`health.concurrency`), and the pool lock is never held while a
-request is in flight — the checker works on a snapshot and writes results back
-in one short critical section.
+a semaphore (`health.concurrency`), and no lock is held while a request is in
+flight: the checker works on a snapshot and writes the results straight into the
+entries' atomics, so `GET /api/v1/get` keeps reading the pool without waiting for
+it.
 
 Every target is probed through the proxy, and the targets of one proxy are
 probed **concurrently**, so a second endpoint costs no extra wall clock time.
@@ -609,7 +610,7 @@ src/
   config.rs      config.yaml model, defaults, validation
   model.rs       Proxy, stable ids, URL normalization, small codecs
   subscriber.rs  subscriber script execution, return-value mapping, Lua sandbox
-  pool.rs        the pool: merge, health updates, selection (rounds)
+  pool.rs        the pool: an ArcSwap snapshot (lock-free reads), merges, health updates, rotation
   checker.rs     health checker + shared upstream client cache
   selector.rs    candidate filtering and the random/latency strategies
   gateway.rs     HTTP proxy gateway: CONNECT tunnels, forwarding, auth

@@ -437,7 +437,8 @@ GET /api/v1/get  →  进入下一轮，A/B/C 重新可用
 ## 健康探测
 
 每个代理都会去访问全部 `health.targets`，同一代理的多个目标**并发**探测（所以多一个目标
-不会让一轮探测时间翻倍）。`health.require` 决定结论：
+不会让一轮探测时间翻倍），并发上限是 `health.concurrency`。探测期间**不持有任何池子锁**：
+健康事实直接写进条目的原子量，`GET /api/v1/get` 照旧无锁读快照。`health.require` 决定结论：
 
 | `require` | 判定为可用的条件 | 适用 |
 | --- | --- | --- |
@@ -560,7 +561,7 @@ src/
   config.rs      config.yaml 模型、默认值、校验
   model.rs       Proxy、稳定 ID、URL 归一化、小工具编解码
   subscriber.rs  订阅源脚本的执行、返回值转换、Lua 沙箱
-  pool.rs        池子：合并、健康写入、选择（轮次）
+  pool.rs        池子：ArcSwap 不可变快照（无锁读）、合并、健康写入、轮换选择
   checker.rs     健康探测 + 共享上游 client 缓存
   selector.rs    候选过滤与 random/latency 策略
   gateway.rs     HTTP 代理网关：CONNECT 隧道、转发、认证

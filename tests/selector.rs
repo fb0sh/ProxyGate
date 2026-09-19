@@ -8,6 +8,8 @@
 //!   immediately instead of waiting for the window to expire;
 //! * the round survives a process restart.
 
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 use proxygate::model::{self};
@@ -229,4 +231,100 @@ fn selection_reports_its_own_diagnostics() {
         "the proxy used in this round is no longer a candidate"
     );
     assert!(!second.reset_round);
+}
+
+/// 并发分发：20 个健康代理、20 个线程同时 `select`，一轮里不许重复。
+///
+/// 这是 CAS 认领的回归测试——旧版靠写锁保证，新版靠条目上的
+/// `compare_exchange`；把它弄丢的话，这里会看到同一个代理被发两次。
+#[test]
+fn concurrent_hand_outs_never_repeat_within_a_round() {
+    let hosts: Vec<String> = (1..=20).map(|i| format!("10.0.0.{i}:8080")).collect();
+    let borrowed: Vec<&str> = hosts.iter().map(String::as_str).collect();
+    let pool = Arc::new(pool_of(&borrowed));
+    let now = SystemTime::now();
+
+    let barrier = Arc::new(Barrier::new(hosts.len()));
+    let handles: Vec<_> = (0..hosts.len())
+        .map(|_| {
+            let pool = pool.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                pick(&pool, now).proxy.host().to_string()
+            })
+        })
+        .collect();
+
+    let mut handed_out: Vec<String> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("thread"))
+        .collect();
+    let total = handed_out.len();
+    handed_out.sort();
+    handed_out.dedup();
+    assert_eq!(
+        handed_out.len(),
+        total,
+        "一轮内每个健康代理只能被分发一次：{handed_out:?}"
+    );
+}
+
+/// 判死之后立刻就不再分发它——不需要重建快照。
+///
+/// 快照只记"有哪些代理"，死活读的是条目里的原子量；这个测试保证后者没被
+/// 漏掉（否则池子里死掉的代理会一直被发出去，直到下一次重建）。
+#[test]
+fn a_proxy_marked_dead_disappears_from_selection_immediately() {
+    let pool = pool_of(&["1.1.1.1:8080", "2.2.2.2:8080"]);
+    let dead = pool.snapshot()[0].id.clone();
+    pool.record_failure(&dead, 1);
+
+    for _ in 0..5 {
+        let selection = pick(&pool, SystemTime::now());
+        assert_ne!(selection.proxy.id, dead);
+        assert_eq!(selection.healthy, 1, "健康数应当立刻反映这次判死");
+    }
+}
+
+/// 新合并进来的代理立刻可以被分发。
+#[test]
+fn merged_proxies_are_visible_to_selection() {
+    let pool = pool_of(&["1.1.1.1:8080"]);
+    pick(&pool, SystemTime::now());
+
+    let (id, is_new) = pool.insert(model::normalize("9.9.9.9:8080").unwrap());
+    assert!(is_new);
+    pool.apply_health_pass(
+        &[(
+            id,
+            HealthUpdate {
+                alive: true,
+                latency: Some(Duration::from_millis(5)),
+                checked_at: SystemTime::now(),
+                probes: Vec::new(),
+            },
+        )],
+        3,
+    );
+
+    let selection = pick(&pool, SystemTime::now());
+    assert_eq!(selection.proxy.host(), "9.9.9.9");
+}
+
+/// 使用记录与轮换在重建快照之后依然连续。
+#[test]
+fn rotation_survives_a_snapshot_rebuild() {
+    let pool = pool_of(&["1.1.1.1:8080", "2.2.2.2:8080"]);
+    let now = SystemTime::now();
+    let first = pick(&pool, now);
+
+    // 结构变化重建快照，已经发过的那个不该被忘掉。
+    pool.insert(model::normalize("3.3.3.3:8080").unwrap());
+
+    let second = pick(&pool, now);
+    assert_ne!(
+        first.proxy.id, second.proxy.id,
+        "重建快照不该重置本轮的使用记录"
+    );
 }
