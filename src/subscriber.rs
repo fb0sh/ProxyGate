@@ -386,22 +386,17 @@ const LUA_MAX_ARG: usize = 4 * 1024;
 /// 脚本可用的全局变量与函数见本模块的文档。这里是**一次性**沙箱：每次刷新
 /// 都新建一个 Lua 状态，脚本之间不共享任何东西——一个来源的脚本改坏了全
 /// 局变量，不会影响另一个来源。
-async fn run_lua(
-    name: &str,
-    code: &str,
-    params: &BTreeMap<String, serde_yaml::Value>,
-    timeout: Duration,
-    client: &reqwest::Client,
-    egress: Option<Arc<Egress>>,
-    via: EgressPolicy,
-) -> Result<ParsedResult> {
+/// 建一个上了锁、装好了参数的 Lua 沙箱。
+///
+/// 不加载 `io`、`os`、`package`、`debug`：脚本的唯一出口是 `fetch`。base 库
+/// 没有开关，所以 `dofile` 这些还要逐个摘掉。参数（配置里的额外键）在这一步
+/// 就变成全局变量，脚本一上来就能读到。
+fn sandbox(name: &str, params: &BTreeMap<String, serde_yaml::Value>) -> Result<Lua> {
     let fail = |message: String| Error::Subscriber {
         name: name.to_string(),
         message,
     };
 
-    // 不加载 `io`、`os`、`package`、`debug`：脚本的唯一出口是 `fetch`。
-    // 注意 base 库没有开关，所以下面还要把 `dofile` 之类逐个摘掉。
     let lua = Lua::new_with(
         StdLib::STRING | StdLib::TABLE | StdLib::MATH | StdLib::COROUTINE,
         LuaOptions::default(),
@@ -430,6 +425,25 @@ async fn run_lua(
             .set(forbidden, LuaValue::Nil)
             .map_err(|e| fail(format!("cannot harden the Lua sandbox: {e}")))?;
     }
+
+    Ok(lua)
+}
+
+async fn run_lua(
+    name: &str,
+    code: &str,
+    params: &BTreeMap<String, serde_yaml::Value>,
+    timeout: Duration,
+    client: &reqwest::Client,
+    egress: Option<Arc<Egress>>,
+    via: EgressPolicy,
+) -> Result<ParsedResult> {
+    let fail = |message: String| Error::Subscriber {
+        name: name.to_string(),
+        message,
+    };
+
+    let lua = sandbox(name, params)?;
 
     // `fetch` / `fetch_json`：脚本访问外部世界的唯一方式，共用订阅源的
     // HTTP 客户端（同一份浏览器 UA、连接池与 TLS 配置）。
@@ -1061,6 +1075,41 @@ mod tests {
         assert_eq!(parsed.rejected.len(), 5, "{:?}", parsed.rejected);
         assert!(parsed.rejected[0].contains("missing `ip`"));
         assert!(parsed.rejected[4].contains("proxy table or string"));
+    }
+
+    #[test]
+    fn every_shipped_subscriber_compiles_in_the_sandbox() {
+        // 一个语法错误、或者手滑用了沙箱里没有的函数，会让整个源在用户第一次
+        // 刷新时才失败。这里把 `subscribers/*.lua` 逐个喂给沙箱编译一遍——
+        // 只编译不执行，所以不碰网络。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("subscribers");
+        let mut checked = 0;
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("lua"))
+            .collect();
+        entries.sort();
+
+        for path in entries {
+            let code = std::fs::read_to_string(&path).expect("read script");
+            let lua = sandbox("test", &BTreeMap::new()).expect("sandbox");
+            lua.load(&code)
+                .set_name(path.display().to_string())
+                .into_function()
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            // 脚本执行完必须留下一个表，否则 `from_value` 会在运行时炸掉。
+            assert!(
+                code.contains("return result"),
+                "{}: expected the script to return a list of proxies",
+                path.display()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 10,
+            "expected the shipped subscribers, found {checked}"
+        );
     }
 
     #[test]

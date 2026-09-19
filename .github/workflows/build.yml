@@ -162,6 +162,9 @@ jobs:
           mkdir -p "dist/${name}"
           cp "target/${{ matrix.target }}/release/proxygate" "dist/${name}/"
           cp README.md README.en.md SKILL.md LICENSE config.example.yaml "dist/${name}/"
+          # The example config points at these by relative path, so an archive
+          # without them ships a config that cannot load its subscribers.
+          cp -r subscribers "dist/${name}/"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           echo "packaged dist/${name}.tar.gz"
           tar -tzf "dist/${name}.tar.gz"
@@ -175,6 +178,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/proxygate.exe" "dist/$name/"
           Copy-Item README.md, README.en.md, SKILL.md, LICENSE, config.example.yaml "dist/$name/"
+          # Same relative layout as the tar.gz archives: config.example.yaml
+          # resolves `lua_file: subscribers/...` against its own directory.
+          Copy-Item -Recurse subscribers "dist/$name/"
           # Same layout as the tar.gz archives: one top-level directory.
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip" -Force
           Write-Host "packaged dist/$name.zip"

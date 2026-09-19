@@ -120,17 +120,23 @@ server:
   listen: 127.0.0.1:8080     # the gateway and the REST API share this port
 
 subscribers:                 # where proxies come from: Lua scripts
+  - name: ip89               # ready-made sources live in subscribers/
+    timeout: 30s
+    max_pages: 3             # extra keys -> script globals
+    delay: 1
+    lua_file: subscribers/ip89.lua   # relative to the config file's directory
   - name: zdaye
     timeout: 120s
     via: pool                # scrape through a proxy from our own pool
-    base_url: https://www.zdaye.com/free/   # extra keys -> script globals
+    base_url: https://www.zdaye.com/free/
     max_pages: 3
-    delay: 2                 # seconds between pages; the site has a WAF
-    lua_code: |
-      local result = {}
-      -- fetch, page, reshape ...
-      table.insert(result, { type = "socks5h", ip = "1.2.3.4", port = 1080, auth = "" })
-      return result
+    lua_file: subscribers/zdaye.lua
+
+refresh:
+  interval: 10m              # how often the scripts run
+  low_water:
+    min_alive: 20            # restock early if fewer than this many are alive
+    cooldown: 2m             # shortest gap between two early refreshes
 
 health:
   targets:                   # each is fetched *through* the proxy
@@ -158,6 +164,11 @@ gateway:
 
 - Proxies already handed out in the current round are skipped; when every
   healthy proxy has been used the round resets immediately.
+- The pool is restocked on `refresh.interval` and, if `refresh.low_water` is
+  set, as soon as the alive count drops below `min_alive` (at most once per
+  `cooldown`). Omit the block to turn that off.
+- A source can be a file (`lua_file`, resolved against the config file's
+  directory) or inline (`lua_code`); the two are mutually exclusive.
 - `https://` upstream proxies are not supported; they are rejected when a source
   produces one.
 

@@ -9,8 +9,13 @@
 # Run (mount a config.yaml and a persistent state directory):
 #   docker run --rm -p 8080:8080 \
 #     -v "$PWD/config.yaml:/home/proxygate/config.yaml:ro" \
+#     -v "$PWD/subscribers:/home/proxygate/subscribers:ro" \
 #     -v proxygate-cache:/home/proxygate/.cache/proxygate \
 #     proxygate
+#
+# The image also carries `config.example.yaml` and `subscribers/` at
+# /home/proxygate, so a config that uses the shipped Lua sources only needs the
+# two mounts above (drop the subscribers mount if you inline `lua_code`).
 #
 # The binary takes no arguments: it reads the config and serves. The image sets
 # PROXYGATE_CONFIG=/home/proxygate/config.yaml, so the mount above is all it
@@ -87,6 +92,13 @@ WORKDIR /home/proxygate
 # Docker initialises a fresh volume with the ownership of the image's directory,
 # so this is what makes the anonymous volume writable for uid 10001.
 RUN mkdir -p /home/proxygate/.cache/proxygate
+
+# The example config plus the subscribers it points at (`lua_file:
+# subscribers/...`, resolved against the config file's own directory). Mount your
+# own config.yaml next to them, or copy this pair and edit it in place:
+#   docker run --rm -p 8080:8080 -v "$PWD/config.yaml:/home/proxygate/config.yaml:ro" proxygate
+COPY config.example.yaml /home/proxygate/config.example.yaml
+COPY subscribers /home/proxygate/subscribers
 
 # state.json and cache.json live here (see the volume in the build notes above).
 VOLUME ["/home/proxygate/.cache/proxygate"]

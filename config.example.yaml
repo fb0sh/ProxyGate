@@ -17,149 +17,157 @@ server:
   # listen: 0.0.0.0:8080
 
 subscribers:
-  # A subscriber is a Lua script. It fetches whatever it wants and **returns** a
-  # list of proxy tables — one table per proxy:
+  # A subscriber is a Lua script plus its parameters. The scripts live in
+  # `subscribers/` — one file per source, which beats editing Lua inside YAML —
+  # and a relative `lua_file` is resolved against the **directory of this config
+  # file**, so keeping `config.yaml` next to `subscribers/` is enough.
+  #
+  # The contract: the script decides where to fetch, how to page and how to
+  # reshape, and finally **returns a list of proxy tables** — one per proxy:
   #
   #   { type = "http" | "socks5" | "socks5h", ip = "1.2.3.4", port = 8080, auth = "user:pass" }
   #
-  # `auth` is optional. `type = "socks4"` (or anything unknown) is dropped, and
-  # `socks5` becomes `socks5h` so the proxy resolves names — with poisoned local
-  # DNS a locally resolved address would be handed to the proxy as-is.
+  # `auth` is optional. `socks4` (or anything unknown) is dropped, and `socks5`
+  # becomes `socks5h` so the proxy resolves names — with poisoned local DNS a
+  # locally resolved address would be handed to the proxy as-is.
   #
   # Inside the script:
   #
-  #   fetch(url)        one GET, returns the body as a string; raises on non-2xx
-  #   fetch_json(url)   same, decoded into a Lua table
+  #   fetch(url[, headers])       one GET, returns the body as a string; raises on non-2xx
+  #   fetch_json(url[, headers])  same, decoded into a Lua table
   #   json_encode(v) / json_decode(s)
-  #   log(...)          writes to ProxyGate's log; `print` is an alias for it
+  #   sleep(seconds)              pace the next request (a site's rate limit)
+  #   log(...) / print(...)       writes to ProxyGate's log; **not** a way to emit proxies
   #
   # The sandbox loads only string/table/math/coroutine: `io`, `os`, `package`
   # and `debug` are absent, and `dofile`/`loadfile`/`load`/`require` are removed,
   # so `fetch` is the only way out. `timeout` bounds the whole script, including
-  # `while true do end`. Every refresh builds a fresh Lua state.
-  #
-  # Any key that is not `name`/`script_name`, `lua_code`, `lua_file`, `timeout`,
-  # `limit`, `enabled` or `via` becomes a global in the script — that is how a
-  # script gets its parameters. `lua_code` and `lua_file` are mutually exclusive.
+  # `while true do end`. Every refresh builds a fresh Lua state. Any key that is
+  # not `name`/`script_name`, `lua_code`, `lua_file`, `timeout`, `limit`,
+  # `enabled` or `via` becomes a global in the script — that is how a script gets
+  # its parameters.
   #
   # `via` picks how the script reaches the network: `direct` (never use the
   # pool), `pool` (prefer a healthy proxy from our own pool, fall back to direct
   # when the pool is empty) or `fallback` (default: direct first, retry through a
-  # pooled proxy if that fails). `fetch(url, headers)` takes an optional table of
-  # request headers, and every request already carries a desktop browser's
-  # User-Agent instead of ours.
+  # pooled proxy if that fails). A pooled fetch tries up to three distinct
+  # proxies. Every request already carries a desktop browser's User-Agent.
 
-  # zdaye.com (站大爷) 的免费代理列表：HTML 表格，一页 20 条，国内段一共 22 页
-  # （第 1 页是 `/free/`，之后 `/free/2/` … `/free/22/`）。
+  # ── Domestic free lists ────────────────────────────────────────────────
+  # These come from jhao104/proxy_pool's fetcher/sources/*.py: same sites, same
+  # paging and same field parsing, rewritten as Lua that lives in the config.
+  # They rate-limit by IP, so the scripts sleep between pages and a failed page
+  # logs a line instead of failing the whole run.
+
+  - name: ip89
+    timeout: 30s
+    max_pages: 3 # 一页 40 条
+    delay: 1
+    lua_file: subscribers/ip89.lua
+
+  - name: ip3366
+    timeout: 30s
+    max_pages: 2 # stype=1（国内）/ stype=2（国外）各翻 2 页
+    delay: 1
+    lua_file: subscribers/ip3366.lua
+
+  - name: kuaidaili
+    timeout: 40s
+    max_pages: 2 # inha（高匿）与 intr（普通）各翻 2 页
+    delay: 1
+    lua_file: subscribers/kuaidaili.lua
+
+  - name: goodips
+    timeout: 20s
+    lua_file: subscribers/goodips.lua
+
+  - name: ihuan
+    timeout: 20s
+    lua_file: subscribers/ihuan.lua
+
+  - name: daili66
+    timeout: 20s
+    lua_file: subscribers/daili66.lua
+
+  # ── Overseas lists and JSON APIs ───────────────────────────────────────
+
+  # Roundproxies：海外列表，命中率比国内那几个高，值得多翻几页。
+  - name: roundproxies
+    timeout: 30s
+    per_page: 50
+    max_pages: 3
+    delay: 1
+    lua_file: subscribers/roundproxies.lua
+
+  # SCDN：一页 100 条、几百页，默认只取前 3 页。
+  - name: scdn
+    timeout: 30s
+    per_page: 100
+    max_pages: 3
+    delay: 1
+    lua_file: subscribers/scdn.lua
+
+  # Proxifly：全量 JSON 约 5 MB / 1.8 万条，脚本只挑出 CN + http/https 的那些
+  # （实测 346 条）；`wanted_country: ""` 可以放开到全世界。
+  - name: proxifly
+    timeout: 60s
+    wanted_country: CN
+    limit: 500
+    lua_file: subscribers/proxifly.lua
+
+  # charlespikachu/freeproxy：约 3 MB / 1.8 万条的公开列表，每次刷新都取最新的一份。
+  # 脚本直接扫 JSON 文本而不是建表；`limit` 决定交给池子多少条——上万条全塞进去
+  # 会让健康探测排很久的队。
   #
-  # 这个站点前面挂的是阿里云 WAF：实测连着抓十来个请求就会被拦成 405
-  # （"您访问的URL有可能对网站造成安全威胁"），而且会持续一段时间。所以脚本
-  # 做了三件事——页与页之间 `sleep`、单页失败用 `pcall` 跳过、默认只抓前几页。
-  # 想把 22 页全抓完就得调大 `max_pages`，但那基本一定会被拦；与其如此，不如
-  # 每轮拿前几页，反正免费代理的存活率摆在那里（见 BENCHMARKS.md）。
+  # 这里按原站（GitHub Pages）取，本机实测要 170s 上下；`subscribers/freeproxy.lua`
+  # 的默认值是 jsDelivr 上同一个仓库的镜像（5.1s / 3.0 MB），嫌慢就换成：
+  #   source_url: https://cdn.jsdelivr.net/gh/charlespikachu/freeproxy@master/proxies.json
+  - name: freeproxy
+    timeout: 300s
+    source_url: https://charlespikachu.github.io/freeproxy/proxies.json
+    limit: 500
+    lua_file: subscribers/freeproxy.lua
+
+  # ── zdaye: an example of a site behind a WAF ───────────────────────────
   #
-  # `via: pool` scrapes **through a healthy proxy from our own pool**: the IP the
-  # site blacklists is the proxy's, not your machine's. While the pool is still
-  # empty (the very first refresh) it falls back to a direct request.
+  # 这个站点前面挂着阿里云 WAF：实测连着抓十来个请求就被拦成 405，而且会持续
+  # 一段时间。所以除了脚本自己控速，这里把出口也换成池子里的健康代理
+  # （`via: pool`），被拉黑的就是代理的 IP 而不是你的机器。
+  #
+  # 国内段 `/free/` 第 1 页没有数字后缀，之后 `/free/2/` … `/free/22/`（实测 421
+  # 条）；海外段 `/free_haiwai/` 实测第 118 页还有 9 条。两段共用同一份脚本。
+  # 想把 22 页全抓完就得调大 `max_pages`，但那基本一定会被拦。
   - name: zdaye
     timeout: 120s
     via: pool
     base_url: https://www.zdaye.com/free/
     max_pages: 3
     delay: 2
-    lua_code: |
-      local result = {}
-      local pages = tonumber(max_pages) or 1
-      for page = 1, pages do
-        local url = page == 1 and base_url or (base_url .. page .. "/")
-        local ok, body = pcall(fetch, url)
-        if ok then
-          local found = 0
-          for row in body:gmatch('<ul class="ul%-row">(.-)</ul>') do
-            local ip = row:match('class="proxy_ip">([^<]+)<')
-            -- 注意别写成 `Port[：:](%d+)`：Lua 的模式是**按字节**匹配的，
-            -- 把全角冒号放进字符类只会吃掉它的第一个字节，`%d+` 随即失败。
-            local port = row:match('Port[^%d]*(%d+)')
-            if ip and port then
-              local protocol = row:match('protocol_span[^>]*>%s*([A-Za-z0-9]+)') or "http"
-              table.insert(result, { type = protocol, ip = ip, port = tonumber(port) })
-              found = found + 1
-            end
-          end
-          -- 空页说明翻到头了，或者这一页被 WAF 换成了别的页面。
-          if found == 0 then break end
-          if page < pages then sleep(tonumber(delay) or 0) end
-        else
-          log("zdaye page " .. page .. " could not be fetched")
-        end
-      end
-      return result
+    lua_file: subscribers/zdaye.lua
 
-  # 海外段：同一套页面结构，只是路径是 `/free_haiwai/`（第 1 页没有数字后缀，
-  # 之后 `/free_haiwai/2/` … 实测第 118 页还有 9 条）。同样是 WAF 后面的站点，
-  # so it takes the first few pages, through the pool as well.
   - name: zdaye-overseas
     timeout: 120s
     via: pool
     base_url: https://www.zdaye.com/free_haiwai/
     max_pages: 3
     delay: 2
-    lua_code: |
-      local result = {}
-      local pages = tonumber(max_pages) or 1
-      for page = 1, pages do
-        local url = page == 1 and base_url or (base_url .. page .. "/")
-        local ok, body = pcall(fetch, url)
-        if ok then
-          local found = 0
-          for row in body:gmatch('<ul class="ul%-row">(.-)</ul>') do
-            local ip = row:match('class="proxy_ip">([^<]+)<')
-            -- 注意别写成 `Port[：:](%d+)`：Lua 的模式是**按字节**匹配的，
-            -- 把全角冒号放进字符类只会吃掉它的第一个字节，`%d+` 随即失败。
-            local port = row:match('Port[^%d]*(%d+)')
-            if ip and port then
-              local protocol = row:match('protocol_span[^>]*>%s*([A-Za-z0-9]+)') or "http"
-              table.insert(result, { type = protocol, ip = ip, port = tonumber(port) })
-              found = found + 1
-            end
-          end
-          if found == 0 then break end
-          if page < pages then sleep(tonumber(delay) or 0) end
-        else
-          log("zdaye-overseas page " .. page .. " could not be fetched")
-        end
-      end
-      return result
+    lua_file: subscribers/zdaye.lua
 
-  # A small, fast JSON API (no WAF, no pagination). The interesting bits of this
-  # one: the proxies sit under `data.proxies`, the payload carries no protocol
-  # (so these are HTTP proxies), and the endpoint caps `count` itself.
-  - name: scdn
-    timeout: 20s
-    lua_code: |
-      local body = fetch_json("https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20")
-      local result = {}
-      for _, entry in ipairs(body.data.proxies or {}) do
-        local host, port = entry:match("^(.+):(%d+)$")
-        if host then
-          table.insert(result, { type = "http", ip = host, port = tonumber(port), auth = "" })
-        end
-      end
-      return result
-
-  # A local list, read by the script itself: a proxy file is just another thing
-  # a script can be pointed at while testing.
-  # - name: local
-  #   lua_file: ./scripts/local.lua
-
-  # Anything else: a script in its own file, with the endpoint injected as a
-  # global instead of hard-coded.
-  # - name: my_scraper
-  #   timeout: 30s
-  #   target_url: https://api.example.com/data.json
-  #   token: "..."                       # extra keys -> globals
-  #   limit: 500                         # keep at most this many (0 = no cap)
-  #   lua_file: ./scripts/my_scraper.lua
+  # ── Other shapes ───────────────────────────────────────────────────────
+  #
+  # A script can also be inlined (`lua_code` and `lua_file` are mutually
+  # exclusive), which suits a five-line source:
+  #
+  # - name: inline
+  #   timeout: 20s
+  #   target_url: https://api.example.com/data.json   # extra keys -> globals
+  #   lua_code: |
+  #     local body = fetch_json(target_url)
+  #     local result = {}
+  #     for _, row in ipairs(body.data or {}) do
+  #       table.insert(result, { type = "http", ip = row.ip, port = tonumber(row.port) })
+  #     end
+  #     return result
 
 refresh:
   # How long a fetched subscriber result is reused before running the script
@@ -167,6 +175,20 @@ refresh:
   interval: 10m
   # Per-subscriber timeout, when the subscriber does not set its own.
   timeout: 20s
+  # Restock early when the pool runs dry, instead of waiting for `interval` to
+  # come around: free proxies are a "used up as you go" resource, and the regular
+  # tick cannot cover the gap in between. This is jhao104/proxy_pool's
+  # `POOL_SIZE_MIN`, expressed as a low-water mark on the *alive* count.
+  #
+  # `cooldown` is what keeps this from turning your sources into a polling
+  # target (free lists are chronically below the mark): two early refreshes are
+  # at least this far apart. Worst case, source traffic is `interval / cooldown`
+  # times the normal rate — 5x with the values below.
+  #
+  # Drop the whole block, or set `min_alive: 0`, to turn it off.
+  low_water:
+    min_alive: 20
+    cooldown: 2m
 
 health:
   # Every target is fetched *through each proxy*, concurrently. A proxy is only
@@ -250,4 +272,8 @@ gateway:
 state:
   # Where state.json and cache.json live.
   # Default: $PROXYGATE_CACHE_DIR, else ~/.cache/proxygate
+  #
+  # A relative `dir` is relative to the *working directory*, not to this file
+  # (`lua_file` above is the other way around, because a config that ships with
+  # its scripts means "next to me").
   # dir: /var/lib/proxygate

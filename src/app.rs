@@ -726,6 +726,19 @@ impl App {
         self.refresh_now.notify_one();
     }
 
+    /// 距上一次**成功抓取订阅源**过了多久；从未抓过时返回 `None`。
+    ///
+    /// 低水位补货用它做冷却：每抓一轮就把这个时间戳推到现在，所以两次提前抓
+    /// 取之间至少隔着 `refresh.low_water.cooldown`。
+    pub fn since_last_refresh(&self) -> Option<Duration> {
+        let at = self.fetched_at.load(Ordering::SeqCst);
+        if at == 0 {
+            return None;
+        }
+        let now = state::unix_secs(SystemTime::now()).max(0) as u64;
+        Some(Duration::from_secs(now.saturating_sub(at)))
+    }
+
     /// 请求后台立刻探测一轮代理池（`POST /api/v1/check`）。
     pub fn request_check(&self) {
         self.check_now.notify_one();
@@ -1056,6 +1069,16 @@ pub(crate) async fn refresh_loop(
     // 第一个 tick 立即完成；初始化由下面的循环自己做，先把它消耗掉。
     ticker.tick().await;
 
+    // `refresh.low_water`：池子里可用的代理太少时不等定时器，提前再抓一轮。
+    // 关闭时用一个占位值；`select!` 的分支由 `low_water.is_some()` 把关。
+    let low_water = app
+        .config
+        .refresh
+        .low_water
+        .as_ref()
+        .and_then(|config| config.armed());
+    let (min_alive, cooldown) = low_water.unwrap_or((0, Duration::ZERO));
+
     loop {
         if app.readiness().is_ready() {
             let added = match app.refresh().await {
@@ -1110,6 +1133,8 @@ pub(crate) async fn refresh_loop(
             _ = app.refresh_now.notified() => {
                 info!("refresh requested through the API");
             }
+            // 低水位补货：抓一轮，然后再回到定时器上等。
+            _ = wait_for_low_water(&app, min_alive, cooldown), if low_water.is_some() => {}
             // 未就绪时，客户端的一次 503 就足以让我们提前醒来重试。
             _ = app.readiness().wait_for_request(INITIALIZE_RETRY_INTERVAL),
                 if !app.readiness().is_ready() => {}
@@ -1126,6 +1151,55 @@ const HEALTH_MAX_SLEEP: Duration = Duration::from_secs(30);
 
 /// 两次唤醒之间的最短间隔，防止退避到 0 时把 CPU 打满。
 const HEALTH_MIN_SLEEP: Duration = Duration::from_millis(50);
+
+/// 低水位检查的轮询节奏。
+///
+/// 15 秒足够快——池子见底到补货之间多等十几秒没有意义——又不会让空转的唤醒
+/// 变得可观（一次唤醒只读两个原子量）。真正决定抓取频率的是
+/// `refresh.low_water.cooldown`，不是这个值。
+const LOW_WATER_POLL: Duration = Duration::from_secs(15);
+
+/// 该不该因为"池子见底"提前抓一轮。
+///
+/// * `alive` —— 当前存活的代理数；
+/// * `since_refresh` —— 距上一次成功抓取过了多久，从没抓过时传 `None`；
+/// * `min_alive` / `cooldown` —— `refresh.low_water` 里的两个值。
+///
+/// 没抓过（`None`）不触发：那说明还没完成初始化，属于 `initialize` 的事。
+pub(crate) fn low_water_triggered(
+    alive: usize,
+    since_refresh: Option<Duration>,
+    min_alive: usize,
+    cooldown: Duration,
+) -> bool {
+    let Some(since_refresh) = since_refresh else {
+        return false;
+    };
+    alive < min_alive && since_refresh >= cooldown
+}
+
+/// 等"池子低于水位线"这件事发生，条件成立就返回。
+///
+/// 放在 `select!` 的一个分支里：条件一直不成立就一直等，期间别的分支
+/// （定时刷新、API 触发、退出）照常生效。
+async fn wait_for_low_water(app: &App, min_alive: usize, cooldown: Duration) {
+    loop {
+        tokio::time::sleep(LOW_WATER_POLL).await;
+        if !app.readiness().is_ready() {
+            continue;
+        }
+        let alive = app.pool.stats().alive;
+        if low_water_triggered(alive, app.since_last_refresh(), min_alive, cooldown) {
+            info!(
+                alive,
+                min_alive,
+                cooldown_seconds = cooldown.as_secs(),
+                "alive proxies are below the low water mark; refreshing early"
+            );
+            return;
+        }
+    }
+}
 
 /// 按每个代理自己的退避计划重新探测健康状态。
 ///
@@ -1253,6 +1327,39 @@ mod tests {
             via: Default::default(),
             params: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn low_water_fires_only_below_the_mark_and_after_the_cooldown() {
+        let cooldown = Duration::from_secs(120);
+        let long_ago = Some(Duration::from_secs(600));
+
+        // 水位之上：不触发，哪怕是刚过了冷却。
+        assert!(!low_water_triggered(20, long_ago, 20, cooldown));
+        assert!(!low_water_triggered(200, long_ago, 20, cooldown));
+        // 水位之下但刚抓过：不触发。
+        assert!(!low_water_triggered(
+            3,
+            Some(Duration::from_secs(119)),
+            20,
+            cooldown
+        ));
+        // 水位之下、冷却已过：触发。
+        assert!(low_water_triggered(
+            3,
+            Some(Duration::from_secs(120)),
+            20,
+            cooldown
+        ));
+        // 空池子同理（`min_alive: 1` 时 0 就低于水位）。
+        assert!(low_water_triggered(
+            0,
+            Some(Duration::from_secs(121)),
+            1,
+            cooldown
+        ));
+        // 从没抓过：那是初始化的事，这里不掺和。
+        assert!(!low_water_triggered(0, None, 20, cooldown));
     }
 
     #[tokio::test]

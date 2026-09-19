@@ -83,6 +83,49 @@ pub struct RefreshConfig {
     /// 针对单个订阅源的超时，YAML 键 `refresh.timeout`，默认 20 秒。
     #[serde(default = "default_refresh_timeout", deserialize_with = "de::duration")]
     pub timeout: Duration,
+    /// 低水位补货，YAML 键 `refresh.low_water`：池子里**可用**的代理少于
+    /// `min_alive` 时不等 `interval` 到点，提前再抓一轮。省略整段就是关闭。
+    #[serde(default)]
+    pub low_water: Option<LowWaterConfig>,
+}
+
+/// `refresh.low_water` 段的配置。
+///
+/// 这是从 jhao104/proxy_pool 的 `POOL_SIZE_MIN` 学来的：那边的巡检发现池子
+/// 太小就先抓一轮，不必等下一个采集周期。免费代理是"用着用着就没了"的东西，
+/// 定时补货挡不住中间那段空窗。
+#[derive(Debug, Clone, Deserialize)]
+pub struct LowWaterConfig {
+    /// 存活代理低于这个数就算"水位低了"。默认 20，和 proxy_pool 的
+    /// `POOL_SIZE_MIN` 一致。配成 0 等于关闭。
+    #[serde(default = "default_low_water_min_alive")]
+    pub min_alive: usize,
+    /// 两次提前抓取之间的最短间隔，默认 2 分钟。
+    ///
+    /// 没有这个下限，池子长期不达标（免费代理本来就常年不达标）会把订阅源当
+    /// 成轮询目标打到被限流。2 分钟是保守值：最坏情况下抓取频率是
+    /// `interval` 的 `interval / cooldown` 倍，10 分钟配 2 分钟就是最多 5 倍。
+    #[serde(
+        default = "default_low_water_cooldown",
+        deserialize_with = "de::duration"
+    )]
+    pub cooldown: Duration,
+}
+
+impl LowWaterConfig {
+    /// 生效的水位：`min_alive` 为 0 时返回 `None`，表示这段配置等于关闭。
+    pub fn armed(&self) -> Option<(usize, Duration)> {
+        (self.min_alive > 0).then_some((self.min_alive, self.cooldown))
+    }
+}
+
+impl Default for LowWaterConfig {
+    fn default() -> Self {
+        Self {
+            min_alive: default_low_water_min_alive(),
+            cooldown: default_low_water_cooldown(),
+        }
+    }
 }
 
 impl Default for RefreshConfig {
@@ -90,6 +133,7 @@ impl Default for RefreshConfig {
         Self {
             interval: default_refresh_interval(),
             timeout: default_refresh_timeout(),
+            low_water: None,
         }
     }
 }
@@ -499,8 +543,31 @@ impl Config {
         let mut config: Config = serde_yaml::from_str(&raw).map_err(|e| {
             Error::Config(format!("cannot parse config file {}: {e}", path.display()))
         })?;
+        config.resolve_relative_paths(&path);
         config.normalize()?;
         Ok((config, Some(path)))
+    }
+
+    /// 把 `lua_file` 里的相对路径按**配置文件所在目录**解开。
+    ///
+    /// 不这么做的话，`lua_file: ./subscribers/ip89.lua` 是相对**当前工作目录**
+    /// 找的：从别处用绝对路径启动 `PROXYGATE_CONFIG=/etc/proxygate/config.yaml`
+    /// 就找不到脚本了，而配置里写相对路径的人显然是指"和配置文件放一起"。
+    pub fn resolve_relative_paths(&mut self, config_path: &Path) {
+        let Some(dir) = config_path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+        else {
+            // `config.yaml` 这种没有目录部分的路径：保持原样，等于相对 CWD。
+            return;
+        };
+        for subscriber in &mut self.subscribers {
+            if let Some(file) = &subscriber.lua_file {
+                if file.is_relative() {
+                    subscriber.lua_file = Some(dir.join(file));
+                }
+            }
+        }
     }
 
     /// 候选配置位置，按优先级排序。
@@ -557,6 +624,15 @@ impl Config {
             return Err(Error::Config(
                 "health.concurrency must be at least 1".into(),
             ));
+        }
+        if let Some(low_water) = &self.refresh.low_water {
+            if low_water.cooldown.is_zero() {
+                return Err(Error::Config(
+                    "refresh.low_water.cooldown must be greater than 0s; a zero cooldown \
+                     would refresh in a tight loop whenever the pool is below the mark"
+                        .into(),
+                ));
+            }
         }
         let targets = self.health.targets();
         if targets.is_empty() {
@@ -895,6 +971,16 @@ fn default_refresh_timeout() -> Duration {
     Duration::from_secs(20)
 }
 
+/// `refresh.low_water.min_alive` 的默认值：20（与 proxy_pool 的 `POOL_SIZE_MIN` 同）。
+fn default_low_water_min_alive() -> usize {
+    20
+}
+
+/// `refresh.low_water.cooldown` 的默认值：2 分钟。
+fn default_low_water_cooldown() -> Duration {
+    Duration::from_secs(120)
+}
+
 /// 特意选用两个目标：一个只有在代理具备真正的国际连通性时才可用，
 /// 另一个国内端点用来证明隧道并非对所有目标都不通。
 ///
@@ -984,6 +1070,66 @@ mod tests {
         assert!(parse_duration("10x").is_err());
         assert!(parse_duration("m").is_err());
         assert!(parse_duration("10").is_ok());
+    }
+
+    #[test]
+    fn low_water_is_optional_and_defaults_to_proxy_pools_numbers() {
+        // 省略整段 = 关闭，默认配置里也是关的。
+        let config: Config = serde_yaml::from_str("refresh:\n  interval: 1m\n").unwrap();
+        assert!(config.refresh.low_water.is_none());
+        assert!(Config::default().refresh.low_water.is_none());
+
+        // 给了这一段但什么都不写：min_alive 20 / cooldown 2m。
+        let config: Config = serde_yaml::from_str("refresh:\n  low_water: {}\n").unwrap();
+        let low = config.refresh.low_water.as_ref().expect("low water");
+        assert_eq!(low.min_alive, 20);
+        assert_eq!(low.cooldown, Duration::from_secs(120));
+        assert_eq!(low.armed(), Some((20, Duration::from_secs(120))));
+
+        let config: Config =
+            serde_yaml::from_str("refresh:\n  low_water:\n    min_alive: 5\n    cooldown: 30s\n")
+                .unwrap();
+        let low = config.refresh.low_water.as_ref().expect("low water");
+        assert_eq!(low.armed(), Some((5, Duration::from_secs(30))));
+
+        // `min_alive: 0` 是"关掉"，不是"水位为 0"。
+        let config: Config =
+            serde_yaml::from_str("refresh:\n  low_water:\n    min_alive: 0\n").unwrap();
+        assert_eq!(config.refresh.low_water.unwrap().armed(), None);
+
+        // 0 秒冷却会把订阅源当成轮询目标，属于配置错误。
+        let mut config: Config =
+            serde_yaml::from_str("refresh:\n  low_water:\n    min_alive: 5\n    cooldown: 0s\n")
+                .unwrap();
+        let error = config.normalize().unwrap_err().to_string();
+        assert!(error.contains("refresh.low_water.cooldown"), "{error}");
+    }
+
+    #[test]
+    fn lua_file_paths_resolve_against_the_config_directory() {
+        let mut config: Config = serde_yaml::from_str(
+            "subscribers:\n  - name: a\n    lua_file: subscribers/ip89.lua\n  - name: b\n    lua_file: /abs/b.lua\n",
+        )
+        .unwrap();
+        config.resolve_relative_paths(Path::new("/etc/proxygate/config.yaml"));
+        assert_eq!(
+            config.subscribers[0].lua_file.as_deref(),
+            Some(Path::new("/etc/proxygate/subscribers/ip89.lua"))
+        );
+        // 绝对路径不动。
+        assert_eq!(
+            config.subscribers[1].lua_file.as_deref(),
+            Some(Path::new("/abs/b.lua"))
+        );
+
+        // 配置路径本身没有目录部分时保持原样（等价于相对 CWD）。
+        let mut config: Config =
+            serde_yaml::from_str("subscribers:\n  - name: a\n    lua_file: a.lua\n").unwrap();
+        config.resolve_relative_paths(Path::new("config.yaml"));
+        assert_eq!(
+            config.subscribers[0].lua_file.as_deref(),
+            Some(Path::new("a.lua"))
+        );
     }
 
     #[test]

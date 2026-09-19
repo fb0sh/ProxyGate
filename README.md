@@ -118,6 +118,8 @@ proxygate --example-config > config.yaml
 | `subscribers` | `[]` | 代理来源（Lua 脚本），见下一节 |
 | `refresh.interval` | `10m` | 拉取结果复用时⻓ |
 | `refresh.timeout` | `20s` | 单个 subscriber 超时 |
+| `refresh.low_water.min_alive` | 关闭 | 存活代理少于这个数就**提前**抓一轮（见下） |
+| `refresh.low_water.cooldown` | `2m` | 两次提前抓取之间的最短间隔 |
 | `health.targets` | Google 204 + `cn.bing.com` | **通过代理**去访问的探测目标，并发探测 |
 | `health.require` | `any` | 目标全部要通（`all`）还是通一个就算（`any`） |
 | `health.interval` | `5m` | **可用**代理的重探周期，同时也是健康结果缓存有效期（与 `refresh.interval` 无关：那个是多久重新跑一次订阅源脚本） |
@@ -142,10 +144,29 @@ proxygate --example-config > config.yaml
 
 > **首查慢是因为健康探测，不是因为脚本**。免费代理的存活率极低（实测一份 1,020 条的
 > 池子只有 9~13 条通过），所以示例配置里的来源都只抓一小部分：zdaye 每轮只抓前 3 页
-> （那个站点有 WAF，抓多了会被拦），scdn 只取 20 条。
+> （那个站点有 WAF，抓多了会被拦），freeproxy 那份 1.8 万条的列表用 `limit: 500` 截断。
 >
 > `health.concurrency` 就是决定首查要跑多久的那个旋钮：同一份 1,020 条的池子、同一组
 > 真实目标，实测 300 并发 14s、100 并发 30s（差距取决于死代理多快失败，不只是并发倍数）。
+
+### 补货：定时 + 低水位
+
+订阅源默认按 `refresh.interval`（10 分钟）跑一轮。免费代理是"用着用着就没了"的东西，
+定时补货挡不住中间那段空窗，所以还有一条**低水位**规则：
+
+```yaml
+refresh:
+  interval: 10m
+  low_water:
+    min_alive: 20     # 存活代理少于 20 条就提前抓
+    cooldown: 2m      # 两次提前抓之间至少隔 2 分钟
+```
+
+这条规则是从 [jhao104/proxy_pool](https://github.com/jhao104/proxy_pool) 的
+`POOL_SIZE_MIN` 学来的：那边巡检发现池子太小就先抓一轮。`cooldown` 是这里额外加的
+保险——免费列表常年低于水位线，没有冷却就等于把它们当成轮询目标打（最坏情况下抓取
+频率是 `interval / cooldown` 倍，10 分钟配 2 分钟就是 5 倍）。整段省略，或
+`min_alive: 0`，就是关闭。
 
 > **注意 `health.targets` 的语义**：探测请求是**通过代理**发出的，所以「你本机连不上
 > Google」不是问题——要连上的是代理。默认两个目标里，Google 只有代理真的能出国才会
@@ -171,38 +192,55 @@ proxygate --example-config > config.yaml
 ### Subscriber（代理来源）
 
 每个订阅源就是**一段 Lua 脚本**：它自己决定去哪里取、怎么翻页、怎么拼装，最后
-**返回一组代理表**（`type` / `ip` / `port` / `auth`）。配置里只写脚本：
+**返回一组代理表**（`type` / `ip` / `port` / `auth`）。脚本可以内联，也可以放在文件里
+（仓库里的 `subscribers/` 就是这么一组现成的源，`lua_file` 的相对路径按**配置文件
+所在目录**解析）：
 
 ```yaml
 subscribers:
-  - name: zdaye
-    timeout: 60s
-    via: pool
-    lua_code: |
-      local page, pages = 1, 1
-      local result = {}
-      repeat
-        local body = fetch("https://www.zdaye.com/free/")
-        for row in body:gmatch('<ul class="ul%-row">(.-)</ul>') do
-          local ip = row:match('class="proxy_ip">([^<]+)<')
-          local port = row:match('Port[^%d]*(%d+)')
-          if ip and port then
-            table.insert(result, { type = "http", ip = ip, port = tonumber(port) })
-          end
-        end
-      return result
+  # 现成的源：一个文件一个站点，参数写在配置里
+  - name: ip89
+    timeout: 30s
+    max_pages: 3            # 不是 ProxyGate 的键 -> 脚本里的全局变量
+    delay: 1
+    lua_file: subscribers/ip89.lua
 
-  # 脚本也可以写在文件里，端点用额外键传进去
+  # 也可以内联三五行的脚本
   - name: my_scraper
     timeout: 30s
-    target_url: https://api.example.com/data.json   # 不是 ProxyGate 的键 -> 脚本全局变量
-    token: "..."                                    # 同上
-    limit: 500                                      # 最多保留多少个可用代理（0 = 不限）
-    lua_file: ./scripts/my_scraper.lua
+    target_url: https://api.example.com/data.json
+    limit: 500              # 最多保留多少个可用代理（0 = 不限）
+    lua_code: |
+      local body = fetch_json(target_url)
+      local result = {}
+      for _, row in ipairs(body.data or {}) do
+        table.insert(result, { type = "http", ip = row.ip, port = tonumber(row.port) })
+      end
+      return result
 ```
 
 `limit` 是给「一个源返回上万条」准备的：健康探测要把池子里每个代理都探一遍，
 上万条在默认并发下就是十几分钟一轮。
+
+#### 仓库里现成的源
+
+`subscribers/*.lua` 里的站点与解析规则移植自
+[jhao104/proxy_pool](https://github.com/jhao104/proxy_pool)（MIT）的
+`fetcher/sources/*.py`，改写成 Lua、把页面数/间隔/过滤条件做成配置项：
+
+| 文件 | 站点 | 一轮大概能拿多少 | 备注 |
+| --- | --- | --- | --- |
+| `ip89.lua` | 89免费代理 | 一页 40 条 × `max_pages` | 站点有十几页，示例取 3 页 |
+| `ip3366.lua` | 云代理 | 国内 + 国外各 11~15 条/页 | `stype=1` 国内、`stype=2` 国外 |
+| `kuaidaili.lua` | 快代理 | 12 条/页 × 两条列表 | 原版注释说请求之间必须 sleep，保留了 |
+| `goodips.lua` | 谷德代理 | 一页 15 条 | 首页就是列表，没有分页 |
+| `ihuan.lua` | 小幻代理 | 一页 18 条 | 原版要两次请求拿 cookie，实测一次就够 |
+| `daili66.lua` | 66代理 | 一次 60 条 | JSON 接口，偶尔会 429 |
+| `roundproxies.lua` | Roundproxies | 一页 50 条 × `max_pages` | 海外源，命中率相对高 |
+| `scdn.lua` | SCDN | 一页 100 条 × `max_pages` | 按 IP 限流，被限时连接会被重置 |
+| `proxifly.lua` | Proxifly | CN + http 约 200~350 条 | 全量 5 MB / 1.8 万条，脚本只取 CN |
+| `freeproxy.lua` | charlespikachu/freeproxy | 1.8 万条（示例 `limit: 500`） | 约 3 MB；默认走 jsDelivr 镜像 |
+| `zdaye.lua` | 站大爷 | 一页 20 条 | 有 WAF，见下面 `via: pool` 那节 |
 
 ### 用 Lua 写 subscriber
 
@@ -270,10 +308,10 @@ user:pass@1.2.3.4:3128       socks5h://user:pass@[2001:db8::1]:1080
 1.2.3.4:8080                 # 协议和端口都会补默认值
 ```
 
-示例配置里的第一个源是 [proxy.scdn.io](https://proxy.scdn.io/api_docs.php)：它返回 JSON
-包装、里面是裸 `host:port`，内置 `json` 格式可以直接读。因为返回体不带协议，这类条目一律
-按 HTTP 代理处理（所以示例里请求 `protocol=http`）；想用它家的 `socks4`/`socks5` 端点，
-改成 `type: lua`，在脚本里按字段拼 `socks5h://…` 就行（示例里的 zdaye 就是这么干的）。
+示例配置里第一个 JSON 源是 `scdn`（[proxy.scdn.io](https://proxy.scdn.io/api_docs.php)）：
+接口返回一段 HTML（`table_html`），脚本按行取 `cell-ip` 与端口。这类"不带协议字段"的条目
+一律按 HTTP 代理处理；想用它家的 `socks4`/`socks5` 端点，在脚本里按字段拼
+`socks5h://…` 就行（`scdn.lua` 已经按 `protocol-socks5` 这个 class 处理了）。
 
 关于这类免费池要有心理准备，下面两点正是健康探测存在的意义：**大部分条目是死的**，并且
 相当一部分「支持 HTTPS」的其实在中间人劫持 TLS、拿自己的证书签发。ProxyGate 会拒绝这类
@@ -308,12 +346,12 @@ user:pass@1.2.3.4:3128       socks5h://user:pass@[2001:db8::1]:1080
 $ proxygate
 2026-09-18T10:51:02Z  INFO proxygate is listening listen=127.0.0.1:8080 config=Some("./config.yaml") proxies=0 alive=0 auth=false ready=false
 2026-09-18T10:51:02Z  INFO API documentation help=http://127.0.0.1:8080/help
-2026-09-18T10:51:02Z  INFO running subscriber script subscriber=zdaye
-2026-09-18T10:51:02Z  INFO running subscriber script subscriber=scdn
-2026-09-18T10:51:04Z  INFO subscriber fetched subscriber=scdn found=20 rejected=0 skipped=0 truncated=0 elapsed_ms=1574
-2026-09-18T10:51:12Z  INFO subscriber fetched subscriber=zdaye found=60 rejected=0 skipped=0 truncated=0 elapsed_ms=9800
+2026-09-18T10:51:01Z  INFO running subscriber script subscriber=ip89
+2026-09-18T10:51:01Z  INFO running subscriber script subscriber=freeproxy
+2026-09-18T10:51:03Z  INFO subscriber fetched subscriber=ip89 found=120 rejected=0 skipped=0 truncated=0 elapsed_ms=3161
+2026-09-18T10:51:06Z  INFO subscriber fetched subscriber=freeproxy found=500 rejected=0 skipped=0 truncated=13581 elapsed_ms=5100
 2026-09-18T10:51:38Z  INFO hand-out verification passed proxy=http://***:***@1.2.3.4:8080 elapsed_ms=312
-2026-09-18T10:55:10Z  INFO proxygate is ready proxies=4499 alive=61
+2026-09-18T10:55:10Z  INFO proxygate is ready proxies=596 alive=61
 ```
 
 * 每个订阅源两行：开始跑脚本，以及拿到多少、跳过/拒绝/截断、耗时。
@@ -599,6 +637,7 @@ src/
   state.rs       state.json / cache.json、RFC 3339 时间戳
   error.rs       整个 crate 共用的错误类型
 assets/          编进二进制的数据（User-Agent 池）
+subscribers/     现成的 Lua 订阅源（一个站点一个文件，移植自 proxy_pool 的 fetcher）
 scripts/         开发用脚本（loadtest.py：/get 的延迟与指标基线）
 tests/           集成测试（进程内假上游）
 SKILL.md         面向 agent 与人的手册（`GET /help` 输出它）

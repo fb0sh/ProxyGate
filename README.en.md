@@ -121,6 +121,8 @@ but not much else. Start from [`config.example.yaml`](config.example.yaml).
 | `subscribers`         | `[]`                                      | Where proxies come from (see below)                   |
 | `refresh.interval`    | `10m`                                     | How often the subscriber scripts run and pull in new proxies |
 | `refresh.timeout`     | `20s`                                     | Per-subscriber timeout                                |
+| `refresh.low_water.min_alive` | off                               | Restock early once the *alive* count drops below this  |
+| `refresh.low_water.cooldown`  | `2m`                              | Shortest gap between two early refreshes               |
 | `health.targets`      | Google 204 + `cn.bing.com`                | URLs fetched *through* each proxy, probed concurrently |
 | `health.require`      | `any`                                     | `any` target may answer, or `all` of them must          |
 | `health.interval`     | `5m`                                      | How often a *working* proxy is re-probed, and the verdict cache lifetime |
@@ -153,12 +155,34 @@ that reaches either one; the `TARGETS` column tells you which.
 > **The slow part is the health check, not the scripts.** Among free proxies the
 > survivors are scarce (one measured pool of 1,020 had 9-13 working), so the
 > example's sources only take a slice each: zdaye's first 3 pages per section (its
-> WAF blocks anyone who asks for more) and scdn's 20 entries.
+> WAF blocks anyone who asks for more), and the 18k-entry freeproxy list is cut
+> to `limit: 500`.
 >
 > `health.concurrency` is the knob that decides how long that first check takes:
 > on the same 1,020-proxy pool against the real targets, 300 in flight finished
 > in 14s and 100 in 30s (the gap depends on how quickly dead proxies fail, not
 > only on the parallelism).
+
+### Restocking: the timer, plus a low-water mark
+
+Subscribers run on `refresh.interval` (10 minutes by default). Free proxies are
+a "used up as you go" resource, so the timer alone leaves a gap; there is a
+second trigger:
+
+```yaml
+refresh:
+  interval: 10m
+  low_water:
+    min_alive: 20     # fewer than 20 alive -> refresh now
+    cooldown: 2m      # ...but never twice within two minutes
+```
+
+The idea is jhao104/proxy_pool's `POOL_SIZE_MIN`: their checker runs a fetch
+whenever the pool looks too small. The `cooldown` is the part they do not have,
+and it matters here — free lists sit below the mark most of the time, and
+without it the low-water rule turns your sources into a polling target. Worst
+case, source traffic is `interval / cooldown` times the normal rate (5x with the
+values above). Drop the block, or set `min_alive: 0`, to turn it off.
 
 ### One port
 
@@ -183,36 +207,55 @@ A subscriber is a Lua script. It fetches whatever it wants and **returns a list
 of proxy tables** — one per proxy, with `type`, `ip`, `port` and an optional
 `auth`:
 
+A script can be inlined or live in its own file — the repo ships a set of ready
+ones under `subscribers/`, and a relative `lua_file` is resolved against the
+**directory of the config file**:
+
 ```yaml
 subscribers:
-  - name: zdaye
-    timeout: 60s
-    via: pool
-    lua_code: |
-      local page, pages = 1, 1
-      local result = {}
-      repeat
-        local body = fetch(base_url)
-        for row in body:gmatch('<ul class="ul%-row">(.-)</ul>') do
-          local ip = row:match('class="proxy_ip">([^<]+)<')
-          local port = row:match('Port[^%d]*(%d+)')
-          if ip and port then
-            table.insert(result, { type = "http", ip = ip, port = tonumber(port) })
-          end
-        end
-      return result
+  # A ready-made source: one file per site, parameters in the config.
+  - name: ip89
+    timeout: 30s
+    max_pages: 3            # not a ProxyGate key -> a global in the script
+    delay: 1
+    lua_file: subscribers/ip89.lua
 
-  # A script can live in its own file, with the endpoint passed in as a global.
+  # Or inline the five-line version.
   - name: my_scraper
     timeout: 30s
-    target_url: https://api.example.com/data.json   # not a ProxyGate key -> script global
-    token: "..."
-    limit: 500                                      # keep at most this many (0 = no cap)
-    lua_file: ./scripts/my_scraper.lua
+    target_url: https://api.example.com/data.json
+    limit: 500              # keep at most this many (0 = no cap)
+    lua_code: |
+      local body = fetch_json(target_url)
+      local result = {}
+      for _, row in ipairs(body.data or {}) do
+        table.insert(result, { type = "http", ip = row.ip, port = tonumber(row.port) })
+      end
+      return result
 ```
 
 `limit` exists because the health checker probes every proxy it is given: tens of
 thousands of them is a very long pass at the default concurrency.
+
+#### The sources that ship with it
+
+The sites and parsing rules in `subscribers/*.lua` are ported from
+[jhao104/proxy_pool](https://github.com/jhao104/proxy_pool) (MIT), rewritten as
+Lua with the page count, delay and filters promoted to config keys:
+
+| File | Site | Per round | Notes |
+| ---- | ---- | --------- | ----- |
+| `ip89.lua` | 89ip.cn | 40 per page x `max_pages` | the site has a dozen pages; the example takes 3 |
+| `ip3366.lua` | ip3366.net | 11-15 per page, domestic + overseas | `stype=1` is domestic, `stype=2` overseas |
+| `kuaidaili.lua` | kuaidaili.com | 12 per page x two lists | upstream sleeps between requests; that is kept |
+| `goodips.lua` | goodips.com | 15 per round | the home page is the list |
+| `ihuan.lua` | ip.ihuan.me | 18 per round | upstream needs two requests for a cookie; one works |
+| `daili66.lua` | 66daili.com | 60 per round | JSON API, occasionally answers 429 |
+| `roundproxies.lua` | roundproxies.com | 50 per page x `max_pages` | overseas, better hit rate |
+| `scdn.lua` | proxy.scdn.io | 100 per page x `max_pages` | rate-limits by IP; it resets connections when annoyed |
+| `proxifly.lua` | proxifly.dev | ~200-350 CN + http | 5 MB / 18k entries, the script keeps only CN |
+| `freeproxy.lua` | charlespikachu/freeproxy | 18k entries (`limit: 500` in the example) | ~3 MB; defaults to the jsDelivr mirror |
+| `zdaye.lua` | zdaye.com | 20 per page | behind a WAF; see the `via: pool` section |
 
 #### Writing a subscriber
 
@@ -295,10 +338,11 @@ user:pass@1.2.3.4:3128       socks5h://user:pass@[2001:db8::1]:1080
 1.2.3.4:8080                 # scheme and port get sensible defaults
 ```
 
-The first source in the example config is
-[proxy.scdn.io](https://proxy.scdn.io/api_docs.php): it answers with a JSON
-envelope holding bare `host:port` entries, so the script asks for
-`protocol=http` and turns each string into an HTTP proxy.
+The first JSON source in the example config is `scdn`
+([proxy.scdn.io](https://proxy.scdn.io/api_docs.php)): it answers with a JSON
+envelope holding a chunk of HTML, and the script walks `cell-ip` rows. Entries
+that carry no protocol are treated as HTTP proxies; `scdn.lua` already reads the
+`protocol-socks5` class and emits `socks5h` for those.
 
 Two things to expect from free lists like that one, both of which the health
 check is designed to surface: most entries are simply dead, and a fair share of
@@ -336,9 +380,11 @@ There is no stdout contract to protect, so progress and results go to the
 $ proxygate
 INFO proxygate is listening listen=127.0.0.1:8080 config=Some("./config.yaml") proxies=0 alive=0 auth=false ready=false
 INFO API documentation help=http://127.0.0.1:8080/help
-INFO running subscriber script subscriber=zdaye
-INFO subscriber fetched subscriber=scdn found=20 rejected=0 skipped=0 elapsed_ms=2423
-INFO proxygate is ready proxies=5157 alive=66
+INFO running subscriber script subscriber=ip89
+INFO running subscriber script subscriber=freeproxy
+INFO subscriber fetched subscriber=ip89 found=120 rejected=0 skipped=0 truncated=0 elapsed_ms=3161
+INFO subscriber fetched subscriber=freeproxy found=500 rejected=0 skipped=0 truncated=13581 elapsed_ms=5100
+INFO proxygate is ready proxies=596 alive=66
 INFO hand-out verification passed proxy=http://***:***@1.2.3.4:8080 elapsed_ms=312
 ```
 
@@ -647,6 +693,7 @@ src/
   state.rs       state.json / cache.json, RFC 3339 timestamps
   error.rs       error type shared by every module
 assets/          data embedded in the binary (user agent pool)
+subscribers/     ready-made Lua subscribers (one site per file, ported from proxy_pool)
 scripts/         developer scripts (loadtest.py: /get latency and metric baseline)
 tests/           integration tests with in-process fake upstreams
 SKILL.md         the manual served by `GET /help`
