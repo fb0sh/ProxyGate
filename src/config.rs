@@ -311,7 +311,7 @@ pub struct StateConfig {
 ///
 /// ```yaml
 /// subscribers:
-///   - name: rola-ip
+///   - name: zdaye
 ///     timeout: 60s
 ///     lua_code: |
 ///       local result = {}
@@ -1090,16 +1090,22 @@ health:
             "the example keeps the default listen address visible"
         );
         // 示例配置必须带上调好的健康检查参数：它们决定首查要跑多久，
-        // 而且 rola-ip 必须限流，否则一遍探测要几分钟。
+        // 而且每个来源都必须只取一小部分，否则一遍探测要几分钟。
         assert_eq!(config.health.concurrency, 300);
         assert_eq!(config.health.timeout, Duration::from_secs(3));
         assert_eq!(config.health.interval, Duration::from_secs(300));
-        let rola = config
-            .subscribers
-            .iter()
-            .find(|subscriber| subscriber.name() == "rola-ip")
-            .expect("the example subscribes to rola-ip");
-        assert_eq!(rola.limit(), Some(1000));
+        // 两个 zdaye 订阅源（国内 + 海外）都必须带上分页与节流参数：
+        // 那个站点有 WAF，脚本靠 `max_pages` 与 `delay` 控制自己打多狠。
+        for name in ["zdaye", "zdaye-overseas"] {
+            let subscriber = config
+                .subscribers
+                .iter()
+                .find(|subscriber| subscriber.name() == name)
+                .unwrap_or_else(|| panic!("the example subscribes to {name}"));
+            assert!(subscriber.params.contains_key("base_url"), "{name}");
+            assert!(subscriber.params.contains_key("max_pages"), "{name}");
+            assert!(subscriber.params.contains_key("delay"), "{name}");
+        }
         assert!(
             config
                 .subscribers

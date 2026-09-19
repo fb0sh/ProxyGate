@@ -120,9 +120,11 @@ server:
   listen: 127.0.0.1:8080     # the gateway and the REST API share this port
 
 subscribers:                 # where proxies come from: Lua scripts
-  - name: rola-ip
-    timeout: 60s
-    limit: 1000              # keep at most this many (0 = no cap)
+  - name: zdaye
+    timeout: 120s
+    base_url: https://www.zdaye.com/free/   # extra keys -> script globals
+    max_pages: 3
+    delay: 2                 # seconds between pages; the site has a WAF
     lua_code: |
       local result = {}
       -- fetch, page, reshape ...
@@ -198,6 +200,7 @@ script:
 | `fetch(url)` | one GET, returns the body as a string; raises on a non-2xx status |
 | `fetch_json(url)` | same, but decodes the body into a Lua table |
 | `json_encode(v)` / `json_decode(s)` | Lua value <-> JSON string |
+| `sleep(seconds)` | wait before the next request (a paginated site's rate limit) |
 | `log(...)` / `print(...)` | writes to ProxyGate's log at `info`; **not** a way to emit proxies |
 
 Entry rules: `type` of `http`/`https`/`ssl` becomes `http` (in a list, "https"
@@ -211,7 +214,9 @@ kill the source.
 
 The script is sandboxed: `io`, `os`, `package` and `debug` are not loaded, and
 `dofile`, `loadfile`, `load` and `require` are removed. The only way out is
-`fetch`. `timeout` (or `refresh.timeout`) bounds the whole script, including
+`fetch` (plus `sleep`, so a script can pace itself against a rate limit; the
+subscriber's `timeout` still bounds the whole run). An empty return is not an
+error either: a source that got nothing this round simply contributes nothing. `timeout` (or `refresh.timeout`) bounds the whole script, including
 `while true do end`. Each refresh builds a fresh Lua state, so scripts cannot see
 each other. `limit` caps how many usable proxies the source contributes.
 
@@ -232,9 +237,9 @@ interface.
 
 ## Things to know before trusting the output
 
-* **Free proxy lists are mostly dead.** In a measured full run of the example
-  config's sources, 4,499 proxies were pooled and only 61 of them passed the
-  health check. Always request a new one for a new task instead of caching it.
+* **Free proxy lists are mostly dead.** In a measured full run, 1,020 proxies
+  were pooled and only 9 passed the health check. Always request a new one for a
+  new task instead of caching it.
 * **Hand-out verification is a snapshot.** A proxy can die seconds after it was
   verified, and it was verified against *ProxyGate's* targets (Google and
   `cn.bing.com` by default), not against the site you are about to fetch. With

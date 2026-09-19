@@ -42,49 +42,85 @@ subscribers:
   # `limit` or `enabled` becomes a global in the script — that is how a script
   # gets its parameters. `lua_code` and `lua_file` are mutually exclusive.
 
-  # ~5,000 proxies, 500 per page. The page count comes from the API's own
-  # `pagination.totalPages`, so a growing list needs no config change.
+  # zdaye.com (站大爷) 的免费代理列表：HTML 表格，一页 20 条，国内段一共 22 页
+  # （第 1 页是 `/free/`，之后 `/free/2/` … `/free/22/`）。
   #
-  # `limit: 1000` keeps a fifth of it. Free proxies die at a brutal rate — one
-  # measured pool of 1,020 had 13 working — so probing 5,000 of them mostly buys
-  # five times the waiting, not five times the usable proxies. The health pass is
-  # the bottleneck here, not the script.
-  - name: rola-ip
-    timeout: 60s
-    limit: 1000
+  # 这个站点前面挂的是阿里云 WAF：实测连着抓十来个请求就会被拦成 405
+  # （"您访问的URL有可能对网站造成安全威胁"），而且会持续一段时间。所以脚本
+  # 做了三件事——页与页之间 `sleep`、单页失败用 `pcall` 跳过、默认只抓前几页。
+  # 想把 22 页全抓完就得调大 `max_pages`，但那基本一定会被拦；与其如此，不如
+  # 每轮拿前几页，反正免费代理的存活率摆在那里（见 BENCHMARKS.md）。
+  - name: zdaye
+    timeout: 120s
+    base_url: https://www.zdaye.com/free/
+    max_pages: 3
+    delay: 2
     lua_code: |
-      local page, pages = 1, 1
       local result = {}
-      repeat
-        local body = fetch_json("https://rola-ip.co/proxy-api/api/v1/proxies?page=" .. page .. "&pageSize=500")
-        pages = (body.pagination and body.pagination.totalPages) or 1
-        for _, item in ipairs(body.data or {}) do
-          local scheme = nil
-          for _, protocol in ipairs(item.protocols or {}) do
-            local name = string.lower(protocol)
-            if name == "http" or name == "https" then
-              scheme = "http"
-              break
-            elseif name == "socks5" then
-              scheme = "socks5h"
+      local pages = tonumber(max_pages) or 1
+      for page = 1, pages do
+        local url = page == 1 and base_url or (base_url .. page .. "/")
+        local ok, body = pcall(fetch, url)
+        if ok then
+          local found = 0
+          for row in body:gmatch('<ul class="ul%-row">(.-)</ul>') do
+            local ip = row:match('class="proxy_ip">([^<]+)<')
+            -- 注意别写成 `Port[：:](%d+)`：Lua 的模式是**按字节**匹配的，
+            -- 把全角冒号放进字符类只会吃掉它的第一个字节，`%d+` 随即失败。
+            local port = row:match('Port[^%d]*(%d+)')
+            if ip and port then
+              local protocol = row:match('protocol_span[^>]*>%s*([A-Za-z0-9]+)') or "http"
+              table.insert(result, { type = protocol, ip = ip, port = tonumber(port) })
+              found = found + 1
             end
           end
-          if scheme then
-            table.insert(result, {
-              type = scheme,
-              ip = item.ip,
-              port = item.port,
-              auth = item.auth or ""
-            })
-          end
+          -- 空页说明翻到头了，或者这一页被 WAF 换成了别的页面。
+          if found == 0 then break end
+          if page < pages then sleep(tonumber(delay) or 0) end
+        else
+          log("zdaye page " .. page .. " could not be fetched")
         end
-        page = page + 1
-      until page > pages
+      end
       return result
 
-  # A small, fast JSON API. The interesting bits of this one: the proxies sit
-  # under `data.proxies`, the payload carries no protocol (so these are HTTP
-  # proxies), and the endpoint caps `count` itself.
+  # 海外段：同一套页面结构，只是路径是 `/free_haiwai/`（第 1 页没有数字后缀，
+  # 之后 `/free_haiwai/2/` … 实测第 118 页还有 9 条）。同样是 WAF 后面的站点，
+  # 所以默认也只抓前几页。
+  - name: zdaye-overseas
+    timeout: 120s
+    base_url: https://www.zdaye.com/free_haiwai/
+    max_pages: 3
+    delay: 2
+    lua_code: |
+      local result = {}
+      local pages = tonumber(max_pages) or 1
+      for page = 1, pages do
+        local url = page == 1 and base_url or (base_url .. page .. "/")
+        local ok, body = pcall(fetch, url)
+        if ok then
+          local found = 0
+          for row in body:gmatch('<ul class="ul%-row">(.-)</ul>') do
+            local ip = row:match('class="proxy_ip">([^<]+)<')
+            -- 注意别写成 `Port[：:](%d+)`：Lua 的模式是**按字节**匹配的，
+            -- 把全角冒号放进字符类只会吃掉它的第一个字节，`%d+` 随即失败。
+            local port = row:match('Port[^%d]*(%d+)')
+            if ip and port then
+              local protocol = row:match('protocol_span[^>]*>%s*([A-Za-z0-9]+)') or "http"
+              table.insert(result, { type = protocol, ip = ip, port = tonumber(port) })
+              found = found + 1
+            end
+          end
+          if found == 0 then break end
+          if page < pages then sleep(tonumber(delay) or 0) end
+        else
+          log("zdaye-overseas page " .. page .. " could not be fetched")
+        end
+      end
+      return result
+
+  # A small, fast JSON API (no WAF, no pagination). The interesting bits of this
+  # one: the proxies sit under `data.proxies`, the payload carries no protocol
+  # (so these are HTTP proxies), and the endpoint caps `count` itself.
   - name: scdn
     timeout: 20s
     lua_code: |

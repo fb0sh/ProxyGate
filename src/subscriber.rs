@@ -35,6 +35,7 @@
 //! | `fetch(url)` | 同步发一次 GET，返回响应体字符串；非 2xx 会抛错 |
 //! | `fetch_json(url)` | 同上，但把响应体解析成 Lua 表 |
 //! | `json_encode(v)` / `json_decode(s)` | Lua 值与 JSON 字符串互转 |
+//! | `sleep(秒)` | 等一会儿再发下一个请求（抓分页站点时给对方留间隔） |
 //! | `log(...)` / `print(...)` | 以 `info` 级别写进 ProxyGate 日志；**不是**输出代理的通道 |
 //!
 //! 返回值的每个条目是一个代理表，也可以直接写成字符串。字段与取值规则见
@@ -389,6 +390,24 @@ async fn run_lua(
         .set("json_decode", decode)
         .map_err(|e| fail(format!("cannot define `json_decode` for Lua: {e}")))?;
 
+    // `sleep(秒)`：给"对同一个站点连着发几十个请求"的脚本一个礼貌的间隔。
+    // 沙箱里没有 `os`/`io`，但抓一个分页站点确实需要它——少了它，脚本只能靠
+    // 硬扛对方的限流。整段脚本的 `timeout` 仍然兜底，所以它跑不远。
+    let sleep = lua
+        .create_async_function(|_, seconds: f64| async move {
+            if !seconds.is_finite() || seconds <= 0.0 {
+                return Ok(());
+            }
+            // 上限就是脚本自己的 timeout（调用方会掐），这里只防止荒谬的数值。
+            let seconds = seconds.min(3600.0);
+            tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+            Ok(())
+        })
+        .map_err(|e| fail(format!("cannot define `sleep` for Lua: {e}")))?;
+    lua.globals()
+        .set("sleep", sleep)
+        .map_err(|e| fail(format!("cannot define `sleep` for Lua: {e}")))?;
+
     // `log`（以及它的别名 `print`）只写日志：脚本的**返回值**才是代理，
     // 这样 `print` 不会被误当成输出通道，也不会把杂音打到进程 stdout 上。
     let log_name = name.to_string();
@@ -532,6 +551,9 @@ fn entries_to_candidates(value: &JsonValue) -> ParsedResult {
 
     let entries: &[JsonValue] = match value {
         JsonValue::Array(items) => items,
+        // 空表要单独认：Lua 的空 table 没有数组部分，serde 把它序列化成空**对象**，
+        // 而空对象显然不是一个代理条目——那是"这轮什么都没拿到"。
+        JsonValue::Object(map) if map.is_empty() => return parsed,
         JsonValue::Object(_) => std::slice::from_ref(value),
         JsonValue::Null => return parsed,
         other => {
@@ -792,6 +814,14 @@ mod tests {
         assert_eq!(parsed.rejected.len(), 5, "{:?}", parsed.rejected);
         assert!(parsed.rejected[0].contains("missing `ip`"));
         assert!(parsed.rejected[4].contains("proxy table or string"));
+    }
+
+    #[test]
+    fn an_empty_result_is_empty_not_a_rejected_entry() {
+        // `return {}` / 什么都没拿到时脚本返回空表，不该被算成"一条被拒绝的条目"。
+        let parsed = entries_to_candidates(&json("{}"));
+        assert!(parsed.candidates.is_empty());
+        assert!(parsed.rejected.is_empty(), "{:?}", parsed.rejected);
     }
 
     #[test]

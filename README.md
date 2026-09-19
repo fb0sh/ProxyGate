@@ -140,10 +140,9 @@ proxygate --example-config > config.yaml
 
 时⻓支持 `30s`、`10m`、`2h`、`1d`、`250ms`、`1h30m` 或纯秒数。
 
-> **首查慢是因为健康探测，不是因为脚本**：`rola-ip` 一个源就有 4,400 多条（10 页在
-> 脚本里循环）。示例配置给它加了 `limit: 1000`：免费代理的存活率极低（实测一份 1,020
-> 条的池子只有 13 条通过），与其花 5 倍时间去探 5,000 条、换来多得有限的可用代理，不如
-> 把这 5 倍时间留给刷新。
+> **首查慢是因为健康探测，不是因为脚本**。免费代理的存活率极低（实测一份 1,020 条的
+> 池子只有 9~13 条通过），所以示例配置里的来源都只抓一小部分：zdaye 每轮只抓前 3 页
+> （那个站点有 WAF，抓多了会被拦），scdn 只取 20 条。
 >
 > `health.concurrency` 就是决定首查要跑多久的那个旋钮：同一份 1,020 条的池子、同一组
 > 真实目标，实测 300 并发 14s、100 并发 30s（差距取决于死代理多快失败，不只是并发倍数）。
@@ -176,36 +175,20 @@ proxygate --example-config > config.yaml
 
 ```yaml
 subscribers:
-  - name: rola-ip
+  - name: zdaye
     timeout: 60s
     lua_code: |
       local page, pages = 1, 1
       local result = {}
       repeat
-        local body = fetch_json("https://rola-ip.co/proxy-api/api/v1/proxies?page=" .. page .. "&pageSize=500")
-        pages = (body.pagination and body.pagination.totalPages) or 1
-        for _, item in ipairs(body.data or {}) do
-          local scheme = nil
-          for _, protocol in ipairs(item.protocols or {}) do
-            local name = string.lower(protocol)
-            if name == "http" or name == "https" then
-              scheme = "http"
-              break
-            elseif name == "socks5" then
-              scheme = "socks5h"
-            end
-          end
-          if scheme then
-            table.insert(result, {
-              type = scheme,
-              ip = item.ip,
-              port = item.port,
-              auth = item.auth or ""
-            })
+        local body = fetch("https://www.zdaye.com/free/")
+        for row in body:gmatch('<ul class="ul%-row">(.-)</ul>') do
+          local ip = row:match('class="proxy_ip">([^<]+)<')
+          local port = row:match('Port[^%d]*(%d+)')
+          if ip and port then
+            table.insert(result, { type = "http", ip = ip, port = tonumber(port) })
           end
         end
-        page = page + 1
-      until page > pages
       return result
 
   # 脚本也可以写在文件里，端点用额外键传进去
@@ -229,6 +212,7 @@ subscribers:
 | `fetch(url)` | 发一次 GET，返回响应体字符串；非 2xx 抛错 |
 | `fetch_json(url)` | 同上，但把响应体解码成 Lua 表 |
 | `json_encode(v)` / `json_decode(s)` | Lua 值与 JSON 字符串互转 |
+| `sleep(秒)` | 等一会儿再发下一个请求（对方有限流时自己控制节奏） |
 | `log(...)` / `print(...)` | 以 `info` 级别写进 ProxyGate 日志。**它们不是输出通道**，代理靠 `return` |
 
 `return` 的每个条目是一个代理表，字段与取值规则：
@@ -248,7 +232,8 @@ subscribers:
 把整个来源判死。
 
 脚本跑在**沙箱**里：不加载 `io`、`os`、`package`、`debug`，`dofile`、`loadfile`、
-`load`、`require` 也被摘掉了，唯一的出口是 `fetch`。`timeout`（缺省 `refresh.timeout`）
+`load`、`require` 也被摘掉了，唯一的出口是 `fetch`（另加 `sleep`，让脚本控制请求节奏；
+整段脚本仍受 `timeout` 限制）。返回空表不是错误：这一轮没拿到东西就不会贡献代理。`timeout`（缺省 `refresh.timeout`）
 限制整段脚本的墙钟时间，`while true do end` 也会被指令钩子掐断；每次刷新都新建一个
 Lua 状态，脚本之间互不影响。`lua_code` 和 `lua_file` 二选一，两个都给或都不给都是
 配置错误。
@@ -267,7 +252,7 @@ user:pass@1.2.3.4:3128       socks5h://user:pass@[2001:db8::1]:1080
 示例配置里的第一个源是 [proxy.scdn.io](https://proxy.scdn.io/api_docs.php)：它返回 JSON
 包装、里面是裸 `host:port`，内置 `json` 格式可以直接读。因为返回体不带协议，这类条目一律
 按 HTTP 代理处理（所以示例里请求 `protocol=http`）；想用它家的 `socks4`/`socks5` 端点，
-改成 `type: lua` 再 `print("socks5h://" .. item)` 就行——`rola-ip` 那段脚本就是这么写的。
+改成 `type: lua`，在脚本里按字段拼 `socks5h://…` 就行（示例里的 zdaye 就是这么干的）。
 
 关于这类免费池要有心理准备，下面两点正是健康探测存在的意义：**大部分条目是死的**，并且
 相当一部分「支持 HTTPS」的其实在中间人劫持 TLS、拿自己的证书签发。ProxyGate 会拒绝这类
@@ -302,10 +287,10 @@ user:pass@1.2.3.4:3128       socks5h://user:pass@[2001:db8::1]:1080
 $ proxygate
 2026-09-18T10:51:02Z  INFO proxygate is listening listen=127.0.0.1:8080 config=Some("./config.yaml") proxies=0 alive=0 auth=false ready=false
 2026-09-18T10:51:02Z  INFO API documentation help=http://127.0.0.1:8080/help
-2026-09-18T10:51:02Z  INFO running subscriber script subscriber=rola-ip
+2026-09-18T10:51:02Z  INFO running subscriber script subscriber=zdaye
 2026-09-18T10:51:02Z  INFO running subscriber script subscriber=scdn
 2026-09-18T10:51:04Z  INFO subscriber fetched subscriber=scdn found=20 rejected=0 skipped=0 truncated=0 elapsed_ms=1574
-2026-09-18T10:51:37Z  INFO subscriber fetched subscriber=rola-ip found=4479 rejected=0 skipped=0 truncated=0 elapsed_ms=35700
+2026-09-18T10:51:12Z  INFO subscriber fetched subscriber=zdaye found=60 rejected=0 skipped=0 truncated=0 elapsed_ms=9800
 2026-09-18T10:51:38Z  INFO hand-out verification passed proxy=http://***:***@1.2.3.4:8080 elapsed_ms=312
 2026-09-18T10:55:10Z  INFO proxygate is ready proxies=4499 alive=61
 ```
@@ -406,7 +391,7 @@ REST API、HTTP 网关。
 循环——那时判定可能几分钟旧，发出去死代理的概率会明显上升。
 
 `refresh` 是**边抓边落盘**的：每个订阅源一完成就立刻合并进池并写 `cache.json`，
-不等最慢的那个（`rola-ip` 要 35 秒）。中途 Ctrl-C 或断电，已经拿到的代理仍
+不等最慢的那个（zdaye 那几页要十来秒）。中途 Ctrl-C 或断电，已经拿到的代理仍
 然在磁盘上；因为整轮没有跑完，`fetched_at` 不会被更新，所以下次还会重新抓一遍补全。
 
 ## 选择与轮换规则

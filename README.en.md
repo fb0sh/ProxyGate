@@ -150,12 +150,10 @@ proxy really has international connectivity, and `cn.bing.com` proves the tunnel
 is not broken for everything else. By default `require: any` accepts a proxy
 that reaches either one; the `TARGETS` column tells you which.
 
-> **The slow part is the health check, not the scripts.** `rola-ip` alone
-> returns 4,400+ proxies (its ten pages are one loop inside the script), which is
-> why the example caps it with `limit: 1000`: among free proxies the survivors
-> are scarce (one measured pool of 1,020 had 13 working), so probing 5,000 of them
-> buys five times the waiting for a limited gain in usable proxies. The five times
-> are better spent on refreshing.
+> **The slow part is the health check, not the scripts.** Among free proxies the
+> survivors are scarce (one measured pool of 1,020 had 9-13 working), so the
+> example's sources only take a slice each: zdaye's first 3 pages per section (its
+> WAF blocks anyone who asks for more) and scdn's 20 entries.
 >
 > `health.concurrency` is the knob that decides how long that first check takes:
 > on the same 1,020-proxy pool against the real targets, 300 in flight finished
@@ -187,36 +185,20 @@ of proxy tables** — one per proxy, with `type`, `ip`, `port` and an optional
 
 ```yaml
 subscribers:
-  - name: rola-ip
+  - name: zdaye
     timeout: 60s
     lua_code: |
       local page, pages = 1, 1
       local result = {}
       repeat
-        local body = fetch_json("https://rola-ip.co/proxy-api/api/v1/proxies?page=" .. page .. "&pageSize=500")
-        pages = (body.pagination and body.pagination.totalPages) or 1
-        for _, item in ipairs(body.data or {}) do
-          local scheme = nil
-          for _, protocol in ipairs(item.protocols or {}) do
-            local name = string.lower(protocol)
-            if name == "http" or name == "https" then
-              scheme = "http"
-              break
-            elseif name == "socks5" then
-              scheme = "socks5h"
-            end
-          end
-          if scheme then
-            table.insert(result, {
-              type = scheme,
-              ip = item.ip,
-              port = item.port,
-              auth = item.auth or ""
-            })
+        local body = fetch(base_url)
+        for row in body:gmatch('<ul class="ul%-row">(.-)</ul>') do
+          local ip = row:match('class="proxy_ip">([^<]+)<')
+          local port = row:match('Port[^%d]*(%d+)')
+          if ip and port then
+            table.insert(result, { type = "http", ip = ip, port = tonumber(port) })
           end
         end
-        page = page + 1
-      until page > pages
       return result
 
   # A script can live in its own file, with the endpoint passed in as a global.
@@ -240,6 +222,7 @@ What the script can use:
 | `fetch(url)` | one GET, returns the body as a string; raises on a non-2xx status |
 | `fetch_json(url)` | same, but decodes the body into a Lua table |
 | `json_encode(v)` / `json_decode(s)` | Lua value <-> JSON string |
+| `sleep(seconds)` | wait before the next request (pace yourself against a rate limit) |
 | `log(...)` / `print(...)` | writes to ProxyGate's log at `info`; **not** a way to emit proxies |
 
 Every key ProxyGate does not recognise (`name`/`script_name`, `lua_code`,
@@ -332,7 +315,7 @@ There is no stdout contract to protect, so progress and results go to the
 $ proxygate
 INFO proxygate is listening listen=127.0.0.1:8080 config=Some("./config.yaml") proxies=0 alive=0 auth=false ready=false
 INFO API documentation help=http://127.0.0.1:8080/help
-INFO running subscriber script subscriber=rola-ip
+INFO running subscriber script subscriber=zdaye
 INFO subscriber fetched subscriber=scdn found=20 rejected=0 skipped=0 elapsed_ms=2423
 INFO proxygate is ready proxies=5157 alive=66
 INFO hand-out verification passed proxy=http://***:***@1.2.3.4:8080 elapsed_ms=312
@@ -443,7 +426,7 @@ old and dead proxies do get handed out.
 
 `refresh` also persists **as it goes**: every subscriber is merged into the pool
 and written to `cache.json` the moment it finishes instead of waiting for the
-slowest one (`rola-ip` takes 35 seconds). A Ctrl-C or a power cut keeps
+slowest one (zdaye's pages take about ten seconds). A Ctrl-C or a power cut keeps
 whatever was already fetched; because the pass never completed, `fetched_at` is
 not updated and the next run fetches again to fill in the rest.
 
@@ -661,7 +644,7 @@ Deviations from the v0.1 design notes, each for a reason found while building it
   single port, dispatched by request shape.
 * Built-in sources can be paginated: the URL carries `{page}` and the catalog
   declares the range, which `normalize` expands into one subscriber per page so
-  each page is counted and can fail on its own. rola-ip went from 500 entries to
+  each page is counted and can fail on its own.
   all 10 pages (4,724).
 * `serve` binds its ports first and initializes in the background; until that
   finishes the REST API answers `503` with `Retry-After` instead of pretending

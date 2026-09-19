@@ -70,6 +70,13 @@ fn rendered(outcome: &proxygate::subscriber::FetchOutcome) -> Vec<String> {
         .collect()
 }
 
+/// 用只含该订阅源的配置跑一次，返回第一个 outcome。
+async fn run_one(subscriber: SubscriberConfig) -> proxygate::subscriber::FetchOutcome {
+    let set = SubscriberSet::new(&config_with(vec![subscriber])).expect("subscriber set");
+    let mut outcomes = set.fetch_all().await;
+    outcomes.remove(0)
+}
+
 fn config_with(subscribers: Vec<SubscriberConfig>) -> Config {
     Config {
         subscribers,
@@ -315,4 +322,127 @@ async fn scripts_are_isolated_from_each_other() {
     assert_eq!(by_name("writer"), vec!["http://10.3.3.3:8080".to_string()]);
     // The reader never saw the writer's global.
     assert_eq!(by_name("reader"), vec!["http://10.4.4.4:8080".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// 出厂的示例配置里那些脚本，拿真实页面的裁剪片段跑一遍。
+//
+// 这两个测试的意义在于：脚本是写在 config.example.yaml 里的，改了配置却把解析
+// 规则改坏，只有这里会红。
+// ---------------------------------------------------------------------------
+
+/// 从示例配置里取出某个订阅源（脚本与参数一起），并把参数指向测试服务器。
+fn shipped_subscriber(name: &str, base_url: &str, delay: &str) -> SubscriberConfig {
+    let config: Config =
+        serde_yaml::from_str(proxygate::config::EXAMPLE_CONFIG).expect("the example config parses");
+    let mut subscriber = config
+        .subscribers
+        .into_iter()
+        .find(|subscriber| subscriber.name() == name)
+        .unwrap_or_else(|| panic!("the example config has a `{name}` subscriber"));
+    subscriber
+        .params
+        .insert("base_url".into(), serde_yaml::Value::from(base_url));
+    // 测试里不真的等：`sleep(0)` 直接返回。
+    subscriber
+        .params
+        .insert("delay".into(), serde_yaml::Value::from(delay));
+    subscriber
+}
+
+/// zdaye 免费代理页的真实标记片段（见 tests/fixtures/zdaye_free.html）。
+const ZDAYE_PAGE: &str = include_str!("fixtures/zdaye_free.html");
+
+#[tokio::test]
+async fn an_empty_result_is_not_an_error() {
+    // 一个什么都没拿到的脚本（比如来源被限流了）应当安静地返回空，
+    // 而不是报错、也不是把空表当成一条坏条目。
+    let outcome = run_one(lua("nothing", "return {}")).await;
+    assert!(outcome.ok(), "{:?}", outcome.error);
+    assert_eq!(outcome.count(), 0);
+    assert!(outcome.rejected.is_empty(), "{:?}", outcome.rejected);
+}
+
+#[tokio::test]
+async fn the_shipped_zdaye_script_parses_the_real_markup() {
+    let address = common::fake_http_server(ZDAYE_PAGE).await;
+    let subscriber = shipped_subscriber("zdaye", &format!("http://{address}/free/"), "0");
+
+    let outcome = run_one(subscriber).await;
+    assert!(outcome.ok(), "{:?}", outcome.error);
+    assert_eq!(outcome.error, None);
+    // max_pages 默认 3：同一个 fixture 被当成三页，所以每条出现三次。
+    assert_eq!(outcome.count(), 9, "{:?}", rendered(&outcome));
+    assert_eq!(outcome.skipped, 0, "两个 HTTP(S) 加一个 SOCKS5 都该留下");
+
+    let mut hosts: Vec<String> = outcome
+        .proxies
+        .iter()
+        .map(|url| url.host_str().unwrap_or_default().to_string())
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    assert_eq!(
+        hosts,
+        vec!["103.152.112.162", "139.159.97.82", "47.92.82.167"],
+        "页面里的三条 IP 一条都不能少"
+    );
+
+    // HTTPS 归一成 http（"能 CONNECT 到 HTTPS"），SOCKS5 升级成 socks5h。
+    let rendered = rendered(&outcome);
+    assert!(
+        rendered.contains(&"http://47.92.82.167:9999".to_string()),
+        "{rendered:?}"
+    );
+    assert!(
+        rendered.contains(&"http://139.159.97.82:10900".to_string()),
+        "{rendered:?}"
+    );
+    assert!(
+        rendered.contains(&"socks5h://103.152.112.162:1080".to_string()),
+        "{rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_shipped_zdaye_script_survives_a_blocked_page() {
+    // 第一页正常，之后几页回 500（WAF 拦人时就是这样）：脚本要 `pcall` 掉，
+    // 把已经拿到的交出去，而不是让整个订阅源失败。
+    let address = common::spawn_server(|mut stream| async move {
+        use tokio::io::AsyncWriteExt;
+
+        let Some(head) = common::read_head(&mut stream).await else {
+            return;
+        };
+        let path = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+        // `/free/` 是第 1 页，`/free/2/` 之后一律拦截。
+        let (status, body) = if path == "/free/" {
+            ("200 OK", ZDAYE_PAGE)
+        } else {
+            ("500 Server too busy", "")
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+    })
+    .await;
+
+    let subscriber = shipped_subscriber("zdaye", &format!("http://{address}/free/"), "0");
+    let outcome = run_one(subscriber).await;
+
+    assert!(outcome.ok(), "被拦的页面不该让整个来源失败");
+    assert_eq!(
+        outcome.count(),
+        3,
+        "只有第 1 页的三条应该留下：{:?}",
+        rendered(&outcome)
+    );
 }

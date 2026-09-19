@@ -1,0 +1,42 @@
+<!--
+  zdaye.com 免费代理页的**真实**标记片段，裁到最小：
+  * 前两行是从 https://www.zdaye.com/free/ 原样摘下来的（HTTP 与 HTTPS 各一条）；
+  * 第三行是照着同一套 class 名写的 SOCKS5 行，只为覆盖协议分支——
+    真实页面上 SOCKS5 出现在第 2 页之后，这里没必要为了测试再打一次那个站点
+    （它有阿里云 WAF，连着抓十来个请求就会 405）。
+  * 分页那一行是真的，用来验"从页面里读出总页数"。
+  用它测试解析规则，就不用每次跑测试都去抓别人的站点。
+-->
+<!DOCTYPE html>
+<html><body>
+<div class="page">当前筛选条件下共<font color='orange'><b>421</b></font>个免费代理IP，每页20个 ... <a title="最后页" href="/free/22/">22</a></div>
+<div class="ip-table-body">
+<ul class="ul-row">
+            <li class="ul-cell"><p class="proxy_ip">47.92.82.167</p><p class="proxy_port">Port：9999<span class="copy-proxy"></span></p></li>
+			<li class="ul-cell"><p class="proxy_protocol"><span class="protocol_span protocol_span_http">HTTP</span></p><p class="proxy_level">高匿</p></li>
+            <li class="ul-cell" title="北京市 阿里云">北京市 阿里云</li>
+            <li class="ul-cell"><i class="icon-clock"></i>&nbsp;2秒前</li>
+            <li class="ul-cell"><div class="progress mb-2"><div class="progress-bar bg-danger" role="progressbar" style="width:59%" aria-valuenow="50" aria-valuemin="0" aria-valuemax="100"></div><span style="color:#42464b">&nbsp;2072</span></div></li>
+            <li class="ul-cell mtd">15小时36分</li>
+			<li class="ul-cell">免费代理IP</li>
+        </ul>
+<ul class="ul-row">
+            <li class="ul-cell"><p class="proxy_ip">139.159.97.82</p><p class="proxy_port">Port：10900<span class="copy-proxy"></span></p></li>
+			<li class="ul-cell"><p class="proxy_protocol"><span class="protocol_span protocol_span_http">HTTP</span></p><p class="proxy_level">未知</p></li>
+            <li class="ul-cell" title="上海市 北京首都在线科技股份有限公司">上海市 北京首都在线科技股份有限公司</li>
+            <li class="ul-cell"><i class="icon-clock"></i>&nbsp;10秒前</li>
+            <li class="ul-cell"><div class="progress mb-2"><div class="progress-bar bg-danger" role="progressbar" style="width:42%" aria-valuenow="50" aria-valuemin="0" aria-valuemax="100"></div><span style="color:#42464b">&nbsp;9970</span></div></li>
+            <li class="ul-cell mtd">新入库</li>
+			<li class="ul-cell">免费代理IP</li>
+        </ul>
+<ul class="ul-row">
+            <li class="ul-cell"><p class="proxy_ip">103.152.112.162</p><p class="proxy_port">Port：1080<span class="copy-proxy"></span></p></li>
+			<li class="ul-cell"><p class="proxy_protocol"><span class="protocol_span protocol_span_socks5">SOCKS5</span></p><p class="proxy_level">高匿</p></li>
+            <li class="ul-cell" title="海外">海外</li>
+            <li class="ul-cell"><i class="icon-clock"></i>&nbsp;1分钟前</li>
+            <li class="ul-cell"><div class="progress mb-2"><div class="progress-bar bg-danger" role="progressbar" style="width:50%"></div><span style="color:#42464b">&nbsp;500</span></div></li>
+            <li class="ul-cell mtd">新入库</li>
+			<li class="ul-cell">免费代理IP</li>
+        </ul>
+</div>
+</body></html>
